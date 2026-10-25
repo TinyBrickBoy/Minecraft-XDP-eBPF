@@ -9,7 +9,7 @@
   ],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 4,
+  "version": 5,
   "editable": true,
   "refresh": "30s",
   "time": {
@@ -842,7 +842,8 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "short",
+          "noValue": "Keine Angriffe im Zeitraum"
         },
         "overrides": [
           {
@@ -949,7 +950,8 @@
               "mode": "normal",
               "group": "A"
             }
-          }
+          },
+          "noValue": "Keine Reflection-Angriffe"
         },
         "overrides": []
       },
@@ -1009,7 +1011,8 @@
               "mode": "none",
               "group": "A"
             }
-          }
+          },
+          "noValue": "Keine Reflection-Angriffe"
         },
         "overrides": []
       },
@@ -1069,7 +1072,8 @@
               "mode": "none",
               "group": "A"
             }
-          }
+          },
+          "noValue": "Kein Traffic an unbenutzte IPs"
         },
         "overrides": []
       },
@@ -1119,7 +1123,8 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "short",
+          "noValue": "Keine Reflection-Angriffe im Zeitraum"
         },
         "overrides": []
       },
