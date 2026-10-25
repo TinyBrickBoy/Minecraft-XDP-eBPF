@@ -9,7 +9,7 @@
   ],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 2,
+  "version": 3,
   "editable": true,
   "refresh": "30s",
   "time": {
@@ -785,7 +785,7 @@
             "properties": [
               {
                 "id": "unit",
-                "value": "string"
+                "value": "none"
               },
               {
                 "id": "decimals",
@@ -810,18 +810,6 @@
         ]
       },
       "transformations": [
-        {
-          "id": "convertFieldType",
-          "options": {
-            "conversions": [
-              {
-                "targetField": "dst_port",
-                "destinationType": "string"
-              }
-            ],
-            "fields": {}
-          }
-        },
         {
           "id": "organize",
           "options": {
@@ -883,7 +871,7 @@
             "properties": [
               {
                 "id": "unit",
-                "value": "string"
+                "value": "none"
               },
               {
                 "id": "decimals",
@@ -908,18 +896,6 @@
         ]
       },
       "transformations": [
-        {
-          "id": "convertFieldType",
-          "options": {
-            "conversions": [
-              {
-                "targetField": "dst_port",
-                "destinationType": "string"
-              }
-            ],
-            "fields": {}
-          }
-        },
         {
           "id": "organize",
           "options": {
