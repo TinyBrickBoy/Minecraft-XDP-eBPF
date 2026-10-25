@@ -40,6 +40,8 @@
 #define IP_OFFSET 0x1FFF // "fragment offset" part
 #endif
 
+#include "reflection.h"
+
 /* ------------------------------------------------------------------------
  * Connection tracking of unverified connections
  * --------------------------------------------------------------------- */
@@ -436,16 +438,27 @@ static __always_inline __u8 is_amplification_port(const __u16 port)
  */
 static __always_inline __s32 handle_udp(const void *data, const void *data_end, const struct iphdr *ip)
 {
-    // non-first fragments: see the tcp path in minecraft_filter()
+    const __u64 raw_packet_len = (__u64)(data_end - data);
+
+    // non-first fragments carry no udp header: only the reflection check
+    // (fragmented amplified answers) applies, see also the tcp path
     if (ip->frag_off & bpf_htons(IP_OFFSET))
     {
-        return XDP_PASS;
+        const __s32 verdict = reflection_check(ip, NULL, raw_packet_len);
+        return verdict < 0 ? XDP_PASS : verdict;
     }
 
     const struct udphdr *udp = (const void *)ip + (ip->ihl * 4);
     if ((const void *)(udp + 1) > data_end)
     {
         return XDP_DROP;
+    }
+
+    // unsolicited answers of abused udp services, for whole networks
+    const __s32 verdict = reflection_check(ip, udp, raw_packet_len);
+    if (verdict >= 0)
+    {
+        return verdict;
     }
 
     __u8 grace = 0;
@@ -461,7 +474,6 @@ static __always_inline __s32 handle_udp(const void *data, const void *data_end, 
         return XDP_DROP;
     }
 
-    const __u64 raw_packet_len = (__u64)(data_end - data);
     count_stats(stats_ptr, dst_stats_ptr, INCOMING_BYTES, raw_packet_len);
 
     // RakNet datagrams always fit the MTU, a fragmented one is forged

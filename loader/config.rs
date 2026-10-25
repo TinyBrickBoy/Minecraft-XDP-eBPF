@@ -89,6 +89,27 @@ retry_negative_secs = 21600
 # File that keeps the detected servers across restarts.
 state_file = "targets.json"
 
+[reflection]
+# UDP reflection/amplification protection for whole networks: answers from
+# the service ports below (DNS, NTP, memcached, SSDP, ...) only pass when
+# they answer a request a protected address sent out through this interface.
+# "off", "monitor" (only count what would be dropped) or "enforce". Start
+# with "monitor" and check the xdp_reflection_* metrics before enforcing.
+mode = "off"
+
+# Protected networks, e.g. ["85.93.5.0/24"].
+networks = []
+
+# UDP source ports whose answers are checked.
+ports = [19, 53, 69, 111, 123, 137, 161, 389, 427, 520, 1900, 3283, 3702, 5353, 5683, 10001, 11211, 37810]
+
+# Also drop non-first UDP fragments to protected addresses: large amplified
+# answers arrive fragmented, legitimate UDP traffic practically never does.
+drop_fragments = true
+
+# Seconds a recorded request accepts answers. Must be between 1 and 300.
+reply_window_secs = 30
+
 [xdp]
 # How the filter attaches to the network interface.
 # "auto"   -> native driver mode if the NIC supports XDP, with automatic
@@ -147,6 +168,7 @@ pub struct Config {
     pub filter: FilterConfig,
     pub targets: TargetsConfig,
     pub autodetect: AutodetectConfig,
+    pub reflection: ReflectionConfig,
     pub xdp: XdpConfig,
     pub metrics: MetricsConfig,
     pub logging: LoggingConfig,
@@ -240,6 +262,49 @@ impl Default for AutodetectConfig {
             retry_negative_secs: 21600,
             state_file: "targets.json".into(),
         }
+    }
+}
+
+/// `[reflection]` — UDP reflection protection for whole networks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReflectionConfig {
+    pub mode: ReflectionMode,
+    pub networks: Vec<String>,
+    pub ports: Vec<u16>,
+    pub drop_fragments: bool,
+    pub reply_window_secs: u64,
+}
+
+impl Default for ReflectionConfig {
+    fn default() -> Self {
+        Self {
+            mode: ReflectionMode::Off,
+            networks: Vec::new(),
+            ports: vec![19, 53, 69, 111, 123, 137, 161, 389, 427, 520, 1900, 3283, 3702, 5353, 5683, 10001, 11211, 37810],
+            drop_fragments: true,
+            reply_window_secs: 30,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReflectionMode {
+    Off,
+    Monitor,
+    Enforce,
+}
+
+impl ReflectionConfig {
+    fn validate(&self) -> Result<()> {
+        for network in &self.networks {
+            parse_cidr(network).context("[reflection] networks")?;
+        }
+        if self.mode != ReflectionMode::Off && self.networks.is_empty() {
+            bail!("[reflection] networks must not be empty when the protection is on");
+        }
+        check_range("[reflection] reply_window_secs", self.reply_window_secs, 1, 300)
     }
 }
 
@@ -393,6 +458,7 @@ impl Config {
         self.filter.validate()?;
         self.targets.validate()?;
         self.autodetect.validate()?;
+        self.reflection.validate()?;
         self.xdp.validate()?;
         self.metrics.validate()?;
         self.logging.validate()
@@ -592,6 +658,15 @@ mod tests {
         assert!(parse_exclude("1.2.3.4:5/icmp").is_err());
         assert!(parse_socket_addr("1.2.3.4").is_err());
         assert_eq!(parse_cidr("85.93.5.0/24").unwrap().1, 24);
+    }
+
+    #[test]
+    fn reflection_requires_networks() {
+        let cfg: Config = toml::from_str("[reflection]\nmode = \"monitor\"").unwrap();
+        assert!(cfg.validate().is_err());
+        let cfg: Config =
+            toml::from_str("[reflection]\nmode = \"enforce\"\nnetworks = [\"85.93.5.0/24\"]").unwrap();
+        cfg.validate().expect("valid reflection config");
     }
 
     #[test]

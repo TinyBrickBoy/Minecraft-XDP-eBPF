@@ -13,6 +13,7 @@ use prometheus::{
 
 use crate::config::Config;
 use crate::shutdown::Shutdown;
+use crate::reflection::{self, StatsMap as ReflectionStatsMap};
 use crate::targets::{DstKey, Targets};
 
 /// Defines the userspace mirror of `struct statistics` (see xdp/stats.h)
@@ -103,6 +104,18 @@ const _: () = assert!(std::mem::size_of::<Statistics>() == 72);
 
 static COUNTERS: LazyLock<Counters> = LazyLock::new(Counters::new);
 static DST_COUNTERS: LazyLock<DstCounters> = LazyLock::new(DstCounters::new);
+static REFLECTION: LazyLock<(IntCounterVec, IntCounterVec)> = LazyLock::new(|| {
+    let labels = &["dst_ip", "src_port", "service"];
+    (
+        register_int_counter_vec!(
+            "xdp_reflection_packets",
+            "UDP reflection packets (dropped when enforcing, only counted when monitoring)",
+            labels
+        )
+        .unwrap(),
+        register_int_counter_vec!("xdp_reflection_bytes", "UDP reflection bytes", labels).unwrap(),
+    )
+});
 static TARGET_INFO: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "minecraft_target_protected",
@@ -119,6 +132,7 @@ pub fn start(
     ebpf: &mut Ebpf,
     config: &Config,
     targets: Arc<Targets>,
+    reflection_stats: Option<ReflectionStatsMap>,
     shutdown: &Arc<Shutdown>,
 ) -> Result<Option<JoinHandle<()>>> {
     if !config.metrics.enabled {
@@ -143,7 +157,9 @@ pub fn start(
     let shutdown = shutdown.clone();
     let handle = thread::Builder::new()
         .name("track-stats".into())
-        .spawn(move || poll_loop(stats, dst_stats, targets, shutdown, poll_interval))?;
+        .spawn(move || {
+            poll_loop(stats, dst_stats, targets, reflection_stats, shutdown, poll_interval)
+        })?;
     Ok(Some(handle))
 }
 
@@ -155,6 +171,7 @@ fn poll_loop(
     stats: PerCpuArray<MapData, Statistics>,
     dst_stats: PerCpuHashMap<MapData, DstKey, Statistics>,
     targets: Arc<Targets>,
+    reflection_stats: Option<ReflectionStatsMap>,
     shutdown: Arc<Shutdown>,
     poll_interval: Duration,
 ) {
@@ -174,6 +191,9 @@ fn poll_loop(
         }
         publish_dst_stats(&dst_stats);
         publish_targets(&targets);
+        if let Some(map) = &reflection_stats {
+            publish_reflection(map);
+        }
         if !shutdown.sleep(poll_interval) {
             return;
         }
@@ -198,6 +218,27 @@ fn publish_dst_stats(dst_stats: &PerCpuHashMap<MapData, DstKey, Statistics>) {
                 debug!("Failed to read dst stats entry: {e}");
             }
         }
+    }
+}
+
+/// Sums and publishes the reflection statistics per victim and source port.
+fn publish_reflection(map: &ReflectionStatsMap) {
+    let (packets, bytes) = &*REFLECTION;
+    for entry in map.iter() {
+        let Ok((key, per_cpu)) = entry else {
+            continue; // evicted mid-iteration
+        };
+        let (mut total_packets, mut total_bytes) = (0u64, 0u64);
+        for stats in per_cpu.iter() {
+            total_packets += stats.packets;
+            total_bytes += stats.bytes;
+        }
+        let (ip, port) = (key.daddr().to_string(), key.sport().to_string());
+        let labels = [ip.as_str(), port.as_str(), reflection::service_name(key.sport())];
+        let counter = packets.with_label_values(&labels);
+        counter.inc_by(total_packets.saturating_sub(counter.get()));
+        let counter = bytes.with_label_values(&labels);
+        counter.inc_by(total_bytes.saturating_sub(counter.get()));
     }
 }
 

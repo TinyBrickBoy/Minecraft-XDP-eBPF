@@ -27,7 +27,7 @@ ip addr add 10.99.0.1/24 dev c0; ip link set c0 up
 ip addr add 10.99.1.1/24 dev s0; ip link set s0 up
 ip link add dummy0 type dummy; ip addr add 10.99.2.1/32 dev dummy0; ip link set dummy0 up
 for ns in cl sv; do ip -n $ns link set lo up; done
-ip -n cl addr add 10.99.0.2/24 dev c1; ip -n cl link set c1 up; ip -n cl route add default via 10.99.0.1
+ip -n cl addr add 10.99.0.2/24 dev c1; ip -n cl addr add 10.99.0.3/24 dev c1; ip -n cl link set c1 up; ip -n cl route add default via 10.99.0.1
 ip -n sv addr add 10.99.1.2/24 dev s1; ip -n sv link set s1 up; ip -n sv route add default via 10.99.1.1
 sysctl -qw net.ipv4.ip_forward=1
 # veth + generic XDP: keep segments MTU sized like a real NIC would
@@ -38,6 +38,10 @@ ip netns exec sv ethtool -K s1 gso off tso off >/dev/null 2>&1
 ip netns exec sv $MC java-server 0.0.0.0 25565 & 
 ip netns exec sv $MC bedrock-server 0.0.0.0 19132 &
 ip netns exec sv $MC echo-server 0.0.0.0 8000 &
+ip netns exec sv $MC udp-echo-server 0.0.0.0 40000 &
+# "internet" side: a resolver and a udp service the customers talk to
+ip netns exec cl $MC udp-echo-server 10.99.0.2 53 &
+ip netns exec cl $MC udp-echo-server 10.99.0.2 7000 &
 $MC java-server 10.99.2.1 25570 &
 sleep 1
 
@@ -58,6 +62,10 @@ networks = ["10.99.1.0/24", "10.99.2.0/24"]
 sniff_interfaces = ["s0"]
 probe_interval_secs = 10
 state_file = "$T/targets.json"
+[reflection]
+mode = "enforce"
+networks = ["10.99.1.0/24", "10.99.2.0/24"]
+reply_window_secs = 5
 [xdp]
 mode = "skb"
 [metrics]
@@ -100,6 +108,22 @@ check "bedrock new session works"   cl $MC bedrock-session 10.99.1.2 19132 3
 check "bedrock garbage dropped"     cl $MC bedrock-garbage 10.99.1.2 19132
 check "old java player survived"    wait $PLAYER
 check "old bedrock session survived" wait $BEDROCK
+
+echo "== udp reflection protection"
+check "recorder attached"              grep -q 'reflection protection: enforcing' $T/loader.log
+check "customer dns query answered"    ip netns exec sv $MC udp-echo 10.99.0.2 53
+check "customer udp traffic works"     ip netns exec sv $MC udp-echo 10.99.0.2 7000
+check "inbound udp works"              cl $MC udp-echo 10.99.1.2 40000 5000
+# the "reflector" sends from its own address, 10.99.0.2:53 is the resolver
+check "unsolicited dns answer dropped" cl env E2E_BIND=10.99.0.3 $MC udp-no-echo 10.99.1.2 40000 53
+check "unsolicited ntp answer dropped" cl env E2E_BIND=10.99.0.3 $MC udp-no-echo 10.99.1.2 40000 123
+check "fragmented flood dropped"       cl $MC udp-no-echo 10.99.1.2 40000 5001 3000
+check "big answer to own query passes" ip netns exec sv $MC udp-echo 10.99.0.2 7000 0 1400
+sleep 2
+dns=$(curl -s 127.0.0.1:1999/metrics | awk '/^xdp_reflection_packets\{.*service="dns"/{s+=$2} END{print s+0}')
+frag=$(curl -s 127.0.0.1:1999/metrics | awk '/^xdp_reflection_packets\{.*service="fragment"/{s+=$2} END{print s+0}')
+check "reflection metrics (dns $dns, fragments $frag)" test "$dns" -ge 1 -a "$frag" -ge 1
+
 adopted=$(metric minecraft_adopted_connections)
 check "connections adopted (${adopted:-0})" test "${adopted:-0}" -ge 2
 

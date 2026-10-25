@@ -10,6 +10,7 @@ fn main() {
         "xdp/common.h",
         "xdp/config.h",
         "xdp/protocol.h",
+        "xdp/reflection.h",
         "xdp/stats.h",
         "xdp/varint.h",
     ] {

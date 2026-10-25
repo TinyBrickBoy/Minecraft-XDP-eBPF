@@ -10,7 +10,11 @@ Clients exit 0 on the expected outcome, 1 otherwise:
   bedrock-ping    RakNet unconnected ping is answered with a pong
   bedrock-session SECS  RakNet open connection handshake, then frames
   bedrock-garbage a non-RakNet datagram is NOT answered (dropped)
+  udp-echo [SPORT [SIZE]]     a datagram (from SPORT, SIZE bytes) is echoed
+  udp-no-echo [SPORT [SIZE]]  ... is NOT echoed (dropped)
+Server: udp-echo-server
 """
+import os
 import socket
 import struct
 import sys
@@ -225,6 +229,27 @@ def bedrock_garbage(host, port):
         return udp_exchange(s, b"\x99junkjunkjunk") is None
 
 
+def udp_echo_server(host, port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((host, port))
+    while True:
+        data, addr = sock.recvfrom(65535)
+        sock.sendto(data, addr)
+
+
+def udp_echo(host, port, sport=0, size=32):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((os.environ.get("E2E_BIND", "0.0.0.0"), int(sport)))
+        s.connect((host, port))
+        data = bytes(range(256)) * (int(size) // 256 + 1)
+        return udp_exchange(s, data[:int(size)]) == data[:int(size)]
+
+
+def udp_no_echo(host, port, sport=0, size=32):
+    return not udp_echo(host, port, sport, size)
+
+
 def main():
     cmd, host, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
     extra = [float(a) for a in sys.argv[4:]]
@@ -234,10 +259,13 @@ def main():
         serve_tcp(host, port, echo_conn)
     elif cmd == "bedrock-server":
         bedrock_server(host, port)
+    elif cmd == "udp-echo-server":
+        udp_echo_server(host, port)
     else:
         fn = {"status": status, "player": player, "garbage": garbage, "echo": echo,
               "bedrock-ping": bedrock_ping, "bedrock-session": bedrock_session,
-              "bedrock-garbage": bedrock_garbage}[cmd]
+              "bedrock-garbage": bedrock_garbage, "udp-echo": udp_echo,
+              "udp-no-echo": udp_no_echo}[cmd]
         try:
             ok = fn(host, port, *extra)
         except Exception as e:  # noqa: BLE001 - any failure is a test failure

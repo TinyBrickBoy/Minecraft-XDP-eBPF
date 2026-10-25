@@ -32,6 +32,12 @@ This fork of [Outfluencer/Minecraft-XDP-eBPF](https://github.com/Outfluencer/Min
   health check.
 - **Per target metrics**: `minecraft_target_*{dst_ip,dst_port,proto}` and
   `minecraft_target_protected{...,kind,source}`.
+- **UDP reflection protection** (`[reflection]`) for whole networks: a tc
+  egress program records requests of protected addresses to abused service
+  ports (DNS, NTP, memcached, SSDP, ...); answers from those ports pass only
+  when they match a recorded request, non-first UDP fragments are dropped.
+  `mode = "monitor"` only counts (`xdp_reflection_*` metrics), `"enforce"`
+  drops; enforcing is only switched on once the recorder is attached.
 - **Manual overrides** (`[targets]`): always protected `java`/`bedrock`
   entries and `exclude` entries that are never filtered.
 

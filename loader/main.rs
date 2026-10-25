@@ -3,6 +3,7 @@ mod detect;
 mod ebpf;
 mod logging;
 mod metrics;
+mod reflection;
 mod shutdown;
 mod targets;
 
@@ -157,8 +158,19 @@ fn run(args: &Args, config: &Config, shutdown: &Arc<Shutdown>) -> Result<()> {
     ));
     apply_config_targets(config, &targets)?;
 
+    // like detection, a failing reflection setup must not take the filter down
+    let reflection_stats = match reflection::setup(&mut ebpf, interface, config, shutdown) {
+        Ok(stats) => stats,
+        Err(e) => {
+            error!("UDP reflection protection disabled: {e:#}");
+            None
+        }
+    };
+
     let mut threads = Vec::new();
-    if let Some(handle) = metrics::start(&mut ebpf, config, targets.clone(), shutdown)? {
+    if let Some(handle) =
+        metrics::start(&mut ebpf, config, targets.clone(), reflection_stats, shutdown)?
+    {
         threads.push(handle);
     }
     if config.autodetect.enabled {
