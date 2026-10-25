@@ -9,7 +9,7 @@
   ],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 3,
+  "version": 4,
   "editable": true,
   "refresh": "30s",
   "time": {
@@ -17,25 +17,7 @@
     "to": "now"
   },
   "templating": {
-    "list": [
-      {
-        "name": "datasource",
-        "label": "Datenquelle",
-        "type": "datasource",
-        "query": "prometheus",
-        "current": {
-          "selected": true,
-          "text": "Router-Prometheus",
-          "value": "Router-Prometheus"
-        },
-        "regex": "",
-        "hide": 0,
-        "refresh": 1,
-        "includeAll": false,
-        "multi": false,
-        "options": []
-      }
-    ]
+    "list": []
   },
   "annotations": {
     "list": []
@@ -60,7 +42,7 @@
       "id": 2,
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "ag2bkfabvaarke"
       },
       "description": "1 = Filter läuft und liefert Metriken, 0 = aus",
       "gridPos": {
@@ -75,7 +57,7 @@
           "expr": "max(up{job=\"minecraft-xdp\"})",
           "datasource": {
             "type": "prometheus",
-            "uid": "${datasource}"
+            "uid": "ag2bkfabvaarke"
           }
         }
       ],
@@ -120,7 +102,7 @@
       "id": 3,
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "ag2bkfabvaarke"
       },
       "description": "",
       "gridPos": {
@@ -135,7 +117,7 @@
           "expr": "sum(rate(minecraft_dropped_packets[1m]))",
           "datasource": {
             "type": "prometheus",
-            "uid": "${datasource}"
+            "uid": "ag2bkfabvaarke"
           }
         }
       ],
@@ -184,7 +166,7 @@
       "id": 4,
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "ag2bkfabvaarke"
       },
       "description": "Im Monitor-Modus nur gezählt, nicht verworfen",
       "gridPos": {
@@ -199,7 +181,7 @@
           "expr": "sum(rate(xdp_reflection_packets[1m])) or vector(0)",
           "datasource": {
             "type": "prometheus",
-            "uid": "${datasource}"
+            "uid": "ag2bkfabvaarke"
           }
         }
       ],
@@ -248,7 +230,7 @@
       "id": 5,
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "ag2bkfabvaarke"
       },
       "description": "",
       "gridPos": {
@@ -263,7 +245,7 @@
           "expr": "sum(rate(xdp_unused_packets[1m])) or vector(0)",
           "datasource": {
             "type": "prometheus",
-            "uid": "${datasource}"
+            "uid": "ag2bkfabvaarke"
           }
         }
       ],
@@ -312,7 +294,7 @@
       "id": 6,
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "ag2bkfabvaarke"
       },
       "description": "",
       "gridPos": {
@@ -327,7 +309,7 @@
           "expr": "(sum(rate(minecraft_dropped_bytes[1m])) or vector(0)) * 8 + (sum(rate(xdp_reflection_bytes[1m])) or vector(0)) * 8 + (sum(rate(xdp_unused_bytes[1m])) or vector(0)) * 8",
           "datasource": {
             "type": "prometheus",
-            "uid": "${datasource}"
+            "uid": "ag2bkfabvaarke"
           }
         }
       ],
@@ -368,7 +350,7 @@
       "id": 7,
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "ag2bkfabvaarke"
       },
       "description": "",
       "gridPos": {
@@ -383,7 +365,7 @@
           "expr": "sum(increase(minecraft_verified_connections[1m]))",
           "datasource": {
             "type": "prometheus",
-            "uid": "${datasource}"
+            "uid": "ag2bkfabvaarke"
           }
         }
       ],
@@ -424,7 +406,7 @@
       "id": 8,
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "ag2bkfabvaarke"
       },
       "description": "Automatisch erkannte und manuell eingetragene Server (ohne festen Portbereich)",
       "gridPos": {
@@ -439,7 +421,7 @@
           "expr": "count(minecraft_target_protected{kind!=\"none\"}) or vector(0)",
           "datasource": {
             "type": "prometheus",
-            "uid": "${datasource}"
+            "uid": "ag2bkfabvaarke"
           }
         }
       ],
@@ -493,7 +475,7 @@
       "id": 10,
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "ag2bkfabvaarke"
       },
       "description": "Die 10 am stärksten angegriffenen Ziele",
       "gridPos": {
@@ -509,7 +491,7 @@
           "legendFormat": "{{dst_ip}}:{{dst_port}}/{{proto}}",
           "datasource": {
             "type": "prometheus",
-            "uid": "${datasource}"
+            "uid": "ag2bkfabvaarke"
           }
         }
       ],
@@ -553,7 +535,7 @@
       "id": 11,
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "ag2bkfabvaarke"
       },
       "description": "TCP-SYNs (Java) bzw. RakNet-Pings/Requests (Bedrock)",
       "gridPos": {
@@ -569,7 +551,7 @@
           "legendFormat": "{{dst_ip}}:{{dst_port}}/{{proto}}",
           "datasource": {
             "type": "prometheus",
-            "uid": "${datasource}"
+            "uid": "ag2bkfabvaarke"
           }
         }
       ],
@@ -613,7 +595,7 @@
       "id": 12,
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "ag2bkfabvaarke"
       },
       "description": "Neue geprüfte Verbindungen pro Minute; übernommen = nach Neustart/Update weitergeführt",
       "gridPos": {
@@ -629,7 +611,7 @@
           "legendFormat": "verifiziert {{dst_ip}}:{{dst_port}}",
           "datasource": {
             "type": "prometheus",
-            "uid": "${datasource}"
+            "uid": "ag2bkfabvaarke"
           }
         },
         {
@@ -638,7 +620,7 @@
           "legendFormat": "übernommen (Neustart)",
           "datasource": {
             "type": "prometheus",
-            "uid": "${datasource}"
+            "uid": "ag2bkfabvaarke"
           }
         }
       ],
@@ -682,7 +664,7 @@
       "id": 13,
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "ag2bkfabvaarke"
       },
       "description": "",
       "gridPos": {
@@ -698,7 +680,7 @@
           "legendFormat": "verworfen",
           "datasource": {
             "type": "prometheus",
-            "uid": "${datasource}"
+            "uid": "ag2bkfabvaarke"
           }
         },
         {
@@ -707,7 +689,7 @@
           "legendFormat": "geprüft",
           "datasource": {
             "type": "prometheus",
-            "uid": "${datasource}"
+            "uid": "ag2bkfabvaarke"
           }
         }
       ],
@@ -751,7 +733,7 @@
       "id": 14,
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "ag2bkfabvaarke"
       },
       "description": "",
       "gridPos": {
@@ -768,7 +750,7 @@
           "instant": true,
           "datasource": {
             "type": "prometheus",
-            "uid": "${datasource}"
+            "uid": "ag2bkfabvaarke"
           }
         }
       ],
@@ -837,7 +819,7 @@
       "id": 15,
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "ag2bkfabvaarke"
       },
       "description": "",
       "gridPos": {
@@ -854,7 +836,7 @@
           "instant": true,
           "datasource": {
             "type": "prometheus",
-            "uid": "${datasource}"
+            "uid": "ag2bkfabvaarke"
           }
         }
       ],
@@ -934,7 +916,7 @@
       "id": 17,
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "ag2bkfabvaarke"
       },
       "description": "Unaufgeforderte Antworten von DNS, NTP, Memcached, ... und UDP-Fragmente",
       "gridPos": {
@@ -950,7 +932,7 @@
           "legendFormat": "{{service}}",
           "datasource": {
             "type": "prometheus",
-            "uid": "${datasource}"
+            "uid": "ag2bkfabvaarke"
           }
         }
       ],
@@ -994,7 +976,7 @@
       "id": 18,
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "ag2bkfabvaarke"
       },
       "description": "",
       "gridPos": {
@@ -1010,7 +992,7 @@
           "legendFormat": "{{dst_ip}}",
           "datasource": {
             "type": "prometheus",
-            "uid": "${datasource}"
+            "uid": "ag2bkfabvaarke"
           }
         }
       ],
@@ -1054,7 +1036,7 @@
       "id": 19,
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "ag2bkfabvaarke"
       },
       "description": "Ziele ohne Route im eigenen Prefix, z. B. noch nicht vergebene Adressen",
       "gridPos": {
@@ -1070,7 +1052,7 @@
           "legendFormat": "{{dst_ip}}",
           "datasource": {
             "type": "prometheus",
-            "uid": "${datasource}"
+            "uid": "ag2bkfabvaarke"
           }
         }
       ],
@@ -1114,7 +1096,7 @@
       "id": 20,
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "ag2bkfabvaarke"
       },
       "description": "",
       "gridPos": {
@@ -1131,7 +1113,7 @@
           "instant": true,
           "datasource": {
             "type": "prometheus",
-            "uid": "${datasource}"
+            "uid": "ag2bkfabvaarke"
           }
         }
       ],
