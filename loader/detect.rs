@@ -41,6 +41,13 @@ const SNIFF_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 const SNIFF_RCVBUF: i32 = 64 * 1024;
 /// Upper bound of remembered probe results, bounds the memory use.
 const MAX_RECORDS: usize = 65536;
+/// A destination only seen through client SYNs (servers with asymmetric
+/// routing, whose replies never pass the sniff interface) becomes a candidate
+/// once this many different sources tried to connect to it within
+/// SYN_GATE_WINDOW. Port scans, one source per port, never get there.
+const SYN_GATE_SOURCES: usize = 3;
+const SYN_GATE_WINDOW: Duration = Duration::from_secs(600);
+const SYN_GATE_MAX: usize = 65536;
 
 /// A possible server, `hint` is set when the observation already identifies
 /// the protocol (a RakNet pong).
@@ -594,30 +601,32 @@ impl Sniffer {
         let sniffer = Sniffer { fd };
 
         // classic BPF, operating on the IP header: accept non-fragmented TCP
-        // segments with SYN+ACK set (sampled 1 in 4: a busy server is still
-        // seen at once, a flood costs a quarter) and UDP datagrams whose
+        // segments with SYN+ACK (server replies) or SYN only (client
+        // connection attempts), both sampled 1 in 4 (a busy server is still
+        // seen at once, a flood costs a quarter), and UDP datagrams whose
         // payload starts with the RakNet pong id. 256 bytes are enough for the
         // headers and the pong magic
-        let filter: [libc::sock_filter; 19] = [
+        let filter: [libc::sock_filter; 20] = [
             bpf(0x30, 0, 0, 9),              // 0: ldb [9]            ip protocol
-            bpf(0x15, 0, 9, 6),              // 1: jeq #6 ? 2 : 11
+            bpf(0x15, 0, 10, 6),             // 1: jeq #6 ? 2 : 12
             bpf(0x28, 0, 0, 6),              // 2: ldh [6]            frag_off
-            bpf(0x45, 14, 0, 0x1fff),        // 3: fragment -> reject
+            bpf(0x45, 15, 0, 0x1fff),        // 3: fragment -> reject
             bpf(0xb1, 0, 0, 0),              // 4: ldxb 4*([0]&0xf)   ip header length
             bpf(0x50, 0, 0, 13),             // 5: ldb [x+13]         tcp flags
             bpf(0x54, 0, 0, 0x12),           // 6: and #SYN|ACK
-            bpf(0x15, 0, 10, 0x12),          // 7: SYN-ACK ? 8 : reject
-            bpf(0x20, 0, 0, 0xffff_f038),    // 8: ld rand            (SKF_AD_RANDOM)
-            bpf(0x54, 0, 0, 3),              // 9: and #3
-            bpf(0x15, 6, 7, 0),              // 10: 1 in 4 -> accept : reject
-            bpf(0x15, 0, 6, 17),             // 11: udp ? 12 : reject
-            bpf(0x28, 0, 0, 6),              // 12: ldh [6]
-            bpf(0x45, 4, 0, 0x1fff),         // 13: fragment -> reject
-            bpf(0xb1, 0, 0, 0),              // 14: ldxb 4*([0]&0xf)
-            bpf(0x50, 0, 0, 8),              // 15: ldb [x+8]         first payload byte
-            bpf(0x15, 0, 1, RAKNET_UNCONNECTED_PONG as u32), // 16: pong ? accept : reject
-            bpf(0x06, 0, 0, 256),            // 17: accept
-            bpf(0x06, 0, 0, 0),              // 18: reject
+            bpf(0x15, 1, 0, 0x12),           // 7: SYN-ACK -> 9
+            bpf(0x15, 0, 10, 0x02),          // 8: SYN ? 9 : reject
+            bpf(0x20, 0, 0, 0xffff_f038),    // 9: ld rand            (SKF_AD_RANDOM)
+            bpf(0x54, 0, 0, 3),              // 10: and #3
+            bpf(0x15, 6, 7, 0),              // 11: 1 in 4 -> accept : reject
+            bpf(0x15, 0, 6, 17),             // 12: udp ? 13 : reject
+            bpf(0x28, 0, 0, 6),              // 13: ldh [6]
+            bpf(0x45, 4, 0, 0x1fff),         // 14: fragment -> reject
+            bpf(0xb1, 0, 0, 0),              // 15: ldxb 4*([0]&0xf)
+            bpf(0x50, 0, 0, 8),              // 16: ldb [x+8]         first payload byte
+            bpf(0x15, 0, 1, RAKNET_UNCONNECTED_PONG as u32), // 17: pong ? accept : reject
+            bpf(0x06, 0, 0, 256),            // 18: accept
+            bpf(0x06, 0, 0, 0),              // 19: reject
         ];
         let program = libc::sock_fprog {
             len: filter.len() as u16,
@@ -695,13 +704,21 @@ const fn bpf(code: u16, jt: u8, jf: u8, k: u32) -> libc::sock_filter {
 
 fn sniff_loop(sniffer: Sniffer, scope: Scope, tx: Sender<Candidate>, shutdown: Arc<Shutdown>) {
     let mut reported: HashMap<DstKey, Instant> = HashMap::new();
+    let mut syn_gate = SynGate::default();
     let mut buf = [0u8; 256];
     while shutdown.is_running() {
         let Some(len) = sniffer.recv(&mut buf) else {
             continue;
         };
-        let Some(candidate) = parse_server_reply(&buf[..len]) else {
-            continue;
+        let candidate = match parse_observation(&buf[..len]) {
+            Some(Observation::Reply(candidate)) => candidate,
+            Some(Observation::Syn { key, source }) => {
+                if !scope.allows(&key) || !syn_gate.passes(key, source, Instant::now()) {
+                    continue;
+                }
+                Candidate { key, hint: None }
+            }
+            None => continue,
         };
         if !scope.allows(&candidate.key) {
             continue;
@@ -724,29 +741,81 @@ fn sniff_loop(sniffer: Sniffer, scope: Scope, tx: Sender<Candidate>, shutdown: A
     }
 }
 
-/// Extracts the server side (source) of a SYN-ACK or RakNet pong.
-fn parse_server_reply(packet: &[u8]) -> Option<Candidate> {
+/// What a sniffed packet tells about a possible server.
+enum Observation {
+    /// A server reply (SYN-ACK, RakNet pong): its source is a server.
+    Reply(Candidate),
+    /// A client connection attempt to `key`, from `source`.
+    Syn { key: DstKey, source: Ipv4Addr },
+}
+
+fn parse_observation(packet: &[u8]) -> Option<Observation> {
     if packet.len() < 20 || packet[0] >> 4 != 4 {
         return None;
     }
     let ihl = ((packet[0] & 0x0f) as usize) * 4;
     let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+    let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
     let l4 = packet.get(ihl..)?;
-    let port = u16::from_be_bytes([*l4.first()?, *l4.get(1)?]);
-    let addr = SocketAddrV4::new(src, port);
+    let sport = u16::from_be_bytes([*l4.first()?, *l4.get(1)?]);
     match packet[9] {
         6 => {
-            let flags = *l4.get(13)?;
-            (flags & 0x12 == 0x12).then(|| Candidate {
-                key: DstKey::new(addr, PROTO_TCP),
-                hint: Some(Kind::Java),
-            })
+            let dport = u16::from_be_bytes([*l4.get(2)?, *l4.get(3)?]);
+            match *l4.get(13)? & 0x12 {
+                0x12 => Some(Observation::Reply(Candidate {
+                    key: DstKey::new(SocketAddrV4::new(src, sport), PROTO_TCP),
+                    hint: Some(Kind::Java),
+                })),
+                0x02 => Some(Observation::Syn {
+                    key: DstKey::new(SocketAddrV4::new(dst, dport), PROTO_TCP),
+                    source: src,
+                }),
+                _ => None,
+            }
         }
-        17 => is_raknet_pong(l4.get(8..)?).then(|| Candidate {
-            key: DstKey::new(addr, PROTO_UDP),
-            hint: Some(Kind::Bedrock),
+        17 => is_raknet_pong(l4.get(8..)?).then(|| {
+            Observation::Reply(Candidate {
+                key: DstKey::new(SocketAddrV4::new(src, sport), PROTO_UDP),
+                hint: Some(Kind::Bedrock),
+            })
         }),
         _ => None,
+    }
+}
+
+/// Counts distinct client sources per destination, see SYN_GATE_SOURCES.
+#[derive(Default)]
+struct SynGate {
+    seen: HashMap<DstKey, (Instant, Vec<Ipv4Addr>)>,
+}
+
+impl SynGate {
+    /// Records a SYN; true exactly when `key` reaches the source threshold.
+    fn passes(&mut self, key: DstKey, source: Ipv4Addr, now: Instant) -> bool {
+        if self.seen.len() >= SYN_GATE_MAX && !self.seen.contains_key(&key) {
+            self.seen.retain(|_, (first, _)| now.duration_since(*first) < SYN_GATE_WINDOW);
+            if self.seen.len() >= SYN_GATE_MAX {
+                return false;
+            }
+        }
+        let (first, sources) = self.seen.entry(key).or_insert((now, Vec::new()));
+        if now.duration_since(*first) >= SYN_GATE_WINDOW {
+            *first = now;
+            sources.clear();
+        }
+        if sources.len() >= SYN_GATE_SOURCES || sources.contains(&source) {
+            return false;
+        }
+        sources.push(source);
+        sources.len() == SYN_GATE_SOURCES
+    }
+}
+
+#[cfg(test)]
+fn parse_server_reply(packet: &[u8]) -> Option<Candidate> {
+    match parse_observation(packet)? {
+        Observation::Reply(candidate) => Some(candidate),
+        Observation::Syn { .. } => None,
     }
 }
 
@@ -814,6 +883,39 @@ mod tests {
         pong[45..61].copy_from_slice(&RAKNET_MAGIC);
         let candidate = parse_server_reply(&pong).unwrap();
         assert_eq!(candidate.key.to_string(), "85.93.5.2:19132/udp");
+    }
+
+    #[test]
+    fn syn_gate_needs_distinct_sources() {
+        let key = DstKey::new("85.93.5.80:25565".parse().unwrap(), PROTO_TCP);
+        let mut gate = SynGate::default();
+        let now = Instant::now();
+        let ip = |n| Ipv4Addr::new(1, 2, 3, n);
+        assert!(!gate.passes(key, ip(1), now));
+        assert!(!gate.passes(key, ip(1), now)); // same source again
+        assert!(!gate.passes(key, ip(2), now));
+        assert!(gate.passes(key, ip(3), now)); // third distinct source
+        assert!(!gate.passes(key, ip(4), now)); // reported once per window
+        let later = now + SYN_GATE_WINDOW;
+        assert!(!gate.passes(key, ip(5), later)); // window restarted
+    }
+
+    #[test]
+    fn parses_client_syns() {
+        let mut syn = vec![0u8; 40];
+        syn[0] = 0x45;
+        syn[9] = 6;
+        syn[12..16].copy_from_slice(&[1, 2, 3, 4]);
+        syn[16..20].copy_from_slice(&[85, 93, 5, 80]);
+        syn[22..24].copy_from_slice(&25565u16.to_be_bytes());
+        syn[33] = 0x02;
+        match parse_observation(&syn) {
+            Some(Observation::Syn { key, source }) => {
+                assert_eq!(key.to_string(), "85.93.5.80:25565/tcp");
+                assert_eq!(source, Ipv4Addr::new(1, 2, 3, 4));
+            }
+            _ => panic!("expected a syn observation"),
+        }
     }
 
     #[test]
