@@ -11,8 +11,10 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# Minecraft XDP filter configuration.
 # Every option is listed with its default value.
 
 [filter]
-# Inclusive TCP destination port range to protect.
-# Use the same value for both to protect a single port.
+# Static inclusive TCP destination port range protected as minecraft java on
+# every destination address. Use the same value for both to protect a single
+# port, or 0 for both to only protect the targets from [targets] and
+# [autodetect].
 start_port = 25565
 end_port = 25565
 
@@ -38,6 +40,54 @@ player_idle_timeout_secs = 60
 # true  -> usernames are limited to 16 characters (Mojang online mode).
 # false -> allow the protocol maximum (offline / cracked servers).
 online_names = true
+
+# Grace window in seconds after the loader starts and after a target becomes
+# protected: connections established before are adopted instead of dropped,
+# so restarts and newly protected servers do not kick players. 0 disables
+# adoption. Must be between 0 and 3600.
+adopt_grace_secs = 120
+
+[targets]
+# Destinations protected regardless of auto detection, as "ip:port".
+java = []
+bedrock = []
+
+# Destinations that are never protected, as "ip:port/tcp" or "ip:port/udp".
+# Overrides the static range and auto detection.
+exclude = []
+
+[autodetect]
+# Find minecraft servers automatically and protect them live: listening
+# sockets of this host and servers that answer through sniff_interfaces are
+# probed with a real java status ping / RakNet ping, and only servers that
+# answer correctly are protected.
+enabled = false
+
+# Only servers inside these networks are considered, e.g. ["85.93.5.0/24"].
+networks = []
+
+# Interfaces on which server replies (TCP SYN-ACKs, RakNet pongs) of remote
+# servers are observed, e.g. a tunnel interface like "wg-bgp".
+sniff_interfaces = []
+
+# Ports below min_port and the ports in exclude_ports are never probed.
+min_port = 1024
+exclude_ports = [1433, 1521, 2049, 3306, 3389, 5432, 5672, 6379, 8080, 8443, 9000, 9090, 9200, 11211, 15672, 27017]
+
+# Seconds between re-probes of known servers.
+probe_interval_secs = 300
+
+# Timeout of a single probe in milliseconds.
+probe_timeout_ms = 2000
+
+# A protected server that did not answer for this many seconds is removed.
+remove_after_secs = 21600
+
+# A port that is no minecraft server is probed again after this many seconds.
+retry_negative_secs = 21600
+
+# File that keeps the detected servers across restarts.
+state_file = "targets.json"
 
 [xdp]
 # How the filter attaches to the network interface.
@@ -95,6 +145,8 @@ file_max_mb = 100
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub filter: FilterConfig,
+    pub targets: TargetsConfig,
+    pub autodetect: AutodetectConfig,
     pub xdp: XdpConfig,
     pub metrics: MetricsConfig,
     pub logging: LoggingConfig,
@@ -122,6 +174,9 @@ pub struct FilterConfig {
     pub player_idle_timeout_secs: u64,
     /// Enforce online-mode (<= 16 char) usernames. Maps to `ONLINE_NAMES`.
     pub online_names: bool,
+    /// Seconds during which established flows of newly protected targets
+    /// (and of every target right after start) are adopted.
+    pub adopt_grace_secs: u64,
 }
 
 impl Default for FilterConfig {
@@ -133,6 +188,57 @@ impl Default for FilterConfig {
             hit_count_reset_secs: 3,
             player_idle_timeout_secs: 60,
             online_names: true,
+            adopt_grace_secs: 120,
+        }
+    }
+}
+
+/// `[targets]` — manually protected and excluded destinations.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TargetsConfig {
+    /// "ip:port" destinations always protected as java.
+    pub java: Vec<String>,
+    /// "ip:port" destinations always protected as bedrock.
+    pub bedrock: Vec<String>,
+    /// "ip:port/tcp|udp" destinations that are never protected.
+    pub exclude: Vec<String>,
+}
+
+/// `[autodetect]` — live detection of minecraft servers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutodetectConfig {
+    pub enabled: bool,
+    /// CIDRs whose servers are considered.
+    pub networks: Vec<String>,
+    /// Interfaces on which replies of remote servers are observed.
+    pub sniff_interfaces: Vec<String>,
+    pub min_port: u16,
+    pub exclude_ports: Vec<u16>,
+    pub probe_interval_secs: u64,
+    pub probe_timeout_ms: u64,
+    pub remove_after_secs: u64,
+    pub retry_negative_secs: u64,
+    pub state_file: String,
+}
+
+impl Default for AutodetectConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            networks: Vec::new(),
+            sniff_interfaces: Vec::new(),
+            min_port: 1024,
+            exclude_ports: vec![
+                1433, 1521, 2049, 3306, 3389, 5432, 5672, 6379, 8080, 8443, 9000, 9090, 9200,
+                11211, 15672, 27017,
+            ],
+            probe_interval_secs: 300,
+            probe_timeout_ms: 2000,
+            remove_after_secs: 21600,
+            retry_negative_secs: 21600,
+            state_file: "targets.json".into(),
         }
     }
 }
@@ -285,6 +391,8 @@ impl Config {
     /// Reject values the eBPF program or loader cannot represent sensibly.
     fn validate(&self) -> Result<()> {
         self.filter.validate()?;
+        self.targets.validate()?;
+        self.autodetect.validate()?;
         self.xdp.validate()?;
         self.metrics.validate()?;
         self.logging.validate()
@@ -301,8 +409,8 @@ fn check_range(option: &str, value: u64, min: u64, max: u64) -> Result<()> {
 
 impl FilterConfig {
     fn validate(&self) -> Result<()> {
-        if self.start_port == 0 {
-            bail!("[filter] start_port must be >= 1");
+        if self.start_port == 0 && self.end_port != 0 {
+            bail!("[filter] start_port must be >= 1 (or 0 for both to disable the static range)");
         }
         if self.start_port > self.end_port {
             bail!(
@@ -322,7 +430,70 @@ impl FilterConfig {
             self.player_idle_timeout_secs,
             1,
             86_400,
-        )
+        )?;
+        check_range("[filter] adopt_grace_secs", self.adopt_grace_secs, 0, 3_600)
+    }
+}
+
+impl TargetsConfig {
+    fn validate(&self) -> Result<()> {
+        for entry in self.java.iter().chain(&self.bedrock) {
+            parse_socket_addr(entry).with_context(|| format!("[targets] invalid entry '{entry}'"))?;
+        }
+        for entry in &self.exclude {
+            parse_exclude(entry).with_context(|| format!("[targets] invalid exclude '{entry}'"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Parses "ip:port" (IPv4 only, the filter does not inspect IPv6).
+pub fn parse_socket_addr(entry: &str) -> Result<std::net::SocketAddrV4> {
+    entry
+        .parse()
+        .with_context(|| format!("expected \"ipv4:port\", got '{entry}'"))
+}
+
+/// Parses "ip:port/tcp" or "ip:port/udp" into the address and its IP protocol.
+pub fn parse_exclude(entry: &str) -> Result<(std::net::SocketAddrV4, u8)> {
+    let (addr, proto) = entry
+        .rsplit_once('/')
+        .with_context(|| format!("expected \"ipv4:port/tcp\" or \"ipv4:port/udp\", got '{entry}'"))?;
+    let proto = match proto {
+        "tcp" => libc::IPPROTO_TCP as u8,
+        "udp" => libc::IPPROTO_UDP as u8,
+        other => bail!("unknown protocol '{other}', expected tcp or udp"),
+    };
+    Ok((parse_socket_addr(addr)?, proto))
+}
+
+/// Parses "a.b.c.d/len" into (network address, prefix length).
+pub fn parse_cidr(entry: &str) -> Result<(std::net::Ipv4Addr, u8)> {
+    let (addr, len) = entry.split_once('/').unwrap_or((entry, "32"));
+    let addr: std::net::Ipv4Addr = addr
+        .parse()
+        .with_context(|| format!("invalid network address in '{entry}'"))?;
+    let len: u8 = len
+        .parse()
+        .with_context(|| format!("invalid prefix length in '{entry}'"))?;
+    if len > 32 {
+        bail!("prefix length of '{entry}' must be <= 32");
+    }
+    Ok((addr, len))
+}
+
+impl AutodetectConfig {
+    fn validate(&self) -> Result<()> {
+        for network in &self.networks {
+            parse_cidr(network).context("[autodetect] networks")?;
+        }
+        if self.enabled && self.networks.is_empty() {
+            bail!("[autodetect] networks must not be empty when auto detection is enabled");
+        }
+        check_range("[autodetect] probe_interval_secs", self.probe_interval_secs, 10, 86_400)?;
+        check_range("[autodetect] probe_timeout_ms", self.probe_timeout_ms, 100, 30_000)?;
+        check_range("[autodetect] remove_after_secs", self.remove_after_secs, 60, 30 * 86_400)?;
+        check_range("[autodetect] retry_negative_secs", self.retry_negative_secs, 10, 30 * 86_400)
     }
 }
 
@@ -402,6 +573,30 @@ mod tests {
     #[test]
     fn rejects_zero_start_port() {
         let cfg: Config = toml::from_str("[filter]\nstart_port = 0").unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_disabled_static_range() {
+        let cfg: Config = toml::from_str("[filter]\nstart_port = 0\nend_port = 0").unwrap();
+        cfg.validate().expect("0/0 disables the static range");
+    }
+
+    #[test]
+    fn parses_targets_and_excludes() {
+        let cfg: Config = toml::from_str(
+            "[targets]\njava = [\"85.93.5.1:25569\"]\nexclude = [\"85.93.5.55:443/tcp\"]",
+        )
+        .unwrap();
+        cfg.validate().expect("valid targets");
+        assert!(parse_exclude("1.2.3.4:5/icmp").is_err());
+        assert!(parse_socket_addr("1.2.3.4").is_err());
+        assert_eq!(parse_cidr("85.93.5.0/24").unwrap().1, 24);
+    }
+
+    #[test]
+    fn autodetect_requires_networks() {
+        let cfg: Config = toml::from_str("[autodetect]\nenabled = true").unwrap();
         assert!(cfg.validate().is_err());
     }
 

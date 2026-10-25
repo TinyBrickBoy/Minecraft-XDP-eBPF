@@ -7,6 +7,37 @@ The default filtered port is 25565.
 
 💬 Questions, feedback or help needed? Join the Discord: https://discord.gg/JnBJPgV4GW
 
+## Fork additions
+
+This fork of [Outfluencer/Minecraft-XDP-eBPF](https://github.com/Outfluencer/Minecraft-XDP-eBPF) adds:
+
+- **Live target list**: protected destinations are kept per `ip:port/proto` in
+  a kernel map that is changed at runtime, no reload needed. The `[filter]`
+  port range still works as a static java range (`0`/`0` disables it).
+- **Auto detection** (`[autodetect]`): listening sockets of the host and
+  servers answering through `sniff_interfaces` (TCP SYN-ACKs, RakNet pongs,
+  sampled and filtered in the kernel) become candidates; only candidates that
+  answer a real java status ping or RakNet ping get protected. A protected
+  server that stops answering stays protected for `remove_after_secs`, so an
+  attack can not switch its own protection off. Detected servers survive
+  restarts via `state_file`.
+- **Bedrock (RakNet)**: unverified flows may only send valid offline
+  handshake messages (magic checked, throttled per source ip); a valid open
+  connection request 2 verifies the flow. Amplification source ports and
+  fragments are dropped.
+- **No kicks on restart/update**: established connections are adopted during
+  `adopt_grace_secs` after the loader starts and after a target is added.
+  `contrib/update.sh` builds and tests in docker, checks the config with the
+  new binary, installs atomically, restarts and rolls back on a failed
+  health check.
+- **Per target metrics**: `minecraft_target_*{dst_ip,dst_port,proto}` and
+  `minecraft_target_protected{...,kind,source}`.
+- **Manual overrides** (`[targets]`): always protected `java`/`bedrock`
+  entries and `exclude` entries that are never filtered.
+
+Tests: `cargo test` and `tests/e2e_docker.sh` (real traffic through the
+filter inside an isolated privileged container, see the script header).
+
 ## Features
 - **Protocol Analysis**: Analyzes Minecraft handshakes, status, ping, and login requests.
 - **Deep Packet Inspection**: Drops invalid packets, bad VarInts, and protocol violations.

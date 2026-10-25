@@ -33,12 +33,17 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
     let hit_count: u32 = filter.hit_count;
     let hit_count_reset_ns: u64 = filter.hit_count_reset_secs * 1_000_000_000;
     let player_idle_ns: u64 = filter.player_idle_timeout_secs * 1_000_000_000;
+    // established flows to the static range are adopted for a while after
+    // start, so a restart does not kick the connected players
+    let static_grace_until_ns: u64 =
+        crate::targets::monotonic_ns() + filter.adopt_grace_secs * 1_000_000_000;
 
     let mut ebpf = EbpfLoader::new()
         .override_global("PROMETHEUS", &prometheus, true)
         .override_global("ONLINE_NAMES", &online_names, true)
         .override_global("START_PORT", &start_port, true)
         .override_global("END_PORT", &end_port, true)
+        .override_global("STATIC_GRACE_UNTIL_NS", &static_grace_until_ns, true)
         .override_global("HIT_COUNT", &hit_count, true)
         .override_global("HIT_COUNT_RESET_NS", &hit_count_reset_ns, true)
         .override_global("PLAYER_IDLE_NS", &player_idle_ns, true)

@@ -1,0 +1,16 @@
+[Unit]
+Description=Minecraft XDP eBPF filter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/minecraft-xdp
+ExecStartPre=/opt/minecraft-xdp/xdp-loader --check-config --config /opt/minecraft-xdp/config.toml
+ExecStart=/opt/minecraft-xdp/xdp-loader --config /opt/minecraft-xdp/config.toml eth0
+# established connections are adopted after a (re)start, see adopt_grace_secs
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
