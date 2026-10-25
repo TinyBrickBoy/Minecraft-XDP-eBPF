@@ -155,6 +155,17 @@ struct
     __type(value, struct statistics);
 } stats_map SEC(".maps");
 
+// per destination ip:port statistics, so the metrics show which address is
+// being attacked. LRU so a flood across many addresses can never fail an
+// insert, at worst the least active destinations lose their counters
+struct
+{
+    __uint(type, BPF_MAP_TYPE_LRU_PERCPU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct dst_key);
+    __type(value, struct statistics);
+} dst_stats_map SEC(".maps");
+
 /* ------------------------------------------------------------------------
  * Helpers
  * --------------------------------------------------------------------- */
@@ -177,7 +188,7 @@ static __always_inline __u8 detect_tcp_bypass(const struct tcphdr *tcp)
  * conntrack map into the player map so its packets skip inspection from now
  * on, and arm the idle timer that will eventually clean the entry up.
  */
-static __always_inline __u32 switch_to_verified(const __u64 raw_packet_len, struct statistics *stats_ptr, const struct ipv4_flow_key *flow_key)
+static __always_inline __u32 switch_to_verified(const __u64 raw_packet_len, struct statistics *stats_ptr, struct statistics *dst_stats_ptr, const struct ipv4_flow_key *flow_key)
 {
     bpf_map_delete_elem(&conntrack_map, flow_key);
     const struct player_entry fresh = {.packets = 1, .last_packets = 0};
@@ -198,11 +209,11 @@ static __always_inline __u32 switch_to_verified(const __u64 raw_packet_len, stru
         bpf_map_delete_elem(&player_connection_map, flow_key);
         goto drop;
     }
-    count_stats(stats_ptr, VERIFIED, 1);
+    count_stats(stats_ptr, dst_stats_ptr, VERIFIED, 1);
     return XDP_PASS;
 drop:
-    count_stats(stats_ptr, DROPPED_BYTES, raw_packet_len);
-    count_stats(stats_ptr, DROP_CONNECTION | DROPPED_PACKET, 1);
+    count_stats(stats_ptr, dst_stats_ptr, DROPPED_BYTES, raw_packet_len);
+    count_stats(stats_ptr, dst_stats_ptr, DROP_CONNECTION | DROPPED_PACKET, 1);
     return XDP_DROP;
 }
 
@@ -288,6 +299,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
     }
 
     struct statistics *stats_ptr = NULL;
+    struct statistics *dst_stats_ptr = NULL;
     if (PROMETHEUS)
     {
         __u32 key = 0;
@@ -297,14 +309,23 @@ __s32 minecraft_filter(struct xdp_md *ctx)
             // per-cpu array index 0 always exists, this is unreachable
             return XDP_DROP;
         }
+
+        const struct dst_key dst = {.daddr = ip->daddr, .dport = tcp->dest, .pad = 0};
+        dst_stats_ptr = bpf_map_lookup_elem(&dst_stats_map, &dst);
+        if (!dst_stats_ptr)
+        {
+            const struct statistics zero = {0};
+            bpf_map_update_elem(&dst_stats_map, &dst, &zero, BPF_NOEXIST);
+            dst_stats_ptr = bpf_map_lookup_elem(&dst_stats_map, &dst);
+        }
     }
 
     const __u64 raw_packet_len = (__u64)(data_end - data);
-    count_stats(stats_ptr, INCOMING_BYTES, raw_packet_len);
+    count_stats(stats_ptr, dst_stats_ptr, INCOMING_BYTES, raw_packet_len);
 
     if (detect_tcp_bypass(tcp))
     {
-        count_stats(stats_ptr, TCP_BYPASS, 1);
+        count_stats(stats_ptr, dst_stats_ptr, TCP_BYPASS, 1);
         goto drop;
     }
 
@@ -314,13 +335,13 @@ __s32 minecraft_filter(struct xdp_md *ctx)
     // new connection: throttle it, then start tracking it
     if (tcp->syn)
     {
-        count_stats(stats_ptr, SYN_RECEIVE, 1);
+        count_stats(stats_ptr, dst_stats_ptr, SYN_RECEIVE, 1);
 
         // drop SYNs carrying payload (e.g. TCP fast open): the data would
         // reach the backend without ever passing the inspection state machine
         if (bpf_ntohs(ip->tot_len) > (ip->ihl * 4) + tcp_hdr_len)
         {
-            count_stats(stats_ptr, TCP_BYPASS, 1);
+            count_stats(stats_ptr, dst_stats_ptr, TCP_BYPASS, 1);
             goto drop;
         }
 
@@ -524,7 +545,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
                 goto drop;
             }
             // tracking ends here, no need to update the expected sequence
-            return switch_to_verified(raw_packet_len, stats_ptr, &flow_key);
+            return switch_to_verified(raw_packet_len, stats_ptr, dst_stats_ptr, &flow_key);
         }
         if (state == PING_COMPLETE)
         {
@@ -545,16 +566,16 @@ __s32 minecraft_filter(struct xdp_md *ctx)
 // shared exit paths: jumping here instead of duplicating these blocks keeps
 // the generated program drastically smaller
 drop_connection:
-    count_stats(stats_ptr, DROP_CONNECTION, 1);
+    count_stats(stats_ptr, dst_stats_ptr, DROP_CONNECTION, 1);
     bpf_map_delete_elem(&conntrack_map, &flow_key);
     // fall through
 drop:
-    count_stats(stats_ptr, DROPPED_PACKET, 1);
-    count_stats(stats_ptr, DROPPED_BYTES, raw_packet_len);
+    count_stats(stats_ptr, dst_stats_ptr, DROPPED_PACKET, 1);
+    count_stats(stats_ptr, dst_stats_ptr, DROPPED_BYTES, raw_packet_len);
     return XDP_DROP;
 update_state:
     initial_state->expected_sequence += tcp_payload_len;
-    count_stats(stats_ptr, STATE_SWITCH, 1);
+    count_stats(stats_ptr, dst_stats_ptr, STATE_SWITCH, 1);
     return XDP_PASS;
 }
 

@@ -1,12 +1,16 @@
+use std::net::Ipv4Addr;
 use std::sync::{Arc, LazyLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use aya::maps::{MapData, PerCpuArray};
+use aya::maps::{MapData, PerCpuArray, PerCpuHashMap};
 use aya::{Ebpf, Pod};
 use log::{debug, error, info};
-use prometheus::{Encoder, IntCounter, TextEncoder, register_int_counter};
+use prometheus::{
+    Encoder, IntCounter, IntCounterVec, TextEncoder, register_int_counter,
+    register_int_counter_vec,
+};
 
 use crate::config::Config;
 use crate::shutdown::Shutdown;
@@ -16,7 +20,7 @@ use crate::shutdown::Shutdown;
 /// per-cpu summing and the published metrics all stay in sync from a single
 /// field list. Field order and types must match the C struct exactly.
 macro_rules! statistics {
-    ($($field:ident => $metric:literal, $help:literal;)+) => {
+    ($($field:ident => $metric:literal, $dst_metric:literal, $help:literal;)+) => {
         #[repr(C)]
         #[derive(Copy, Clone, Debug, Default)]
         pub struct Statistics {
@@ -53,24 +57,67 @@ macro_rules! statistics {
                 $(self.$field.inc_by(total.$field.saturating_sub(self.$field.get()));)+
             }
         }
+
+        /// Same counters as `Counters`, labelled per destination ip:port.
+        struct DstCounters {
+            $($field: IntCounterVec,)+
+        }
+
+        impl DstCounters {
+            fn new() -> Self {
+                Self {
+                    $($field: register_int_counter_vec!(
+                        $dst_metric,
+                        concat!($help, " per destination ip:port"),
+                        &["dst_ip", "dst_port"]
+                    ).unwrap(),)+
+                }
+            }
+
+            /// Like `Counters::publish`. An entry evicted from the LRU map
+            /// restarts at 0; saturating_sub keeps the counter monotonic.
+            fn publish(&self, labels: &[&str], total: &Statistics) {
+                $(
+                    let counter = self.$field.with_label_values(labels);
+                    counter.inc_by(total.$field.saturating_sub(counter.get()));
+                )+
+            }
+        }
     };
 }
 
 statistics! {
-    verified        => "minecraft_verified_connections", "Total verified connections";
-    dropped_packets => "minecraft_dropped_packets", "Total dropped packets";
-    state_switches  => "minecraft_state_switches", "Total state switches";
-    drop_connection => "minecraft_dropped_connections", "Total dropped connections";
-    syn             => "minecraft_syn_packets", "Total SYN packets";
-    tcp_bypass      => "minecraft_tcp_bypass", "Total TCP bypass attempts";
-    incoming_bytes  => "minecraft_incoming_bytes", "Total incoming bytes";
-    dropped_bytes   => "minecraft_dropped_bytes", "Total dropped bytes";
+    verified        => "minecraft_verified_connections", "minecraft_target_verified_connections", "Total verified connections";
+    dropped_packets => "minecraft_dropped_packets", "minecraft_target_dropped_packets", "Total dropped packets";
+    state_switches  => "minecraft_state_switches", "minecraft_target_state_switches", "Total state switches";
+    drop_connection => "minecraft_dropped_connections", "minecraft_target_dropped_connections", "Total dropped connections";
+    syn             => "minecraft_syn_packets", "minecraft_target_syn_packets", "Total SYN packets";
+    tcp_bypass      => "minecraft_tcp_bypass", "minecraft_target_tcp_bypass", "Total TCP bypass attempts";
+    incoming_bytes  => "minecraft_incoming_bytes", "minecraft_target_incoming_bytes", "Total incoming bytes";
+    dropped_bytes   => "minecraft_dropped_bytes", "minecraft_target_dropped_bytes", "Total dropped bytes";
 }
 
 // compile-time layout check, mirrors the _Static_assert in xdp/stats.h
 const _: () = assert!(std::mem::size_of::<Statistics>() == 64);
 
+/// Userspace mirror of `struct dst_key` (see xdp/stats.h), fields in network
+/// byte order.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct DstKey {
+    daddr: u32,
+    dport: u16,
+    pad: u16,
+}
+
+// SAFETY: repr(C) struct of plain integers without padding, valid for any bit
+// pattern read from the map.
+unsafe impl Pod for DstKey {}
+
+const _: () = assert!(std::mem::size_of::<DstKey>() == 8);
+
 static COUNTERS: LazyLock<Counters> = LazyLock::new(Counters::new);
+static DST_COUNTERS: LazyLock<DstCounters> = LazyLock::new(DstCounters::new);
 
 /// Starts the metrics machinery if enabled in the config: takes ownership of
 /// the stats map, spawns the polling thread and (when an address is
@@ -88,6 +135,10 @@ pub fn start(
         .take_map("stats_map")
         .context("can't take map 'stats_map'")?;
     let stats = PerCpuArray::try_from(map)?;
+    let dst_map = ebpf
+        .take_map("dst_stats_map")
+        .context("can't take map 'dst_stats_map'")?;
+    let dst_stats = PerCpuHashMap::try_from(dst_map)?;
 
     match &config.metrics.addr {
         Some(addr) => serve_http(addr.clone()),
@@ -98,7 +149,7 @@ pub fn start(
     let shutdown = shutdown.clone();
     let handle = thread::Builder::new()
         .name("track-stats".into())
-        .spawn(move || poll_loop(stats, shutdown, poll_interval))?;
+        .spawn(move || poll_loop(stats, dst_stats, shutdown, poll_interval))?;
     Ok(Some(handle))
 }
 
@@ -108,6 +159,7 @@ pub fn start(
 /// filter itself.
 fn poll_loop(
     stats: PerCpuArray<MapData, Statistics>,
+    dst_stats: PerCpuHashMap<MapData, DstKey, Statistics>,
     shutdown: Arc<Shutdown>,
     poll_interval: Duration,
 ) {
@@ -125,8 +177,30 @@ fn poll_loop(
                 error!("Failed to read stats map (retrying next interval): {e}");
             }
         }
+        publish_dst_stats(&dst_stats);
         if !shutdown.sleep(poll_interval) {
             return;
+        }
+    }
+}
+
+/// Sums and publishes every entry of the per destination ip:port map.
+fn publish_dst_stats(dst_stats: &PerCpuHashMap<MapData, DstKey, Statistics>) {
+    for entry in dst_stats.iter() {
+        match entry {
+            Ok((key, per_cpu)) => {
+                let mut total = Statistics::default();
+                for cpu_stats in per_cpu.iter() {
+                    total.add(cpu_stats);
+                }
+                let ip = Ipv4Addr::from(key.daddr.to_ne_bytes()).to_string();
+                let port = u16::from_be(key.dport).to_string();
+                DST_COUNTERS.publish(&[&ip, &port], &total);
+            }
+            Err(e) => {
+                // keys can vanish mid-iteration through LRU eviction
+                debug!("Failed to read dst stats entry: {e}");
+            }
         }
     }
 }
