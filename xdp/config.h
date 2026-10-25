@@ -21,6 +21,7 @@ volatile const __u8 ONLINE_NAMES = 0;         // enforce online-mode usernames (
 volatile const __u32 START_PORT = 0;          // first TCP port of the static java range (inclusive), 0 disables it
 volatile const __u32 END_PORT = 0;            // last TCP port of the static java range (inclusive)
 volatile const __u64 STATIC_GRACE_UNTIL_NS = 0; // ktime until which the static range adopts established flows
+volatile const __u8 UNUSED_DROP = 0;          // drop traffic to unrouted addresses of unused_networks
 volatile const __u32 HIT_COUNT = 0;           // max SYNs per source ip per window, 0 disables the throttle
 volatile const __u64 HIT_COUNT_RESET_NS = 0;  // throttle window length in nanoseconds
 volatile const __u64 PLAYER_IDLE_NS = 0;      // idle check interval for verified connections in nanoseconds;

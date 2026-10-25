@@ -41,6 +41,7 @@
 #endif
 
 #include "reflection.h"
+#include "unused.h"
 
 /* ------------------------------------------------------------------------
  * Connection tracking of unverified connections
@@ -579,6 +580,12 @@ __s32 minecraft_filter(struct xdp_md *ctx)
 
     const struct iphdr *ip = data + sizeof(struct ethhdr);
     if ((const void *)(ip + 1) > data_end || ip->ihl < 5)
+    {
+        return XDP_DROP;
+    }
+
+    // addresses without a route would be dropped by the stack anyway
+    if (unused_destination(ctx, ip))
     {
         return XDP_DROP;
     }

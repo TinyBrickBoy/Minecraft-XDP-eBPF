@@ -35,6 +35,7 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
     let player_idle_ns: u64 = filter.player_idle_timeout_secs * 1_000_000_000;
     // established flows to the static range are adopted for a while after
     // start, so a restart does not kick the connected players
+    let unused_drop: u8 = config.unused.enabled as u8;
     let static_grace_until_ns: u64 =
         crate::targets::monotonic_ns() + filter.adopt_grace_secs * 1_000_000_000;
 
@@ -44,6 +45,7 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
         .override_global("START_PORT", &start_port, true)
         .override_global("END_PORT", &end_port, true)
         .override_global("STATIC_GRACE_UNTIL_NS", &static_grace_until_ns, true)
+        .override_global("UNUSED_DROP", &unused_drop, true)
         .override_global("HIT_COUNT", &hit_count, true)
         .override_global("HIT_COUNT_RESET_NS", &hit_count_reset_ns, true)
         .override_global("PLAYER_IDLE_NS", &player_idle_ns, true)

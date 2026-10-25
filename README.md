@@ -38,6 +38,11 @@ This fork of [Outfluencer/Minecraft-XDP-eBPF](https://github.com/Outfluencer/Min
   when they match a recorded request, non-first UDP fragments are dropped.
   `mode = "monitor"` only counts (`xdp_reflection_*` metrics), `"enforce"`
   drops; enforcing is only switched on once the recorder is attached.
+- **Unused address drop** (`[unused]`): traffic to addresses of the
+  configured networks that the kernel has no route for (unreachable,
+  blackhole, prohibit; decided per packet with `bpf_fib_lookup`) is dropped
+  at the driver instead of walking the stack and triggering ICMP errors.
+  Routing an address makes it reachable at once (`xdp_unused_*` metrics).
 - **Manual overrides** (`[targets]`): always protected `java`/`bedrock`
   entries and `exclude` entries that are never filtered.
 

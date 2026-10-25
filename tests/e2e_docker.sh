@@ -30,6 +30,11 @@ for ns in cl sv; do ip -n $ns link set lo up; done
 ip -n cl addr add 10.99.0.2/24 dev c1; ip -n cl addr add 10.99.0.3/24 dev c1; ip -n cl link set c1 up; ip -n cl route add default via 10.99.0.1
 ip -n sv addr add 10.99.1.2/24 dev s1; ip -n sv link set s1 up; ip -n sv route add default via 10.99.1.1
 sysctl -qw net.ipv4.ip_forward=1
+# customer prefix like on the router: unreachable /24, one address routed
+ip route add unreachable 10.99.3.0/24
+ip -n sv addr add 10.99.3.7/32 dev lo
+ip route add 10.99.3.7/32 via 10.99.1.2
+ip netns exec sv $MC udp-echo-server 10.99.3.7 40001 &
 # veth + generic XDP: keep segments MTU sized like a real NIC would
 for dev in c0 s0; do ethtool -K $dev gro off gso off tso off >/dev/null 2>&1; done
 ip netns exec cl ethtool -K c1 gso off tso off >/dev/null 2>&1
@@ -66,6 +71,9 @@ state_file = "$T/targets.json"
 mode = "enforce"
 networks = ["10.99.1.0/24", "10.99.2.0/24"]
 reply_window_secs = 5
+[unused]
+enabled = true
+networks = ["10.99.3.0/24"]
 [xdp]
 mode = "skb"
 [metrics]
@@ -123,6 +131,15 @@ sleep 2
 dns=$(curl -s 127.0.0.1:1999/metrics | awk '/^xdp_reflection_packets\{.*service="dns"/{s+=$2} END{print s+0}')
 frag=$(curl -s 127.0.0.1:1999/metrics | awk '/^xdp_reflection_packets\{.*service="fragment"/{s+=$2} END{print s+0}')
 check "reflection metrics (dns $dns, fragments $frag)" test "$dns" -ge 1 -a "$frag" -ge 1
+
+echo "== unused addresses"
+check "routed customer address works"  cl $MC udp-echo 10.99.3.7 40001
+check "unused address dropped"         cl $MC udp-no-echo 10.99.3.5 40000
+cl $MC garbage 10.99.3.9 25565 >/dev/null
+sleep 2
+unused=$(curl -s 127.0.0.1:1999/metrics | awk '/^xdp_unused_packets\{dst_ip="10.99.3.(5|9)"/{s+=$2} END{print s+0}')
+check "unused drops counted ($unused)" test "$unused" -ge 2
+check "routed address not counted" bash -c "! curl -s 127.0.0.1:1999/metrics | grep -q 'xdp_unused_packets{dst_ip=\"10.99.3.7\"'"
 
 adopted=$(metric minecraft_adopted_connections)
 check "connections adopted (${adopted:-0})" test "${adopted:-0}" -ge 2

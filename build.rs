@@ -12,6 +12,7 @@ fn main() {
         "xdp/protocol.h",
         "xdp/reflection.h",
         "xdp/stats.h",
+        "xdp/unused.h",
         "xdp/varint.h",
     ] {
         println!("cargo:rerun-if-changed={source}");

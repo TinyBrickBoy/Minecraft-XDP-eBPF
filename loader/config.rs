@@ -110,6 +110,15 @@ drop_fragments = true
 # Seconds a recorded request accepts answers. Must be between 1 and 300.
 reply_window_secs = 30
 
+[unused]
+# Drop traffic to addresses of these networks that the kernel has no route
+# for (e.g. not yet assigned customer addresses behind an unreachable
+# route) at the driver, instead of letting the stack drop them and answer
+# with ICMP errors. Decided per packet by the kernel routing table, so a
+# newly routed address is reachable at once. At most 8 networks.
+enabled = false
+networks = []
+
 [xdp]
 # How the filter attaches to the network interface.
 # "auto"   -> native driver mode if the NIC supports XDP, with automatic
@@ -169,6 +178,7 @@ pub struct Config {
     pub targets: TargetsConfig,
     pub autodetect: AutodetectConfig,
     pub reflection: ReflectionConfig,
+    pub unused: UnusedConfig,
     pub xdp: XdpConfig,
     pub metrics: MetricsConfig,
     pub logging: LoggingConfig,
@@ -305,6 +315,29 @@ impl ReflectionConfig {
             bail!("[reflection] networks must not be empty when the protection is on");
         }
         check_range("[reflection] reply_window_secs", self.reply_window_secs, 1, 300)
+    }
+}
+
+/// `[unused]` — drop traffic to unrouted addresses of whole networks.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UnusedConfig {
+    pub enabled: bool,
+    pub networks: Vec<String>,
+}
+
+impl UnusedConfig {
+    fn validate(&self) -> Result<()> {
+        for network in &self.networks {
+            parse_cidr(network).context("[unused] networks")?;
+        }
+        if self.networks.len() > 8 {
+            bail!("[unused] supports at most 8 networks");
+        }
+        if self.enabled && self.networks.is_empty() {
+            bail!("[unused] networks must not be empty when enabled");
+        }
+        Ok(())
     }
 }
 
@@ -459,6 +492,7 @@ impl Config {
         self.targets.validate()?;
         self.autodetect.validate()?;
         self.reflection.validate()?;
+        self.unused.validate()?;
         self.xdp.validate()?;
         self.metrics.validate()?;
         self.logging.validate()
@@ -667,6 +701,15 @@ mod tests {
         let cfg: Config =
             toml::from_str("[reflection]\nmode = \"enforce\"\nnetworks = [\"85.93.5.0/24\"]").unwrap();
         cfg.validate().expect("valid reflection config");
+    }
+
+    #[test]
+    fn unused_requires_networks() {
+        let cfg: Config = toml::from_str("[unused]\nenabled = true").unwrap();
+        assert!(cfg.validate().is_err());
+        let cfg: Config =
+            toml::from_str("[unused]\nenabled = true\nnetworks = [\"85.93.5.0/24\"]").unwrap();
+        cfg.validate().expect("valid unused config");
     }
 
     #[test]

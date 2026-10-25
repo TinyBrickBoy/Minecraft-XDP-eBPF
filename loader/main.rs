@@ -6,6 +6,7 @@ mod metrics;
 mod reflection;
 mod shutdown;
 mod targets;
+mod unused;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -167,10 +168,14 @@ fn run(args: &Args, config: &Config, shutdown: &Arc<Shutdown>) -> Result<()> {
         }
     };
 
+    let unused_stats = unused::setup(&mut ebpf, config)?;
+
     let mut threads = Vec::new();
-    if let Some(handle) =
-        metrics::start(&mut ebpf, config, targets.clone(), reflection_stats, shutdown)?
-    {
+    let extra = metrics::Extra {
+        reflection: reflection_stats,
+        unused: unused_stats,
+    };
+    if let Some(handle) = metrics::start(&mut ebpf, config, targets.clone(), extra, shutdown)? {
         threads.push(handle);
     }
     if config.autodetect.enabled {
