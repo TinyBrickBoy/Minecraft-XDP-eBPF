@@ -408,6 +408,15 @@ static __always_inline __u8 dns_scan_check(const struct iphdr *ip, const void *d
     {
         return 0;
     }
+    // only queries count: answers arriving at port 53 come from resolvers
+    // abused in a reflection attack with our address as spoofed source
+    // (source port 53); those are the reflection check's job, the
+    // resolvers themselves did nothing wrong
+    const __u8 *dns = (const void *)(udp + 1);
+    if ((const void *)(dns + 12) > data_end || udp->source == bpf_htons(53) || (dns[2] & 0x80))
+    {
+        return 0;
+    }
     const __u32 dst = ip->daddr;
     const __u64 now = bpf_ktime_get_ns();
     const struct dns_verdict *verdict = bpf_map_lookup_elem(&dns_verdicts, &dst);

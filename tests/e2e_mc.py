@@ -309,6 +309,14 @@ def udp_echo(host, port, sport=0, size=32):
         return udp_exchange(s, data[:int(size)]) == data[:int(size)]
 
 
+def dns_answer(host, port, sport):
+    """Sends a DNS answer (QR bit set), as reflected by an abused resolver."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind((os.environ.get("E2E_BIND", "0.0.0.0"), int(sport)))
+        s.sendto(b"\x12\x34\x81\x80" + bytes(28), (host, port))
+    return True
+
+
 def udp_no_echo(host, port, sport=0, size=32):
     return not udp_echo(host, port, sport, size)
 
@@ -455,7 +463,7 @@ def main():
               "http-answered": http_answered, "udp-flood": udp_flood,
               "login-uuid": login_uuid, "login-uuid-rejected": login_uuid_rejected,
               "connect-spam": connect_spam, "penalty-message": penalty_message,
-              "no-penalty-message": no_penalty_message}[cmd]
+              "no-penalty-message": no_penalty_message, "dns-answer": dns_answer}[cmd]
         try:
             ok = fn(host, port, *extra)
         except Exception as e:  # noqa: BLE001 - any failure is a test failure

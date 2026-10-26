@@ -252,7 +252,10 @@ D6="env E2E_BIND=10.99.0.6"; D7="env E2E_BIND=10.99.0.7"
 check "dns scanner works before"      cl $D6 $MC udp-echo 10.99.1.2 40000 5020
 cl $D6 $MC udp-echo 10.99.1.2 53 5021 >/dev/null 2>&1   # query where no DNS server runs
 cl $D7 $MC udp-echo 10.99.3.7 53 5022 >/dev/null 2>&1   # query to a real DNS server
+cl $P8 $MC dns-answer 10.99.1.2 53 53       # reflected answers (attack on us)
+cl $P8 $MC dns-answer 10.99.1.2 53 40053
 sleep 5
+grep "^10.99.0.8 " $T/blocklist.txt; check "reflected dns answers don't blocklist the resolver" bash -c "! grep -q '^10.99.0.8 .*dns-scan' $T/blocklist.txt"
 check "dns scanner blocklisted"       grep -q '^10.99.0.6 .*dns-scan' $T/blocklist.txt
 check "dns scanner dropped"           cl $D6 $MC udp-no-echo 10.99.1.2 40000 5023
 check "dns scanner reaches the router" cl $D6 $MC udp-echo 10.99.0.1 40100 5024
