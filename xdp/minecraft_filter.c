@@ -627,8 +627,10 @@ static __always_inline __u8 tls_client_hello_start(const __u8 *p, const __u8 *en
 
 /*
  * TCP packets for protected web targets: a clean handshake, then the first
- * data segment has to be an http request (KIND_HTTP) or a TLS ClientHello
- * (KIND_HTTPS); afterwards the flow is verified and passes uninspected until
+ * data segment has to be an http request or a TLS ClientHello. Both are
+ * accepted on http and https targets alike: proxies like traefik serve both
+ * on one port, and a wrong http/https classification must never break a
+ * site. Afterwards the flow is verified and passes uninspected until
  * it is idle for WEB_IDLE_NS. Unlike the java path the empty ACK finishing
  * the handshake passes, so preconnected browser sockets that send their
  * request later keep working. Without WEB_ENFORCE everything is only counted.
@@ -749,8 +751,10 @@ static __always_inline __s32 handle_web(const void *data, const void *data_end, 
         goto drop;
     }
 
-    const __u8 valid = kind == KIND_HTTP ? http_request_start(payload, payload_end, data_end)
-                                         : tls_client_hello_start(payload, payload_end, data_end);
+    // the expected protocol of the target first, the other one as fallback
+    const __u8 valid = kind == KIND_HTTP
+                           ? (http_request_start(payload, payload_end, data_end) || tls_client_hello_start(payload, payload_end, data_end))
+                           : (tls_client_hello_start(payload, payload_end, data_end) || http_request_start(payload, payload_end, data_end));
     if (!valid)
     {
         goto drop_connection;

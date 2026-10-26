@@ -106,6 +106,10 @@ cl $MC echo 10.99.1.2 8000 >/dev/null
 # probes run one after another (unreachable candidates cost a timeout each),
 # so wait for every expected target instead of a fixed time
 for i in $(seq 1 60); do
+    # the sniffer samples 1 in 4 server replies: keep the traffic coming
+    cl $MC http-get 10.99.1.2 8081 >/dev/null; cl $MC http-get 10.99.1.2 80 >/dev/null
+    cl $MC https-get 10.99.1.2 8443 >/dev/null; cl $MC status 10.99.1.2 25565 >/dev/null
+    cl $MC bedrock-ping 10.99.1.2 19132 >/dev/null
     n=0
     for t in 10.99.1.2:25565/tcp 10.99.1.2:19132/udp 10.99.2.1:25570/tcp 10.99.1.2:8081/tcp 10.99.1.2:80/tcp 10.99.1.2:8443/tcp; do
         grep -q "Target $t: " $T/loader.log && n=$((n+1))
@@ -143,6 +147,7 @@ check "https request works"       cl $MC https-get 10.99.1.2 8443
 check "http junk dropped"         cl $MC tcp-junk 10.99.1.2 8081
 check "https junk dropped"        cl $MC tcp-junk 10.99.1.2 8443
 check "new http keep-alive works" cl $MC http-keepalive 10.99.1.2 8081 3
+check "plain http on https port passes" cl $MC http-answered 10.99.1.2 8443
 
 echo "== udp reflection protection"
 check "recorder attached"              grep -q 'reflection protection: enforcing' $T/loader.log

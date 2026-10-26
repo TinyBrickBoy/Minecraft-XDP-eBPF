@@ -328,6 +328,13 @@ def http_keepalive(host, port, secs):
     return True
 
 
+def http_answered(host, port):
+    """Any http answer (also a 400 from a TLS port) proves the request passed."""
+    with socket.create_connection((host, port), timeout=3) as s:
+        s.sendall(b"GET / HTTP/1.1\r\nHost: e2e\r\n\r\n")
+        return s.recv(5) == b"HTTP/"
+
+
 def tcp_junk(host, port):
     try:
         with socket.create_connection((host, port), timeout=2) as s:
@@ -359,7 +366,8 @@ def main():
               "bedrock-ping": bedrock_ping, "bedrock-session": bedrock_session,
               "bedrock-garbage": bedrock_garbage, "udp-echo": udp_echo,
               "udp-no-echo": udp_no_echo, "http-get": http_get, "https-get": https_get,
-              "http-keepalive": http_keepalive, "tcp-junk": tcp_junk}[cmd]
+              "http-keepalive": http_keepalive, "tcp-junk": tcp_junk,
+              "http-answered": http_answered}[cmd]
         try:
             ok = fn(host, port, *extra)
         except Exception as e:  # noqa: BLE001 - any failure is a test failure
