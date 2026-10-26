@@ -1,3 +1,4 @@
+mod blocklist;
 mod config;
 mod detect;
 mod ebpf;
@@ -171,12 +172,22 @@ fn run(args: &Args, config: &Config, shutdown: &Arc<Shutdown>) -> Result<()> {
     };
 
     let unused_stats = unused::setup(&mut ebpf, config)?;
+    let (block_handles, block_thread) = match blocklist::setup(&mut ebpf, config, shutdown) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("Blocklist/rate limit setup failed: {e:#}");
+            (None, None)
+        }
+    };
 
     let mut threads = Vec::new();
     let extra = metrics::Extra {
         reflection: reflection_stats,
         unused: unused_stats,
+        blocklist: block_handles,
+        ban_secs: config.ratelimit.ban_secs,
     };
+    threads.extend(block_thread);
     if let Some(handle) = metrics::start(&mut ebpf, config, targets.clone(), extra, shutdown)? {
         threads.push(handle);
     }

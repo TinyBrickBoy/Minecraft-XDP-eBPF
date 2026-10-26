@@ -22,6 +22,15 @@ pub struct UnusedNetwork {
 // SAFETY: repr(C) struct of plain integers without padding.
 unsafe impl Pod for UnusedNetwork {}
 
+impl UnusedNetwork {
+    /// A network as address/mask in network byte order (shared by
+    /// unused_networks and ratelimit_networks).
+    pub fn new(addr: std::net::Ipv4Addr, len: u8) -> Self {
+        let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+        Self { addr: (u32::from(addr) & mask).to_be(), mask: mask.to_be(), valid: 1, pad: 0 }
+    }
+}
+
 /// Userspace mirror of `struct unused_stats`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
@@ -51,14 +60,7 @@ pub fn setup(ebpf: &mut Ebpf, config: &Config) -> Result<Option<StatsMap>> {
     )?;
     for (index, network) in config.unused.networks.iter().enumerate() {
         let (addr, len) = parse_cidr(network)?;
-        let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
-        let entry = UnusedNetwork {
-            addr: (u32::from(addr) & mask).to_be(),
-            mask: mask.to_be(),
-            valid: 1,
-            pad: 0,
-        };
-        networks.set(index as u32, entry, 0)?;
+        networks.set(index as u32, UnusedNetwork::new(addr, len), 0)?;
     }
     info!(
         "Dropping traffic to unrouted addresses of {:?}",

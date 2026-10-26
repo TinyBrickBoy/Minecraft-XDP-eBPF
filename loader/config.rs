@@ -134,6 +134,26 @@ drop_fragments = true
 # Seconds a recorded request accepts answers. Must be between 1 and 300.
 reply_window_secs = 30
 
+[blocklist]
+# Sources that are always dropped, checked before everything else: one
+# address or prefix per line in `file` (re-read live when it changes, `#`
+# starts a comment) plus `entries`.
+enabled = true
+file = "blocklist.txt"
+entries = []
+reload_secs = 5
+
+[ratelimit]
+# Automatic bans: a source sending more than `pps` packets per second to
+# `networks` is banned (all its traffic dropped) for `ban_secs`. Sources in
+# `allow` (own proxies, CDNs) are never banned. Players send 20-200 packets/s.
+# "off", "monitor" (only count and log would-be bans) or "enforce".
+mode = "off"
+networks = []
+pps = 3000
+ban_secs = 300
+allow = []
+
 [unused]
 # Drop traffic to addresses of these networks that the kernel has no route
 # for (e.g. not yet assigned customer addresses behind an unreachable
@@ -203,6 +223,8 @@ pub struct Config {
     pub autodetect: AutodetectConfig,
     pub web: WebConfig,
     pub reflection: ReflectionConfig,
+    pub blocklist: BlocklistConfig,
+    pub ratelimit: RatelimitConfig,
     pub unused: UnusedConfig,
     pub xdp: XdpConfig,
     pub metrics: MetricsConfig,
@@ -381,6 +403,61 @@ impl ReflectionConfig {
     }
 }
 
+/// `[blocklist]` — always dropped sources.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BlocklistConfig {
+    pub enabled: bool,
+    pub file: String,
+    pub entries: Vec<String>,
+    pub reload_secs: u64,
+}
+
+impl Default for BlocklistConfig {
+    fn default() -> Self {
+        Self { enabled: true, file: "blocklist.txt".into(), entries: Vec::new(), reload_secs: 5 }
+    }
+}
+
+impl BlocklistConfig {
+    fn validate(&self) -> Result<()> {
+        for entry in &self.entries {
+            parse_cidr(entry).context("[blocklist] entries")?;
+        }
+        check_range("[blocklist] reload_secs", self.reload_secs, 1, 3_600)
+    }
+}
+
+/// `[ratelimit]` — automatic bans of sources sending too many packets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RatelimitConfig {
+    pub mode: ProtectionMode,
+    pub networks: Vec<String>,
+    pub pps: u64,
+    pub ban_secs: u64,
+    pub allow: Vec<String>,
+}
+
+impl Default for RatelimitConfig {
+    fn default() -> Self {
+        Self { mode: ProtectionMode::Off, networks: Vec::new(), pps: 3000, ban_secs: 300, allow: Vec::new() }
+    }
+}
+
+impl RatelimitConfig {
+    fn validate(&self) -> Result<()> {
+        for network in self.networks.iter().chain(&self.allow) {
+            parse_cidr(network).context("[ratelimit] networks/allow")?;
+        }
+        if self.mode != ProtectionMode::Off && self.networks.is_empty() {
+            bail!("[ratelimit] networks must not be empty when the rate limit is on");
+        }
+        check_range("[ratelimit] pps", self.pps, 50, 10_000_000)?;
+        check_range("[ratelimit] ban_secs", self.ban_secs, 5, 86_400)
+    }
+}
+
 /// `[unused]` — drop traffic to unrouted addresses of whole networks.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -556,6 +633,8 @@ impl Config {
         self.autodetect.validate()?;
         self.web.validate()?;
         self.reflection.validate()?;
+        self.blocklist.validate()?;
+        self.ratelimit.validate()?;
         self.unused.validate()?;
         self.xdp.validate()?;
         self.metrics.validate()?;
@@ -765,6 +844,19 @@ mod tests {
         let cfg: Config =
             toml::from_str("[reflection]\nmode = \"enforce\"\nnetworks = [\"85.93.5.0/24\"]").unwrap();
         cfg.validate().expect("valid reflection config");
+    }
+
+    #[test]
+    fn ratelimit_validation() {
+        let cfg: Config = toml::from_str("[ratelimit]\nmode = \"enforce\"").unwrap();
+        assert!(cfg.validate().is_err()); // no networks
+        let cfg: Config = toml::from_str(
+            "[ratelimit]\nmode = \"enforce\"\nnetworks = [\"85.93.5.0/24\"]\nallow = [\"1.2.3.4\"]",
+        )
+        .unwrap();
+        cfg.validate().expect("valid rate limit");
+        let cfg: Config = toml::from_str("[blocklist]\nentries = [\"nope\"]").unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

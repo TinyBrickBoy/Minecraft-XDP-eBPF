@@ -42,6 +42,7 @@
 
 #include "reflection.h"
 #include "unused.h"
+#include "blocklist.h"
 
 /* ------------------------------------------------------------------------
  * Connection tracking of unverified connections
@@ -595,7 +596,6 @@ drop:
 static __always_inline __u8 http_request_start(const __u8 *p, const __u8 *end, const void *data_end)
 {
     const __u8 *cursor = p;
-#pragma unroll
     for (__u32 i = 0; i <= HTTP_METHOD_MAX; i++)
     {
         CHECK_BOUNDS_OR_RETURN(cursor, 1, end, data_end);
@@ -795,6 +795,12 @@ __s32 minecraft_filter(struct xdp_md *ctx)
 
     const struct iphdr *ip = data + sizeof(struct ethhdr);
     if ((const void *)(ip + 1) > data_end || ip->ihl < 5)
+    {
+        return XDP_DROP;
+    }
+
+    // blocked and banned sources go first, whatever they send
+    if (blocked_source(ip, (__u64)(data_end - data)))
     {
         return XDP_DROP;
     }

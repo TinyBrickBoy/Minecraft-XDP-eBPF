@@ -49,6 +49,12 @@ This fork of [Outfluencer/Minecraft-XDP-eBPF](https://github.com/Outfluencer/Min
   http request line or a TLS ClientHello. Verified connections get their own
   idle timeout (keep-alive, HTTP/2, websockets) and an optional per ip SYN
   limit. `mode = "monitor"` only counts.
+- **Blocklist and rate limit** (`[blocklist]`, `[ratelimit]`): sources in a
+  live reloaded file (addresses and prefixes) are dropped before anything
+  else; a source sending more than `pps` packets per second to the protected
+  networks is banned for `ban_secs` (allowlist for own proxies/CDNs). Bans
+  are logged, per source counters are exported (`xdp_blocklist_*`,
+  `xdp_ratelimit_*`).
 - **Manual overrides** (`[targets]`): always protected `java`/`bedrock`
   entries and `exclude` entries that are never filtered.
 

@@ -7,6 +7,7 @@ fn main() {
     // also watch the generated .o and recompile on every build
     for source in [
         "xdp/minecraft_filter.c",
+        "xdp/blocklist.h",
         "xdp/common.h",
         "xdp/config.h",
         "xdp/protocol.h",

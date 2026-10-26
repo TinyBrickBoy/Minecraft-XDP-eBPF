@@ -51,6 +51,25 @@ struct
     __type(value, struct unused_stats);
 } unused_stats SEC(".maps");
 
+// fib verdict per destination, re-checked at most once per UNUSED_CACHE_NS:
+// a fib lookup costs several hundred ns, and every packet to the customer
+// prefix would pay it; a newly routed address works within that time
+#define UNUSED_CACHE_NS 1000000000ULL
+
+struct unused_verdict
+{
+    __u64 checked_ns;
+    __u64 unrouted; // 1 = unreachable/blackhole/prohibit
+};
+
+struct
+{
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u32); // destination address
+    __type(value, struct unused_verdict);
+} unused_cache SEC(".maps");
+
 static __always_inline __u8 unused_in_networks(const __u32 daddr)
 {
 #pragma unroll
@@ -70,17 +89,8 @@ static __always_inline __u8 unused_in_networks(const __u32 daddr)
     return 0;
 }
 
-/*
- * Returns 1 when the packet goes to an address of the configured networks
- * that the kernel has no usable route for.
- */
-static __always_inline __u8 unused_destination(struct xdp_md *ctx, const struct iphdr *ip)
+static __always_inline __u8 unused_fib_unrouted(struct xdp_md *ctx, const struct iphdr *ip)
 {
-    if (!UNUSED_DROP || !unused_in_networks(ip->daddr))
-    {
-        return 0;
-    }
-
     struct bpf_fib_lookup fib = {0};
     fib.family = AF_INET;
     fib.tos = ip->tos;
@@ -91,12 +101,13 @@ static __always_inline __u8 unused_destination(struct xdp_md *ctx, const struct 
     fib.ifindex = ctx->ingress_ifindex;
 
     const long ret = bpf_fib_lookup(ctx, &fib, sizeof(fib), 0);
-    if (ret != BPF_FIB_LKUP_RET_UNREACHABLE && ret != BPF_FIB_LKUP_RET_BLACKHOLE &&
-        ret != BPF_FIB_LKUP_RET_PROHIBIT)
-    {
-        return 0; // routed, local, or anything we do not understand: deliver
-    }
+    // routed, local, or anything we do not understand: deliver
+    return ret == BPF_FIB_LKUP_RET_UNREACHABLE || ret == BPF_FIB_LKUP_RET_BLACKHOLE ||
+           ret == BPF_FIB_LKUP_RET_PROHIBIT;
+}
 
+static __always_inline void unused_count(struct xdp_md *ctx, const struct iphdr *ip)
+{
     const __u32 daddr = ip->daddr;
     const __u64 bytes = (__u64)((long)ctx->data_end - (long)ctx->data);
     struct unused_stats *stats = bpf_map_lookup_elem(&unused_stats, &daddr);
@@ -111,6 +122,39 @@ static __always_inline __u8 unused_destination(struct xdp_md *ctx, const struct 
         stats->packets++;
         stats->bytes += bytes;
     }
+    }
+
+
+/*
+ * Returns 1 when the packet goes to an address of the configured networks
+ * that the kernel has no usable route for.
+ */
+static __always_inline __u8 unused_destination(struct xdp_md *ctx, const struct iphdr *ip)
+{
+    if (!UNUSED_DROP || !unused_in_networks(ip->daddr))
+    {
+        return 0;
+    }
+
+    const __u32 cache_key = ip->daddr;
+    const __u64 now = bpf_ktime_get_ns();
+    __u8 unrouted;
+    struct unused_verdict *cached = bpf_map_lookup_elem(&unused_cache, &cache_key);
+    if (cached && now - cached->checked_ns < UNUSED_CACHE_NS)
+    {
+        unrouted = cached->unrouted;
+    }
+    else
+    {
+        unrouted = unused_fib_unrouted(ctx, ip);
+        const struct unused_verdict fresh = {.checked_ns = now, .unrouted = unrouted};
+        bpf_map_update_elem(&unused_cache, &cache_key, &fresh, BPF_ANY);
+    }
+    if (!unrouted)
+    {
+        return 0;
+    }
+    unused_count(ctx, ip);
     return 1;
 }
 

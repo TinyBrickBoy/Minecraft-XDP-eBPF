@@ -328,6 +328,15 @@ def http_keepalive(host, port, secs):
     return True
 
 
+def udp_flood(host, port, count):
+    """Sends `count` small datagrams as fast as possible (rate limit test)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind((os.environ.get("E2E_BIND", "0.0.0.0"), 0))
+        for _ in range(int(count)):
+            s.sendto(b"flood", (host, port))
+    return True
+
+
 def http_answered(host, port):
     """Any http answer (also a 400 from a TLS port) proves the request passed."""
     with socket.create_connection((host, port), timeout=3) as s:
@@ -367,7 +376,7 @@ def main():
               "bedrock-garbage": bedrock_garbage, "udp-echo": udp_echo,
               "udp-no-echo": udp_no_echo, "http-get": http_get, "https-get": https_get,
               "http-keepalive": http_keepalive, "tcp-junk": tcp_junk,
-              "http-answered": http_answered}[cmd]
+              "http-answered": http_answered, "udp-flood": udp_flood}[cmd]
         try:
             ok = fn(host, port, *extra)
         except Exception as e:  # noqa: BLE001 - any failure is a test failure

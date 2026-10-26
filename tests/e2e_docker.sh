@@ -27,7 +27,7 @@ ip addr add 10.99.0.1/24 dev c0; ip link set c0 up
 ip addr add 10.99.1.1/24 dev s0; ip link set s0 up
 ip link add dummy0 type dummy; ip addr add 10.99.2.1/32 dev dummy0; ip link set dummy0 up
 for ns in cl sv; do ip -n $ns link set lo up; done
-ip -n cl addr add 10.99.0.2/24 dev c1; ip -n cl addr add 10.99.0.3/24 dev c1; ip -n cl link set c1 up; ip -n cl route add default via 10.99.0.1
+ip -n cl addr add 10.99.0.2/24 dev c1; ip -n cl addr add 10.99.0.3/24 dev c1; ip -n cl addr add 10.99.0.4/24 dev c1; ip -n cl link set c1 up; ip -n cl route add default via 10.99.0.1
 ip -n sv addr add 10.99.1.2/24 dev s1; ip -n sv link set s1 up; ip -n sv route add default via 10.99.1.1
 sysctl -qw net.ipv4.ip_forward=1
 # customer prefix like on the router: unreachable /24, one address routed
@@ -79,6 +79,15 @@ reply_window_secs = 5
 [web]
 mode = "enforce"
 idle_timeout_secs = 60
+[blocklist]
+file = "$T/blocklist.txt"
+reload_secs = 1
+[ratelimit]
+mode = "enforce"
+networks = ["10.99.1.0/24", "10.99.3.0/24"]
+pps = 1000
+ban_secs = 8
+allow = ["10.99.0.4/32"]
 [unused]
 enabled = true
 networks = ["10.99.3.0/24"]
@@ -172,6 +181,28 @@ sleep 2
 unused=$(curl -s 127.0.0.1:1999/metrics | awk '/^xdp_unused_packets\{dst_ip="10.99.3.(5|9)"/{s+=$2} END{print s+0}')
 check "unused drops counted ($unused)" test "$unused" -ge 2
 check "routed address not counted" bash -c "! curl -s 127.0.0.1:1999/metrics | grep -q 'xdp_unused_packets{dst_ip=\"10.99.3.7\"'"
+
+echo "== blocklist"
+B="env E2E_BIND=10.99.0.3"
+check "unblocked source works"        cl $B $MC udp-echo 10.99.1.2 40000 5002
+echo "10.99.0.3   # e2e" > $T/blocklist.txt; sleep 3
+check "blocklisted source dropped"    cl $B $MC udp-no-echo 10.99.1.2 40000 5002
+check "other source still works"      cl $MC udp-echo 10.99.1.2 40000 5003
+check "blocklist hits per source"     bash -c "curl -s 127.0.0.1:1999/metrics | grep -q 'xdp_blocklist_source_packets{src_ip=\"10.99.0.3\"}'"
+: > $T/blocklist.txt; sleep 3
+check "removed entry works again"     cl $B $MC udp-echo 10.99.1.2 40000 5002
+
+echo "== rate limit"
+cl $B $MC udp-flood 10.99.1.2 40000 4000
+check "flooding source banned"        cl $B $MC udp-no-echo 10.99.1.2 40000 5004
+check "other source not affected"     cl $MC udp-echo 10.99.1.2 40000 5005
+cl env E2E_BIND=10.99.0.4 $MC udp-flood 10.99.1.2 40000 4000
+check "allowlisted source not banned" cl env E2E_BIND=10.99.0.4 $MC udp-echo 10.99.1.2 40000 5006
+sleep 3
+bans=$(metric xdp_ratelimit_bans)
+check "ban counted and logged ($bans)" bash -c "test '${bans:-0}' -ge 1 && grep -q 'Rate limit: banned 10.99.0.3' $T/loader.log"
+sleep 7
+check "ban expires"                   cl $B $MC udp-echo 10.99.1.2 40000 5007
 
 adopted=$(metric minecraft_adopted_connections)
 check "connections adopted (${adopted:-0})" test "${adopted:-0}" -ge 2

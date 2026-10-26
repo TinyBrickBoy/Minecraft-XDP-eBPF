@@ -36,6 +36,14 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
     // established flows to the static range are adopted for a while after
     // start, so a restart does not kick the connected players
     let unused_drop: u8 = config.unused.enabled as u8;
+    let blocklist_active: u8 = config.blocklist.enabled as u8;
+    let ratelimit_mode: u8 = match config.ratelimit.mode {
+        crate::config::ProtectionMode::Off => 0,
+        crate::config::ProtectionMode::Monitor => 1,
+        crate::config::ProtectionMode::Enforce => 2,
+    };
+    let ratelimit_pps: u64 = config.ratelimit.pps;
+    let ratelimit_ban_ns: u64 = config.ratelimit.ban_secs * 1_000_000_000;
     let web_enforce: u8 = (config.web.mode == crate::config::ProtectionMode::Enforce) as u8;
     let web_hit_count: u32 = config.web.hit_count;
     let web_idle_ns: u64 = config.web.idle_timeout_secs * 1_000_000_000;
@@ -49,6 +57,10 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
         .override_global("END_PORT", &end_port, true)
         .override_global("STATIC_GRACE_UNTIL_NS", &static_grace_until_ns, true)
         .override_global("UNUSED_DROP", &unused_drop, true)
+        .override_global("BLOCKLIST_ACTIVE", &blocklist_active, true)
+        .override_global("RATELIMIT_MODE", &ratelimit_mode, true)
+        .override_global("RATELIMIT_PPS", &ratelimit_pps, true)
+        .override_global("RATELIMIT_BAN_NS", &ratelimit_ban_ns, true)
         .override_global("WEB_ENFORCE", &web_enforce, true)
         .override_global("WEB_HIT_COUNT", &web_hit_count, true)
         .override_global("WEB_IDLE_NS", &web_idle_ns, true)
