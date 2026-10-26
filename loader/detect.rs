@@ -29,6 +29,12 @@ use crate::targets::{DstKey, Kind, PROTO_TCP, PROTO_UDP, Source, Targets};
 const RAKNET_MAGIC: [u8; 16] = [
     0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78,
 ];
+/// A real ClientHello (TLS 1.2/1.3, post-quantum key share, no SNI): every
+/// TLS server answers it with a ServerHello or an alert record.
+const TLS_CLIENT_HELLO: &[u8] = include_bytes!("tls_client_hello.bin");
+/// Known web servers are re-probed at most this often: every probe shows up
+/// in the customer's access or TLS error log.
+const WEB_PROBE_INTERVAL_SECS: u64 = 3600;
 const RAKNET_UNCONNECTED_PING: u8 = 0x01;
 const RAKNET_UNCONNECTED_PONG: u8 = 0x1c;
 
@@ -76,6 +82,8 @@ struct Record {
 enum Kind2 {
     Java,
     Bedrock,
+    Http,
+    Https,
 }
 
 impl From<Kind2> for Kind {
@@ -83,7 +91,15 @@ impl From<Kind2> for Kind {
         match kind {
             Kind2::Java => Kind::Java,
             Kind2::Bedrock => Kind::Bedrock,
+            Kind2::Http => Kind::Http,
+            Kind2::Https => Kind::Https,
         }
+    }
+}
+
+impl Kind2 {
+    fn is_web(self) -> bool {
+        matches!(self, Kind2::Http | Kind2::Https)
     }
 }
 
@@ -92,6 +108,8 @@ impl From<Kind2> for Kind {
 struct Scope {
     networks: Vec<(u32, u32)>,
     min_port: u16,
+    /// Probed for web servers even below min_port.
+    web_ports: HashSet<u16>,
     exclude_ports: HashSet<u16>,
     exclude: HashSet<DstKey>,
 }
@@ -113,6 +131,11 @@ impl Scope {
         Ok(Self {
             networks,
             min_port: auto.min_port,
+            web_ports: if config.web.detects() {
+                config.web.ports.iter().copied().collect()
+            } else {
+                HashSet::new()
+            },
             exclude_ports: auto.exclude_ports.iter().copied().collect(),
             exclude,
         })
@@ -126,7 +149,7 @@ impl Scope {
     fn allows(&self, key: &DstKey) -> bool {
         let addr = key.addr();
         self.contains_ip(*addr.ip())
-            && addr.port() >= self.min_port
+            && (addr.port() >= self.min_port || self.web_ports.contains(&addr.port()))
             && !self.exclude_ports.contains(&addr.port())
             && !self.exclude.contains(key)
     }
@@ -174,7 +197,7 @@ pub fn start(
     drop(tx);
 
     let shutdown = shutdown.clone();
-    let mut prober = Prober::new(auto, scope, targets);
+    let mut prober = Prober::new(auto, scope, targets, config.web.detects());
     prober.restore();
     handles.push(
         thread::Builder::new()
@@ -194,10 +217,12 @@ struct Prober {
     targets: Arc<Targets>,
     records: HashMap<DstKey, Record>,
     state_file: PathBuf,
+    /// Probe TCP candidates for http and TLS too.
+    web: bool,
 }
 
 impl Prober {
-    fn new(config: AutodetectConfig, scope: Scope, targets: Arc<Targets>) -> Self {
+    fn new(config: AutodetectConfig, scope: Scope, targets: Arc<Targets>, web: bool) -> Self {
         let state_file = PathBuf::from(&config.state_file);
         Self {
             config,
@@ -205,6 +230,7 @@ impl Prober {
             targets,
             records: HashMap::new(),
             state_file,
+            web,
         }
     }
 
@@ -281,7 +307,13 @@ impl Prober {
         let due: Vec<DstKey> = self
             .records
             .iter()
-            .filter(|(_, r)| r.kind.is_some() && now >= r.last_probe + self.config.probe_interval_secs)
+            .filter(|(_, r)| match r.kind {
+                Some(kind) if kind.is_web() => {
+                    now >= r.last_probe + self.config.probe_interval_secs.max(WEB_PROBE_INTERVAL_SECS)
+                }
+                Some(_) => now >= r.last_probe + self.config.probe_interval_secs,
+                None => false,
+            })
             .map(|(key, _)| *key)
             .collect();
         for key in due {
@@ -293,7 +325,7 @@ impl Prober {
         let now = unix_now();
         let timeout = Duration::from_millis(self.config.probe_timeout_ms);
         let detected = match key.proto() {
-            PROTO_TCP => probe_java(key.addr(), timeout).then_some(Kind2::Java),
+            PROTO_TCP => self.probe_tcp(key.addr(), timeout),
             PROTO_UDP => probe_bedrock(key.addr(), timeout).then_some(Kind2::Bedrock),
             _ => None,
         };
@@ -341,6 +373,20 @@ impl Prober {
         if changed {
             self.save();
         }
+    }
+
+    /// Minecraft first (it is what most targets are), then http, then TLS.
+    fn probe_tcp(&self, addr: SocketAddrV4, timeout: Duration) -> Option<Kind2> {
+        if probe_java(addr, timeout) {
+            return Some(Kind2::Java);
+        }
+        if !self.web {
+            return None;
+        }
+        if probe_http(addr, timeout) {
+            return Some(Kind2::Http);
+        }
+        probe_tls(addr, timeout).then_some(Kind2::Https)
     }
 
     fn save(&self) {
@@ -434,6 +480,56 @@ fn probe_java(addr: SocketAddrV4, timeout: Duration) -> bool {
         )
     })();
     result.unwrap_or(false)
+}
+
+/// True if `addr` answers an http request with an http status line.
+fn probe_http(addr: SocketAddrV4, timeout: Duration) -> bool {
+    let result = (|| -> Option<bool> {
+        let mut stream = TcpStream::connect_timeout(&SocketAddr::V4(addr), timeout).ok()?;
+        stream.set_read_timeout(Some(timeout)).ok()?;
+        stream.set_write_timeout(Some(timeout)).ok()?;
+        let request = format!(
+            "HEAD / HTTP/1.1\r\nHost: {}\r\nUser-Agent: xdp-loader-detect\r\nConnection: close\r\n\r\n",
+            addr.ip()
+        );
+        stream.write_all(request.as_bytes()).ok()?;
+        let mut head = [0u8; 5];
+        stream.read_exact(&mut head).ok()?;
+        Some(&head == b"HTTP/")
+    })();
+    result.unwrap_or(false)
+}
+
+/// True if `addr` answers a TLS ClientHello with a ServerHello, or with an
+/// alert (e.g. because SNI is missing): both prove a TLS server. An echo of
+/// our own ClientHello does not count.
+fn probe_tls(addr: SocketAddrV4, timeout: Duration) -> bool {
+    let result = (|| -> Option<bool> {
+        let mut stream = TcpStream::connect_timeout(&SocketAddr::V4(addr), timeout).ok()?;
+        stream.set_read_timeout(Some(timeout)).ok()?;
+        stream.set_write_timeout(Some(timeout)).ok()?;
+        stream.write_all(TLS_CLIENT_HELLO).ok()?;
+        let mut head = [0u8; 6];
+        stream.read_exact(&mut head[..5]).ok()?;
+        if head[0] == 0x16 {
+            stream.read_exact(&mut head[5..]).ok()?;
+        }
+        Some(is_tls_server_answer(&head))
+    })();
+    result.unwrap_or(false)
+}
+
+/// A TLS 1.0-1.3 alert record, or a handshake record carrying a ServerHello
+/// (handshake type 2 at byte 5).
+fn is_tls_server_answer(head: &[u8]) -> bool {
+    if head.len() < 5 || head[1] != 0x03 || head[2] > 0x04 {
+        return false;
+    }
+    match head[0] {
+        0x15 => true,
+        0x16 => head.get(5) == Some(&0x02),
+        _ => false,
+    }
 }
 
 /// True if `addr` answers a RakNet unconnected ping with a pong.
@@ -824,6 +920,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tls_detection() {
+        assert_eq!(&TLS_CLIENT_HELLO[..3], &[0x16, 0x03, 0x01]);
+        assert_eq!(TLS_CLIENT_HELLO[5], 0x01); // ClientHello
+        assert!(is_tls_server_answer(&[0x16, 0x03, 0x03, 0x00, 0x7a, 0x02])); // ServerHello
+        assert!(is_tls_server_answer(&[0x15, 0x03, 0x01, 0x00, 0x02])); // alert, e.g. no SNI
+        assert!(!is_tls_server_answer(&TLS_CLIENT_HELLO[..6])); // our own hello echoed
+        assert!(!is_tls_server_answer(b"HTTP/1"));
+        assert!(!is_tls_server_answer(&[0x16, 0x04, 0x00, 0x00, 0x00, 0x02]));
+    }
+
+    #[test]
     fn varint_encoding() {
         let mut buf = Vec::new();
         write_varint(&mut buf, -1);
@@ -916,6 +1023,20 @@ mod tests {
             }
             _ => panic!("expected a syn observation"),
         }
+    }
+
+    #[test]
+    fn web_ports_below_min_port() {
+        let key = DstKey::new("85.93.5.55:443".parse().unwrap(), PROTO_TCP);
+        let off: Config = toml::from_str("[autodetect]\nnetworks = [\"85.93.5.0/24\"]").unwrap();
+        assert!(!Scope::new(&off).unwrap().allows(&key));
+        let on: Config = toml::from_str(
+            "[autodetect]\nnetworks = [\"85.93.5.0/24\"]\n\n[web]\nmode = \"monitor\"",
+        )
+        .unwrap();
+        assert!(Scope::new(&on).unwrap().allows(&key));
+        let ssh = DstKey::new("85.93.5.55:22".parse().unwrap(), PROTO_TCP);
+        assert!(!Scope::new(&on).unwrap().allows(&ssh));
     }
 
     #[test]

@@ -51,6 +51,8 @@ adopt_grace_secs = 120
 # Destinations protected regardless of auto detection, as "ip:port".
 java = []
 bedrock = []
+http = []
+https = []
 
 # Destinations that are never protected, as "ip:port/tcp" or "ip:port/udp".
 # Overrides the static range and auto detection.
@@ -72,7 +74,7 @@ sniff_interfaces = []
 
 # Ports below min_port and the ports in exclude_ports are never probed.
 min_port = 1024
-exclude_ports = [1433, 1521, 2049, 3306, 3389, 5432, 5672, 6379, 8080, 8443, 9000, 9090, 9200, 11211, 15672, 27017]
+exclude_ports = [1433, 1521, 2049, 3306, 3389, 5432, 5672, 6379, 9000, 9090, 9200, 11211, 15672, 27017]
 
 # Seconds between re-probes of known servers.
 probe_interval_secs = 300
@@ -88,6 +90,28 @@ retry_negative_secs = 21600
 
 # File that keeps the detected servers across restarts.
 state_file = "targets.json"
+
+[web]
+# HTTP/HTTPS protection: a clean TCP handshake, then the first segment of a
+# connection has to be an http request line (HTTP) or a TLS ClientHello
+# (HTTPS); everything else is dropped. Encrypted request floods can not be
+# told apart from visitors at this layer, that needs a reverse proxy.
+# "off", "monitor" (only count what would be dropped) or "enforce".
+mode = "off"
+
+# Let auto detection probe for web servers (http request, TLS handshake) on
+# every candidate port, plus these ports below min_port.
+detect = true
+ports = [80, 443]
+
+# Verified web connections are forgotten after this many idle seconds
+# (keep-alive, HTTP/2 and websockets idle much longer than game clients).
+# Must be between 60 and 86400.
+idle_timeout_secs = 900
+
+# Max new connections per source ip per throttle window on web targets, 0
+# disables it. Browsers, NATs and CDNs open many connections from one ip.
+hit_count = 0
 
 [reflection]
 # UDP reflection/amplification protection for whole networks: answers from
@@ -177,6 +201,7 @@ pub struct Config {
     pub filter: FilterConfig,
     pub targets: TargetsConfig,
     pub autodetect: AutodetectConfig,
+    pub web: WebConfig,
     pub reflection: ReflectionConfig,
     pub unused: UnusedConfig,
     pub xdp: XdpConfig,
@@ -233,6 +258,10 @@ pub struct TargetsConfig {
     pub java: Vec<String>,
     /// "ip:port" destinations always protected as bedrock.
     pub bedrock: Vec<String>,
+    /// "ip:port" destinations always protected as http.
+    pub http: Vec<String>,
+    /// "ip:port" destinations always protected as https.
+    pub https: Vec<String>,
     /// "ip:port/tcp|udp" destinations that are never protected.
     pub exclude: Vec<String>,
 }
@@ -263,8 +292,8 @@ impl Default for AutodetectConfig {
             sniff_interfaces: Vec::new(),
             min_port: 1024,
             exclude_ports: vec![
-                1433, 1521, 2049, 3306, 3389, 5432, 5672, 6379, 8080, 8443, 9000, 9090, 9200,
-                11211, 15672, 27017,
+                1433, 1521, 2049, 3306, 3389, 5432, 5672, 6379, 9000, 9090, 9200, 11211, 15672,
+                27017,
             ],
             probe_interval_secs: 300,
             probe_timeout_ms: 2000,
@@ -275,11 +304,45 @@ impl Default for AutodetectConfig {
     }
 }
 
+/// `[web]` — HTTP/HTTPS targets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebConfig {
+    pub mode: ProtectionMode,
+    pub detect: bool,
+    pub ports: Vec<u16>,
+    pub idle_timeout_secs: u64,
+    pub hit_count: u32,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            mode: ProtectionMode::Off,
+            detect: true,
+            ports: vec![80, 443],
+            idle_timeout_secs: 900,
+            hit_count: 0,
+        }
+    }
+}
+
+impl WebConfig {
+    /// Whether auto detection probes for web servers.
+    pub fn detects(&self) -> bool {
+        self.mode != ProtectionMode::Off && self.detect
+    }
+
+    fn validate(&self) -> Result<()> {
+        check_range("[web] idle_timeout_secs", self.idle_timeout_secs, 60, 86_400)
+    }
+}
+
 /// `[reflection]` — UDP reflection protection for whole networks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReflectionConfig {
-    pub mode: ReflectionMode,
+    pub mode: ProtectionMode,
     pub networks: Vec<String>,
     pub ports: Vec<u16>,
     pub drop_fragments: bool,
@@ -289,7 +352,7 @@ pub struct ReflectionConfig {
 impl Default for ReflectionConfig {
     fn default() -> Self {
         Self {
-            mode: ReflectionMode::Off,
+            mode: ProtectionMode::Off,
             networks: Vec::new(),
             ports: vec![19, 53, 69, 111, 123, 137, 161, 389, 427, 520, 1900, 3283, 3702, 5353, 5683, 10001, 11211, 37810],
             drop_fragments: true,
@@ -300,7 +363,7 @@ impl Default for ReflectionConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ReflectionMode {
+pub enum ProtectionMode {
     Off,
     Monitor,
     Enforce,
@@ -311,7 +374,7 @@ impl ReflectionConfig {
         for network in &self.networks {
             parse_cidr(network).context("[reflection] networks")?;
         }
-        if self.mode != ReflectionMode::Off && self.networks.is_empty() {
+        if self.mode != ProtectionMode::Off && self.networks.is_empty() {
             bail!("[reflection] networks must not be empty when the protection is on");
         }
         check_range("[reflection] reply_window_secs", self.reply_window_secs, 1, 300)
@@ -491,6 +554,7 @@ impl Config {
         self.filter.validate()?;
         self.targets.validate()?;
         self.autodetect.validate()?;
+        self.web.validate()?;
         self.reflection.validate()?;
         self.unused.validate()?;
         self.xdp.validate()?;
@@ -537,7 +601,7 @@ impl FilterConfig {
 
 impl TargetsConfig {
     fn validate(&self) -> Result<()> {
-        for entry in self.java.iter().chain(&self.bedrock) {
+        for entry in self.java.iter().chain(&self.bedrock).chain(&self.http).chain(&self.https) {
             parse_socket_addr(entry).with_context(|| format!("[targets] invalid entry '{entry}'"))?;
         }
         for entry in &self.exclude {

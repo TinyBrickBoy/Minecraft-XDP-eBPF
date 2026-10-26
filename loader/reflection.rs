@@ -13,7 +13,7 @@ use aya::maps::{Array, MapData, PerCpuHashMap};
 use aya::programs::{SchedClassifier, TcAttachType};
 use log::{error, info};
 
-use crate::config::{Config, ReflectionMode, parse_cidr};
+use crate::config::{Config, ProtectionMode, parse_cidr};
 use crate::shutdown::Shutdown;
 
 /// Userspace mirror of `struct reflection_config`.
@@ -109,7 +109,7 @@ pub fn setup(
     shutdown: &Arc<Shutdown>,
 ) -> Result<Option<StatsMap>> {
     let refl = &config.reflection;
-    if refl.mode == ReflectionMode::Off {
+    if refl.mode == ProtectionMode::Off {
         return Ok(None);
     }
 
@@ -164,7 +164,7 @@ pub fn setup(
         refl.networks
     );
 
-    if refl.mode == ReflectionMode::Enforce {
+    if refl.mode == ProtectionMode::Enforce {
         // requests sent right before this start were not recorded: only count
         // during one reply window, then drop
         let window = Duration::from_secs(refl.reply_window_secs);

@@ -12,10 +12,15 @@ Clients exit 0 on the expected outcome, 1 otherwise:
   bedrock-garbage a non-RakNet datagram is NOT answered (dropped)
   udp-echo [SPORT [SIZE]]     a datagram (from SPORT, SIZE bytes) is echoed
   udp-no-echo [SPORT [SIZE]]  ... is NOT echoed (dropped)
-Server: udp-echo-server
+  http-get                    a plain http request is answered
+  https-get                   a TLS handshake + http request is answered
+  http-keepalive SECS         one keep-alive http connection, a request every 0.5 s
+  tcp-junk                    a non-http/non-TLS first segment is NOT answered (dropped)
+Server: udp-echo-server, http-server, https-server CERT KEY
 """
 import os
 import socket
+import ssl
 import struct
 import sys
 import threading
@@ -229,6 +234,45 @@ def bedrock_garbage(host, port):
         return udp_exchange(s, b"\x99junkjunkjunk") is None
 
 
+HTTP_OK = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok"
+
+
+def http_conn(conn, first=b""):
+    """Answers every request of a keep-alive connection; BAD for non-http."""
+    try:
+        buf = first
+        while True:
+            while b"\r\n\r\n" not in buf:
+                data = conn.recv(4096)
+                if not data:
+                    return
+                buf += data
+                if len(buf) >= 4 and not buf[:1].isalpha():
+                    conn.sendall(b"BAD")
+                    return
+            head, buf = buf.split(b"\r\n\r\n", 1)
+            if not head.split(b" ", 1)[0].isalpha():
+                conn.sendall(b"BAD")
+                return
+            conn.sendall(HTTP_OK)
+    except (OSError, ssl.SSLError):
+        pass
+    finally:
+        conn.close()
+
+
+def https_conn(conn, ctx):
+    try:
+        first = conn.recv(1, socket.MSG_PEEK)
+        if first != b"\x16":
+            conn.sendall(b"BAD")
+            conn.close()
+            return
+        http_conn(ctx.wrap_socket(conn, server_side=True))
+    except (OSError, ssl.SSLError):
+        conn.close()
+
+
 def udp_echo_server(host, port):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((host, port))
@@ -250,9 +294,47 @@ def udp_no_echo(host, port, sport=0, size=32):
     return not udp_echo(host, port, sport, size)
 
 
+def http_request(sock):
+    sock.sendall(b"GET / HTTP/1.1\r\nHost: e2e\r\n\r\n")
+    return recv_exact(sock, len(HTTP_OK)) == HTTP_OK
+
+
+def http_get(host, port):
+    with socket.create_connection((host, port), timeout=3) as s:
+        return http_request(s)
+
+
+def https_get(host, port):
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with socket.create_connection((host, port), timeout=3) as raw:
+        with ctx.wrap_socket(raw) as s:
+            return http_request(s)
+
+
+def http_keepalive(host, port, secs):
+    with socket.create_connection((host, port), timeout=3) as s:
+        end = time.time() + secs
+        while time.time() < end:
+            if not http_request(s):
+                return False
+            time.sleep(0.5)
+    return True
+
+
+def tcp_junk(host, port):
+    try:
+        with socket.create_connection((host, port), timeout=2) as s:
+            s.sendall(b"\x00\x01\x02junk-that-is-neither-http-nor-tls" * 4)
+            return not s.recv(16)
+    except (socket.timeout, ConnectionError):
+        return True
+
+
 def main():
     cmd, host, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
-    extra = [float(a) for a in sys.argv[4:]]
+    extra = [float(a) for a in sys.argv[4:]] if cmd != "https-server" else []
     if cmd == "java-server":
         serve_tcp(host, port, java_conn)
     elif cmd == "echo-server":
@@ -261,11 +343,18 @@ def main():
         bedrock_server(host, port)
     elif cmd == "udp-echo-server":
         udp_echo_server(host, port)
+    elif cmd == "http-server":
+        serve_tcp(host, port, http_conn)
+    elif cmd == "https-server":
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(sys.argv[4], sys.argv[5])
+        serve_tcp(host, port, lambda conn: https_conn(conn, ctx))
     else:
         fn = {"status": status, "player": player, "garbage": garbage, "echo": echo,
               "bedrock-ping": bedrock_ping, "bedrock-session": bedrock_session,
               "bedrock-garbage": bedrock_garbage, "udp-echo": udp_echo,
-              "udp-no-echo": udp_no_echo}[cmd]
+              "udp-no-echo": udp_no_echo, "http-get": http_get, "https-get": https_get,
+              "http-keepalive": http_keepalive, "tcp-junk": tcp_junk}[cmd]
         try:
             ok = fn(host, port, *extra)
         except Exception as e:  # noqa: BLE001 - any failure is a test failure

@@ -44,6 +44,10 @@ ip netns exec sv $MC java-server 0.0.0.0 25565 &
 ip netns exec sv $MC bedrock-server 0.0.0.0 19132 &
 ip netns exec sv $MC echo-server 0.0.0.0 8000 &
 ip netns exec sv $MC udp-echo-server 0.0.0.0 40000 &
+openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=e2e -days 1 -keyout $T/key.pem -out $T/cert.pem 2>/dev/null
+ip netns exec sv $MC http-server 0.0.0.0 8081 &
+ip netns exec sv $MC http-server 0.0.0.0 80 &
+ip netns exec sv $MC https-server 0.0.0.0 8443 $T/cert.pem $T/key.pem &
 # "internet" side: a resolver and a udp service the customers talk to
 ip netns exec cl $MC udp-echo-server 10.99.0.2 53 &
 ip netns exec cl $MC udp-echo-server 10.99.0.2 7000 &
@@ -53,6 +57,7 @@ sleep 1
 echo "== sessions established before the filter starts"
 cl $MC player 10.99.1.2 25565 45 & PLAYER=$!
 cl $MC bedrock-session 10.99.1.2 19132 45 & BEDROCK=$!
+cl $MC http-keepalive 10.99.1.2 8081 45 & KEEPALIVE=$!
 sleep 2
 
 cat > $T/config.toml <<CONF
@@ -71,6 +76,9 @@ state_file = "$T/targets.json"
 mode = "enforce"
 networks = ["10.99.1.0/24", "10.99.2.0/24"]
 reply_window_secs = 5
+[web]
+mode = "enforce"
+idle_timeout_secs = 60
 [unused]
 enabled = true
 networks = ["10.99.3.0/24"]
@@ -90,18 +98,28 @@ echo "== detection"
 # server list pings make the remote servers answer through the "tunnel";
 # paced below the per ip throttle (hit_count 10 per 3 s)
 for i in $(seq 1 12); do
-    cl $MC status 10.99.1.2 25565 >/dev/null; cl $MC bedrock-ping 10.99.1.2 19132 >/dev/null; sleep 0.4
+    cl $MC status 10.99.1.2 25565 >/dev/null; cl $MC bedrock-ping 10.99.1.2 19132 >/dev/null
+    cl $MC http-get 10.99.1.2 8081 >/dev/null; cl $MC http-get 10.99.1.2 80 >/dev/null; cl $MC https-get 10.99.1.2 8443 >/dev/null
+    sleep 0.4
 done
 cl $MC echo 10.99.1.2 8000 >/dev/null
-for i in $(seq 1 30); do
-    n=$(curl -s 127.0.0.1:1999/metrics | grep -c '^minecraft_target_protected{')
-    [ "$n" -ge 3 ] && break; sleep 1
+# probes run one after another (unreachable candidates cost a timeout each),
+# so wait for every expected target instead of a fixed time
+for i in $(seq 1 60); do
+    n=0
+    for t in 10.99.1.2:25565/tcp 10.99.1.2:19132/udp 10.99.2.1:25570/tcp 10.99.1.2:8081/tcp 10.99.1.2:80/tcp 10.99.1.2:8443/tcp; do
+        grep -q "Target $t: " $T/loader.log && n=$((n+1))
+    done
+    [ $n -ge 6 ] && break; sleep 1
 done
 curl -s 127.0.0.1:1999/metrics | grep '^minecraft_target_protected{' | sed 's/^/        /'
 check "remote java detected"   grep -q 'Target 10.99.1.2:25565/tcp: java (auto)' $T/loader.log
 check "remote bedrock detected" grep -q 'Target 10.99.1.2:19132/udp: bedrock (auto)' $T/loader.log
 check "local java detected"    grep -q 'Target 10.99.2.1:25570/tcp: java (auto)' $T/loader.log
 check "echo service not protected" bash -c "! grep -q '10.99.1.2:8000' $T/loader.log"
+check "http on 8081 detected"   grep -q 'Target 10.99.1.2:8081/tcp: http (auto)' $T/loader.log
+check "http on port 80 detected" grep -q 'Target 10.99.1.2:80/tcp: http (auto)' $T/loader.log
+check "https on 8443 detected"  grep -q 'Target 10.99.1.2:8443/tcp: https (auto)' $T/loader.log
 
 echo "== waiting for the grace window to end"
 sleep 17
@@ -116,6 +134,15 @@ check "bedrock new session works"   cl $MC bedrock-session 10.99.1.2 19132 3
 check "bedrock garbage dropped"     cl $MC bedrock-garbage 10.99.1.2 19132
 check "old java player survived"    wait $PLAYER
 check "old bedrock session survived" wait $BEDROCK
+check "old http keep-alive survived" wait $KEEPALIVE
+
+echo "== web"
+check "http request works"        cl $MC http-get 10.99.1.2 8081
+check "http on port 80 works"     cl $MC http-get 10.99.1.2 80
+check "https request works"       cl $MC https-get 10.99.1.2 8443
+check "http junk dropped"         cl $MC tcp-junk 10.99.1.2 8081
+check "https junk dropped"        cl $MC tcp-junk 10.99.1.2 8443
+check "new http keep-alive works" cl $MC http-keepalive 10.99.1.2 8081 3
 
 echo "== udp reflection protection"
 check "recorder attached"              grep -q 'reflection protection: enforcing' $T/loader.log
@@ -152,7 +179,7 @@ kill $LOADER; wait $LOADER 2>/dev/null
 check "filter detached on stop" bash -c "! ip link show c0 | grep -q xdp"
 start_loader
 sleep 3
-check "targets restored from state" grep -q 'Restored 3 detected server' $T/loader.log
+check "targets restored from state" grep -q 'Restored 6 detected server' $T/loader.log
 check "java player survived restart"    wait $PLAYER
 check "bedrock session survived restart" wait $BEDROCK
 sleep 13

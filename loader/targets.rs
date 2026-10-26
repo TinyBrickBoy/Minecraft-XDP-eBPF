@@ -85,6 +85,8 @@ pub enum Kind {
     None = 0,
     Java = 1,
     Bedrock = 2,
+    Http = 3,
+    Https = 4,
 }
 
 impl Kind {
@@ -93,6 +95,8 @@ impl Kind {
             Kind::None => "none",
             Kind::Java => "java",
             Kind::Bedrock => "bedrock",
+            Kind::Http => "http",
+            Kind::Https => "https",
         }
     }
 

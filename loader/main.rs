@@ -242,6 +242,8 @@ fn apply_config_targets(config: &Config, targets: &Targets) -> Result<()> {
     for (entries, kind) in [
         (&config.targets.java, Kind::Java),
         (&config.targets.bedrock, Kind::Bedrock),
+        (&config.targets.http, Kind::Http),
+        (&config.targets.https, Kind::Https),
     ] {
         for entry in entries {
             let addr = config::parse_socket_addr(entry)?;
