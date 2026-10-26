@@ -143,6 +143,20 @@ file = "blocklist.txt"
 entries = []
 reload_secs = 5
 
+# Sources banned by the rate limit `auto_after_bans` times within
+# `auto_window_secs` are appended to `file` for `auto_duration_secs`, with an
+# "auto until=<unix time>" comment; expired automatic lines are removed again,
+# manual lines are never touched. Needs [ratelimit] mode = enforce.
+auto = true
+auto_after_bans = 3
+auto_window_secs = 86400
+auto_duration_secs = 604800
+auto_state_file = "auto-blocklist.json"
+
+# An automatic entry is also removed once its source sent nothing for this
+# many seconds (0 keeps it until auto_duration_secs).
+auto_idle_secs = 300
+
 [ratelimit]
 # Automatic bans: a source sending more than `pps` packets per second to
 # `networks` is banned (all its traffic dropped) for `ban_secs`. Sources in
@@ -153,6 +167,12 @@ networks = []
 pps = 3000
 ban_secs = 300
 allow = []
+
+# Violations (packets to unused addresses, invalid handshakes, forged TCP
+# flags, invalid RakNet messages) per source: more than `strikes` within
+# `strike_window_secs` ban the source like the packet rate. 0 disables.
+strikes = 30
+strike_window_secs = 60
 
 [unused]
 # Drop traffic to addresses of these networks that the kernel has no route
@@ -411,11 +431,28 @@ pub struct BlocklistConfig {
     pub file: String,
     pub entries: Vec<String>,
     pub reload_secs: u64,
+    pub auto: bool,
+    pub auto_after_bans: u64,
+    pub auto_window_secs: u64,
+    pub auto_duration_secs: u64,
+    pub auto_state_file: String,
+    pub auto_idle_secs: u64,
 }
 
 impl Default for BlocklistConfig {
     fn default() -> Self {
-        Self { enabled: true, file: "blocklist.txt".into(), entries: Vec::new(), reload_secs: 5 }
+        Self {
+            enabled: true,
+            file: "blocklist.txt".into(),
+            entries: Vec::new(),
+            reload_secs: 5,
+            auto: true,
+            auto_after_bans: 3,
+            auto_window_secs: 86_400,
+            auto_duration_secs: 604_800,
+            auto_state_file: "auto-blocklist.json".into(),
+            auto_idle_secs: 300,
+        }
     }
 }
 
@@ -424,7 +461,14 @@ impl BlocklistConfig {
         for entry in &self.entries {
             parse_cidr(entry).context("[blocklist] entries")?;
         }
-        check_range("[blocklist] reload_secs", self.reload_secs, 1, 3_600)
+        check_range("[blocklist] reload_secs", self.reload_secs, 1, 3_600)?;
+        check_range("[blocklist] auto_after_bans", self.auto_after_bans, 1, 100)?;
+        check_range("[blocklist] auto_window_secs", self.auto_window_secs, 10, 30 * 86_400)?;
+        check_range("[blocklist] auto_duration_secs", self.auto_duration_secs, 10, 365 * 86_400)?;
+        if self.auto_idle_secs != 0 {
+            check_range("[blocklist] auto_idle_secs", self.auto_idle_secs, 10, 30 * 86_400)?;
+        }
+        Ok(())
     }
 }
 
@@ -437,11 +481,21 @@ pub struct RatelimitConfig {
     pub pps: u64,
     pub ban_secs: u64,
     pub allow: Vec<String>,
+    pub strikes: u64,
+    pub strike_window_secs: u64,
 }
 
 impl Default for RatelimitConfig {
     fn default() -> Self {
-        Self { mode: ProtectionMode::Off, networks: Vec::new(), pps: 3000, ban_secs: 300, allow: Vec::new() }
+        Self {
+            mode: ProtectionMode::Off,
+            networks: Vec::new(),
+            pps: 3000,
+            ban_secs: 300,
+            allow: Vec::new(),
+            strikes: 30,
+            strike_window_secs: 60,
+        }
     }
 }
 
@@ -454,7 +508,8 @@ impl RatelimitConfig {
             bail!("[ratelimit] networks must not be empty when the rate limit is on");
         }
         check_range("[ratelimit] pps", self.pps, 50, 10_000_000)?;
-        check_range("[ratelimit] ban_secs", self.ban_secs, 5, 86_400)
+        check_range("[ratelimit] ban_secs", self.ban_secs, 5, 86_400)?;
+        check_range("[ratelimit] strike_window_secs", self.strike_window_secs, 1, 3_600)
     }
 }
 

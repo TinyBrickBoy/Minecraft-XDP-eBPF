@@ -27,7 +27,7 @@ ip addr add 10.99.0.1/24 dev c0; ip link set c0 up
 ip addr add 10.99.1.1/24 dev s0; ip link set s0 up
 ip link add dummy0 type dummy; ip addr add 10.99.2.1/32 dev dummy0; ip link set dummy0 up
 for ns in cl sv; do ip -n $ns link set lo up; done
-ip -n cl addr add 10.99.0.2/24 dev c1; ip -n cl addr add 10.99.0.3/24 dev c1; ip -n cl addr add 10.99.0.4/24 dev c1; ip -n cl link set c1 up; ip -n cl route add default via 10.99.0.1
+ip -n cl addr add 10.99.0.2/24 dev c1; ip -n cl addr add 10.99.0.3/24 dev c1; ip -n cl addr add 10.99.0.4/24 dev c1; ip -n cl addr add 10.99.0.5/24 dev c1; ip -n cl link set c1 up; ip -n cl route add default via 10.99.0.1
 ip -n sv addr add 10.99.1.2/24 dev s1; ip -n sv link set s1 up; ip -n sv route add default via 10.99.1.1
 sysctl -qw net.ipv4.ip_forward=1
 # customer prefix like on the router: unreachable /24, one address routed
@@ -52,6 +52,7 @@ ip netns exec sv $MC https-server 0.0.0.0 8443 $T/cert.pem $T/key.pem &
 ip netns exec cl $MC udp-echo-server 10.99.0.2 53 &
 ip netns exec cl $MC udp-echo-server 10.99.0.2 7000 &
 $MC java-server 10.99.2.1 25570 &
+$MC udp-echo-server 10.99.0.1 40100 &   # a service on the router itself
 sleep 1
 
 echo "== sessions established before the filter starts"
@@ -82,12 +83,19 @@ idle_timeout_secs = 60
 [blocklist]
 file = "$T/blocklist.txt"
 reload_secs = 1
+auto_after_bans = 2
+auto_window_secs = 600
+auto_duration_secs = 120
+auto_idle_secs = 12
+auto_state_file = "$T/auto-blocklist.json"
 [ratelimit]
 mode = "enforce"
 networks = ["10.99.1.0/24", "10.99.3.0/24"]
 pps = 1000
-ban_secs = 8
+ban_secs = 5
 allow = ["10.99.0.4/32"]
+strikes = 20
+strike_window_secs = 10
 [unused]
 enabled = true
 networks = ["10.99.3.0/24"]
@@ -201,8 +209,32 @@ check "allowlisted source not banned" cl env E2E_BIND=10.99.0.4 $MC udp-echo 10.
 sleep 3
 bans=$(metric xdp_ratelimit_bans)
 check "ban counted and logged ($bans)" bash -c "test '${bans:-0}' -ge 1 && grep -q 'Rate limit: banned 10.99.0.3' $T/loader.log"
-sleep 7
+sleep 3
 check "ban expires"                   cl $B $MC udp-echo 10.99.1.2 40000 5007
+
+echo "== violations (scanner)"
+S5="env E2E_BIND=10.99.0.5"
+check "scanner works before"          cl $S5 $MC udp-echo 10.99.1.2 40000 5010
+SCAN=""; for i in $(seq 1 30); do cl $S5 $MC udp-echo 10.99.3.$((i+20)) 40000 5011 >/dev/null 2>&1 & SCAN="$SCAN $!"; done
+wait $SCAN  # only the scanner probes, not the background servers
+sleep 2
+check "scanner banned (violations)"   cl $S5 $MC udp-no-echo 10.99.1.2 40000 5012
+check "logged as violations"          grep -q 'banned 10.99.0.5 .*violations' $T/loader.log
+check "banned source still reaches the router itself" cl $S5 $MC udp-echo 10.99.0.1 40100 5013
+
+echo "== automatic blocklist"
+check "1st ban not yet blocklisted"   bash -c "! grep -q 'auto until=' $T/blocklist.txt"
+cl $B $MC udp-flood 10.99.1.2 40000 4000; sleep 3
+check "2nd ban writes auto entry"     grep -q '^10.99.0.3 .*auto until=' $T/blocklist.txt
+sleep 4
+check "still dropped after the ban"   cl $B $MC udp-no-echo 10.99.1.2 40000 5008
+check "auto entries counted"          bash -c "test \"\$(curl -s 127.0.0.1:1999/metrics | awk '\$1==\"xdp_blocklist_auto_entries\"{print \$2}')\" -ge 1"
+check "logged"                        grep -q 'Auto blocklist: 10.99.0.3 banned 2 times' $T/loader.log
+# the source stays silent now: removed after auto_idle_secs, long before auto_duration_secs
+for i in $(seq 1 40); do grep -q 'auto until=' $T/blocklist.txt || break; sleep 1; done
+check "idle auto entry removed"       bash -c "! grep -q 'auto until=' $T/blocklist.txt && grep -q 'Auto blocklist: 10.99.0.3 sent nothing' $T/loader.log"
+sleep 2
+check "works again after expiry"      cl $B $MC udp-echo 10.99.1.2 40000 5009
 
 adopted=$(metric minecraft_adopted_connections)
 check "connections adopted (${adopted:-0})" test "${adopted:-0}" -ge 2

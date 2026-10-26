@@ -185,7 +185,6 @@ fn run(args: &Args, config: &Config, shutdown: &Arc<Shutdown>) -> Result<()> {
         reflection: reflection_stats,
         unused: unused_stats,
         blocklist: block_handles,
-        ban_secs: config.ratelimit.ban_secs,
     };
     threads.extend(block_thread);
     if let Some(handle) = metrics::start(&mut ebpf, config, targets.clone(), extra, shutdown)? {

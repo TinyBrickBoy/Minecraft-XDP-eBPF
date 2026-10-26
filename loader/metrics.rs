@@ -23,7 +23,6 @@ pub struct Extra {
     pub reflection: Option<ReflectionStatsMap>,
     pub unused: Option<UnusedStatsMap>,
     pub blocklist: Option<blocklist::Handles>,
-    pub ban_secs: u64,
 }
 
 /// Defines the userspace mirror of `struct statistics` (see xdp/stats.h)
@@ -142,21 +141,25 @@ static UNUSED: LazyLock<(IntCounterVec, IntCounterVec)> = LazyLock::new(|| {
         .unwrap(),
     )
 });
-static BLOCK: LazyLock<[IntCounter; 5]> = LazyLock::new(|| {
+static BLOCK: LazyLock<[IntCounter; 6]> = LazyLock::new(|| {
     [
         register_int_counter!("xdp_blocklist_dropped_packets", "Packets dropped by the manual blocklist").unwrap(),
         register_int_counter!("xdp_blocklist_dropped_bytes", "Bytes dropped by the manual blocklist").unwrap(),
         register_int_counter!("xdp_ratelimit_banned_packets", "Packets of banned sources (dropped when enforcing)").unwrap(),
         register_int_counter!("xdp_ratelimit_banned_bytes", "Bytes of banned sources").unwrap(),
-        register_int_counter!("xdp_ratelimit_bans", "Automatic bans issued").unwrap(),
+        register_int_counter!("xdp_ratelimit_bans", "Automatic bans issued for the packet rate").unwrap(),
+        register_int_counter!("xdp_ratelimit_strike_bans", "Automatic bans issued for repeated violations").unwrap(),
     ]
 });
 static BLOCK_GAUGES: LazyLock<(prometheus::IntGauge, prometheus::IntGauge, IntGaugeVec)> = LazyLock::new(|| {
     (
-        prometheus::register_int_gauge!("xdp_blocklist_entries", "Active blocklist entries").unwrap(),
+        prometheus::register_int_gauge!("xdp_blocklist_entries", "Active blocklist entries (manual and automatic)").unwrap(),
         prometheus::register_int_gauge!("xdp_ratelimit_active_bans", "Currently banned sources").unwrap(),
         register_int_gauge_vec!("xdp_ratelimit_ban", "Packets dropped per currently banned source (top 200)", &["src_ip"]).unwrap(),
     )
+});
+static AUTO_ENTRIES: LazyLock<prometheus::IntGauge> = LazyLock::new(|| {
+    prometheus::register_int_gauge!("xdp_blocklist_auto_entries", "Blocklist entries written automatically after repeated bans").unwrap()
 });
 static BLOCKED_SOURCES: LazyLock<(IntCounterVec, IntCounterVec)> = LazyLock::new(|| {
     (
@@ -223,7 +226,6 @@ fn poll_loop(
     shutdown: Arc<Shutdown>,
     poll_interval: Duration,
 ) {
-    let mut seen_bans = std::collections::HashMap::new();
     loop {
         match stats.get(&0, 0) {
             Ok(per_cpu) => {
@@ -247,7 +249,7 @@ fn poll_loop(
             publish_unused(map);
         }
         if let Some(handles) = &extra.blocklist {
-            publish_block(handles, &mut seen_bans, extra.ban_secs);
+            publish_block(handles);
         }
         if !shutdown.sleep(poll_interval) {
             return;
@@ -299,7 +301,7 @@ fn publish_reflection(map: &ReflectionStatsMap) {
 
 /// Publishes the blocklist and rate limit counters, current bans, and logs
 /// newly banned sources.
-fn publish_block(h: &blocklist::Handles, seen: &mut std::collections::HashMap<std::net::Ipv4Addr, u64>, ban_secs: u64) {
+fn publish_block(h: &blocklist::Handles) {
     if let Ok(per_cpu) = h.stats.get(&0, 0) {
         let mut t = blocklist::BlockStats::default();
         for s in per_cpu.iter() {
@@ -308,20 +310,17 @@ fn publish_block(h: &blocklist::Handles, seen: &mut std::collections::HashMap<st
             t.banned_packets += s.banned_packets;
             t.banned_bytes += s.banned_bytes;
             t.bans += s.bans;
+            t.strike_bans += s.strike_bans;
         }
-        for (counter, total) in BLOCK.iter().zip([t.blocklist_packets, t.blocklist_bytes, t.banned_packets, t.banned_bytes, t.bans]) {
+        for (counter, total) in BLOCK.iter().zip([t.blocklist_packets, t.blocklist_bytes, t.banned_packets, t.banned_bytes, t.bans, t.strike_bans]) {
             counter.inc_by(total.saturating_sub(counter.get()));
         }
     }
     let (src_packets, src_bytes) = &*BLOCKED_SOURCES;
-    for entry in h.sources.iter() {
-        let Ok((ip, per_cpu)) = entry else { continue };
-        let (mut p, mut b) = (0u64, 0u64);
-        for s in per_cpu.iter() {
-            p += s.packets;
-            b += s.bytes;
-        }
-        let ip = std::net::Ipv4Addr::from(ip.to_ne_bytes()).to_string();
+    let sources = h.sources.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for (ip, s) in sources {
+        let (p, b) = (s.packets, s.bytes);
+        let ip = ip.to_string();
         let c = src_packets.with_label_values(&[&ip]);
         c.inc_by(p.saturating_sub(c.get()));
         let c = src_bytes.with_label_values(&[&ip]);
@@ -329,8 +328,8 @@ fn publish_block(h: &blocklist::Handles, seen: &mut std::collections::HashMap<st
     }
     let (entries, active, per_ip) = &*BLOCK_GAUGES;
     entries.set(h.entries.load(std::sync::atomic::Ordering::Relaxed) as i64);
-    let mut bans = blocklist::active_bans(&h.bans, crate::targets::monotonic_ns());
-    blocklist::log_new_bans(&bans, seen, ban_secs);
+    AUTO_ENTRIES.set(h.auto_entries.load(std::sync::atomic::Ordering::Relaxed) as i64);
+    let mut bans = h.bans.lock().unwrap_or_else(|e| e.into_inner()).clone();
     active.set(bans.len() as i64);
     bans.sort_by(|a, b| b.1.dropped.cmp(&a.1.dropped));
     per_ip.reset();

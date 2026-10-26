@@ -44,6 +44,8 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
     };
     let ratelimit_pps: u64 = config.ratelimit.pps;
     let ratelimit_ban_ns: u64 = config.ratelimit.ban_secs * 1_000_000_000;
+    let strike_limit: u64 = config.ratelimit.strikes;
+    let strike_window_ns: u64 = config.ratelimit.strike_window_secs * 1_000_000_000;
     let web_enforce: u8 = (config.web.mode == crate::config::ProtectionMode::Enforce) as u8;
     let web_hit_count: u32 = config.web.hit_count;
     let web_idle_ns: u64 = config.web.idle_timeout_secs * 1_000_000_000;
@@ -61,6 +63,8 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
         .override_global("RATELIMIT_MODE", &ratelimit_mode, true)
         .override_global("RATELIMIT_PPS", &ratelimit_pps, true)
         .override_global("RATELIMIT_BAN_NS", &ratelimit_ban_ns, true)
+        .override_global("STRIKE_LIMIT", &strike_limit, true)
+        .override_global("STRIKE_WINDOW_NS", &strike_window_ns, true)
         .override_global("WEB_ENFORCE", &web_enforce, true)
         .override_global("WEB_HIT_COUNT", &web_hit_count, true)
         .override_global("WEB_IDLE_NS", &web_idle_ns, true)

@@ -540,18 +540,21 @@ static __always_inline __s32 handle_udp(const void *data, const void *data_end, 
     case RAKNET_UNCONNECTED_PING_OPEN:
         if (payload_len < RAKNET_PING_LEN || !raknet_magic_at(payload + 9, data_end))
         {
+            add_strike(ip->saddr);
             goto drop;
         }
         break;
     case RAKNET_OPEN_CONNECTION_REQUEST_1:
         if (payload_len < RAKNET_REQUEST_1_MIN_LEN || !raknet_magic_at(payload + 1, data_end))
         {
+            add_strike(ip->saddr);
             goto drop;
         }
         break;
     case RAKNET_OPEN_CONNECTION_REQUEST_2:
         if (payload_len < RAKNET_REQUEST_2_MIN_LEN || !raknet_magic_at(payload + 1, data_end))
         {
+            add_strike(ip->saddr);
             goto drop;
         }
         return switch_to_verified(raw_packet_len, stats_ptr, dst_stats_ptr, &flow_key, VERIFIED);
@@ -669,6 +672,7 @@ static __always_inline __s32 handle_web(const void *data, const void *data_end, 
     if (detect_tcp_bypass(tcp))
     {
         count_stats(stats_ptr, dst_stats_ptr, TCP_BYPASS, 1);
+        add_strike(ip->saddr);
         goto drop;
     }
 
@@ -678,6 +682,7 @@ static __always_inline __s32 handle_web(const void *data, const void *data_end, 
         if (bpf_ntohs(ip->tot_len) > (ip->ihl * 4) + tcp_hdr_len)
         {
             count_stats(stats_ptr, dst_stats_ptr, TCP_BYPASS, 1);
+            add_strike(ip->saddr);
             goto drop;
         }
         if (!throttle_allows_in(&web_throttle, ip->saddr, WEB_HIT_COUNT))
@@ -765,6 +770,7 @@ static __always_inline __s32 handle_web(const void *data, const void *data_end, 
 
 drop_connection:
     count_stats(stats_ptr, dst_stats_ptr, DROP_CONNECTION, 1);
+    add_strike(ip->saddr);
     bpf_map_delete_elem(&conntrack_map, &flow_key);
 drop:
     count_stats(stats_ptr, dst_stats_ptr, DROPPED_PACKET, 1);
@@ -805,9 +811,11 @@ __s32 minecraft_filter(struct xdp_md *ctx)
         return XDP_DROP;
     }
 
-    // addresses without a route would be dropped by the stack anyway
+    // addresses without a route would be dropped by the stack anyway; hitting
+    // them is what scanners do, so it counts as a violation
     if (unused_destination(ctx, ip))
     {
+        add_strike(ip->saddr);
         return XDP_DROP;
     }
 
@@ -888,6 +896,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
     if (detect_tcp_bypass(tcp))
     {
         count_stats(stats_ptr, dst_stats_ptr, TCP_BYPASS, 1);
+        add_strike(ip->saddr);
         goto drop;
     }
 
@@ -904,6 +913,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
         if (bpf_ntohs(ip->tot_len) > (ip->ihl * 4) + tcp_hdr_len)
         {
             count_stats(stats_ptr, dst_stats_ptr, TCP_BYPASS, 1);
+            add_strike(ip->saddr);
             goto drop;
         }
 
@@ -1089,6 +1099,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
 // the generated program drastically smaller
 drop_connection:
     count_stats(stats_ptr, dst_stats_ptr, DROP_CONNECTION, 1);
+    add_strike(ip->saddr);
     bpf_map_delete_elem(&conntrack_map, &flow_key);
     // fall through
 drop:

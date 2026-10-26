@@ -25,6 +25,22 @@ enum ratelimit_mode
     RATELIMIT_ENFORCE = 2,
 };
 
+// blocklist entry scope (map value): manual entries drop everything from
+// the source, automatic ones only traffic to the protected networks, so a
+// spoofed source (e.g. a BGP neighbour) can never be cut off from the router
+enum block_scope
+{
+    BLOCK_ALL = 1,
+    BLOCK_PROTECTED = 2,
+};
+
+// why a source was banned
+enum ban_reason
+{
+    BAN_RATE = 1,    // packets per second above RATELIMIT_PPS
+    BAN_STRIKES = 2, // repeated violations (unused addresses, invalid handshakes)
+};
+
 // manual blocklist and allowlist, keyed like reflection_networks (net_key)
 struct
 {
@@ -110,9 +126,19 @@ struct ban
 {
     __u64 until_ns;  // ktime when the ban ends
     __u64 since_ns;  // ktime when it started
-    __u64 rate;      // packets in the window that triggered it
+    __u64 rate;      // packets (or violations) in the window that triggered it
     __u64 dropped;   // packets dropped since
+    __u64 reason;    // enum ban_reason
 };
+
+// violations per source within the current strike window
+struct
+{
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u32);
+    __type(value, struct rate_window);
+} strike_windows SEC(".maps");
 
 struct
 {
@@ -129,7 +155,8 @@ struct block_stats
     __u64 blocklist_bytes;
     __u64 banned_packets;    // dropped by automatic bans (or would be, when monitoring)
     __u64 banned_bytes;
-    __u64 bans;              // automatic bans issued
+    __u64 bans;              // automatic bans issued (rate)
+    __u64 strike_bans;       // automatic bans issued (violations)
 };
 
 struct
@@ -168,6 +195,33 @@ static __always_inline __u8 lpm_contains(void *trie, const __u32 addr)
     return bpf_map_lookup_elem(trie, &key) != NULL;
 }
 
+static __always_inline __u8 lpm_value(void *trie, const __u32 addr)
+{
+    const struct net_key key = {.prefixlen = 32, .addr = addr};
+    const __u8 *value = bpf_map_lookup_elem(trie, &key);
+    return value ? *value : 0;
+}
+
+static __always_inline void issue_ban(const __u32 src, const __u64 now, const __u64 count, const __u64 reason)
+{
+    const struct ban fresh = {.until_ns = now + RATELIMIT_BAN_NS, .since_ns = now, .rate = count, .dropped = 0, .reason = reason};
+    if (bpf_map_update_elem(&ratelimit_bans, &src, &fresh, BPF_NOEXIST) == 0)
+    {
+        struct block_stats *st = block_stats_slot();
+        if (st)
+        {
+            if (reason == BAN_STRIKES)
+            {
+                st->strike_bans++;
+            }
+            else
+            {
+                st->bans++;
+            }
+        }
+    }
+}
+
 /*
  * Returns 1 when the packet has to be dropped because of its source.
  * bytes is the frame length, for the statistics.
@@ -176,7 +230,8 @@ static __always_inline __u8 blocked_source(const struct iphdr *ip, const __u64 b
 {
     const __u32 src = ip->saddr;
 
-    if (BLOCKLIST_ACTIVE && blocklist_nonempty() && lpm_contains(&blocklist, src))
+    const __u8 scope = BLOCKLIST_ACTIVE && blocklist_nonempty() ? lpm_value(&blocklist, src) : 0;
+    if (scope == BLOCK_ALL || (scope == BLOCK_PROTECTED && in_ratelimit_networks(ip->daddr)))
     {
         struct block_stats *st = block_stats_slot();
         if (st)
@@ -204,6 +259,13 @@ static __always_inline __u8 blocked_source(const struct iphdr *ip, const __u64 b
         return 0;
     }
 
+    // automatic bans and the rate limit only concern the protected networks:
+    // traffic to the router itself (BGP, tunnels) is never cut off
+    if (!in_ratelimit_networks(ip->daddr))
+    {
+        return 0;
+    }
+
     const __u64 now = bpf_ktime_get_ns();
     struct ban *ban = bpf_map_lookup_elem(&ratelimit_bans, &src);
     if (ban)
@@ -220,12 +282,6 @@ static __always_inline __u8 blocked_source(const struct iphdr *ip, const __u64 b
             return RATELIMIT_MODE == RATELIMIT_ENFORCE;
         }
         bpf_map_delete_elem(&ratelimit_bans, &src);
-    }
-
-    // only traffic to the protected networks counts
-    if (!in_ratelimit_networks(ip->daddr))
-    {
-        return 0;
     }
 
     struct rate_window *window = bpf_map_lookup_elem(&ratelimit_windows, &src);
@@ -255,17 +311,49 @@ static __always_inline __u8 blocked_source(const struct iphdr *ip, const __u64 b
         return 0;
     }
 
-    const struct ban fresh_ban = {.until_ns = now + RATELIMIT_BAN_NS, .since_ns = now, .rate = packets, .dropped = 1};
-    if (bpf_map_update_elem(&ratelimit_bans, &src, &fresh_ban, BPF_NOEXIST) == 0)
-    {
-        struct block_stats *st = block_stats_slot();
-        if (st)
-        {
-            st->bans++;
-        }
-    }
+    issue_ban(src, now, packets, BAN_RATE);
     bpf_map_delete_elem(&ratelimit_windows, &src);
     return RATELIMIT_MODE == RATELIMIT_ENFORCE;
+}
+
+/*
+ * Counts a violation of src: a packet to an unused address, an invalid
+ * handshake, forged TCP flags, an invalid RakNet message. More than
+ * STRIKE_LIMIT within STRIKE_WINDOW_NS ban the source like the rate limit.
+ * Never call it for traffic whose source is typically spoofed on behalf of
+ * a victim (reflection answers).
+ */
+static __always_inline void add_strike(const __u32 src)
+{
+    if (RATELIMIT_MODE == RATELIMIT_OFF || !STRIKE_LIMIT)
+    {
+        return;
+    }
+    const __u64 now = bpf_ktime_get_ns();
+    struct rate_window *window = bpf_map_lookup_elem(&strike_windows, &src);
+    if (!window)
+    {
+        const struct rate_window fresh = {.start_ns = now, .packets = 1};
+        bpf_map_update_elem(&strike_windows, &src, &fresh, BPF_ANY);
+        return;
+    }
+    if (now - window->start_ns >= STRIKE_WINDOW_NS)
+    {
+        window->start_ns = now;
+        window->packets = 1;
+        return;
+    }
+    const __u64 strikes = __sync_fetch_and_add(&window->packets, 1) + 1;
+    if (strikes <= STRIKE_LIMIT)
+    {
+        return;
+    }
+    bpf_map_delete_elem(&strike_windows, &src);
+    if (lpm_contains(&ratelimit_allow, src))
+    {
+        return;
+    }
+    issue_ban(src, now, strikes, BAN_STRIKES);
 }
 
 #endif
