@@ -73,7 +73,7 @@ def recv_exact(sock, n):
 
 # ---------------------------------------------------------------- servers
 
-def java_conn(conn):
+def java_conn(conn, online=False):
     try:
         length = read_varint(conn)
         body = recv_exact(conn, length)
@@ -90,6 +90,8 @@ def java_conn(conn):
             return
         length = read_varint(conn)
         recv_exact(conn, length)  # login start
+        if online:
+            conn.sendall(encryption_request())
         while True:  # "game": echo everything
             data = conn.recv(4096)
             if not data:
@@ -99,6 +101,17 @@ def java_conn(conn):
         pass
     finally:
         conn.close()
+
+
+def encryption_request():
+    """What an online mode server sends after login start (1.20.5+ layout)."""
+    body = b"\x01" + b"\x00" + varint(162) + bytes(162) + varint(4) + b"tokn" + b"\x01"
+    return packet(body)
+
+
+def java_online_conn_full(conn):
+    """Like java_conn (status works), but a login gets an Encryption Request."""
+    java_conn(conn, online=True)
 
 
 def serve_tcp(host, port, handler):
@@ -328,6 +341,24 @@ def http_keepalive(host, port, secs):
     return True
 
 
+def login_uuid(host, port, version):
+    """Login start with a uuid of the given version, then a few bytes: True
+    when the server answers anything (encryption request or echo)."""
+    uuid = bytearray(range(16))
+    uuid[6] = (int(version) << 4) | (uuid[6] & 0x0F)
+    try:
+        with socket.create_connection((host, port), timeout=3) as s:
+            s.sendall(handshake(host, port, 2) + packet(b"\x00" + varint(6) + b"Tester" + bytes(uuid)))
+            s.sendall(b"hello")
+            return bool(s.recv(16))
+    except (socket.timeout, ConnectionError, OSError):
+        return False
+
+
+def login_uuid_rejected(host, port, version):
+    return not login_uuid(host, port, version)
+
+
 def udp_flood(host, port, count):
     """Sends `count` small datagrams as fast as possible (rate limit test)."""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -358,6 +389,8 @@ def main():
     extra = [float(a) for a in sys.argv[4:]] if cmd != "https-server" else []
     if cmd == "java-server":
         serve_tcp(host, port, java_conn)
+    elif cmd == "java-online-server":
+        serve_tcp(host, port, java_online_conn_full)
     elif cmd == "echo-server":
         serve_tcp(host, port, echo_conn)
     elif cmd == "bedrock-server":
@@ -376,7 +409,8 @@ def main():
               "bedrock-garbage": bedrock_garbage, "udp-echo": udp_echo,
               "udp-no-echo": udp_no_echo, "http-get": http_get, "https-get": https_get,
               "http-keepalive": http_keepalive, "tcp-junk": tcp_junk,
-              "http-answered": http_answered, "udp-flood": udp_flood}[cmd]
+              "http-answered": http_answered, "udp-flood": udp_flood,
+              "login-uuid": login_uuid, "login-uuid-rejected": login_uuid_rejected}[cmd]
         try:
             ok = fn(host, port, *extra)
         except Exception as e:  # noqa: BLE001 - any failure is a test failure

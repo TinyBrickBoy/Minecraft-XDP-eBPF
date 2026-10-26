@@ -41,6 +41,14 @@ player_idle_timeout_secs = 60
 # false -> allow the protocol maximum (offline / cracked servers).
 online_names = true
 
+# Online mode check: when a java server is seen asking clients for
+# encryption (it runs in online mode), logins with an offline-mode uuid
+# (cracked launchers, most bots) are rejected before they reach it. The
+# server counts as online mode for online_mode_cache_secs after the last
+# time it was seen; needs [autodetect] sniff_interfaces.
+online_mode_check = true
+online_mode_cache_secs = 300
+
 # Grace window in seconds after the loader starts and after a target becomes
 # protected: connections established before are adopted instead of dropped,
 # so restarts and newly protected servers do not kick players. 0 disables
@@ -276,6 +284,8 @@ pub struct FilterConfig {
     /// Seconds during which established flows of newly protected targets
     /// (and of every target right after start) are adopted.
     pub adopt_grace_secs: u64,
+    pub online_mode_check: bool,
+    pub online_mode_cache_secs: u64,
 }
 
 impl Default for FilterConfig {
@@ -288,6 +298,8 @@ impl Default for FilterConfig {
             player_idle_timeout_secs: 60,
             online_names: true,
             adopt_grace_secs: 120,
+            online_mode_check: true,
+            online_mode_cache_secs: 300,
         }
     }
 }
@@ -729,6 +741,7 @@ impl FilterConfig {
             1,
             86_400,
         )?;
+        check_range("[filter] online_mode_cache_secs", self.online_mode_cache_secs, 10, 86_400)?;
         check_range("[filter] adopt_grace_secs", self.adopt_grace_secs, 0, 3_600)
     }
 }

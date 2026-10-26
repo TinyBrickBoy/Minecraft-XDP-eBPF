@@ -69,6 +69,7 @@ impl fmt::Display for DstKey {
 #[derive(Copy, Clone, Debug)]
 pub struct TargetEntry {
     grace_until_ns: u64,
+    online_until_ns: u64,
     kind: u8,
     pad: [u8; 7],
 }
@@ -76,7 +77,7 @@ pub struct TargetEntry {
 // SAFETY: repr(C) struct of plain integers without padding.
 unsafe impl Pod for TargetEntry {}
 
-const _: () = assert!(std::mem::size_of::<TargetEntry>() == 16);
+const _: () = assert!(std::mem::size_of::<TargetEntry>() == 24);
 
 /// How a destination is protected, `enum target_kind` on the C side.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -134,6 +135,8 @@ impl Source {
 pub struct Targets {
     map: Mutex<HashMap<MapData, DstKey, TargetEntry>>,
     entries: Mutex<StdHashMap<DstKey, (Kind, Source)>>,
+    /// java targets seen in online mode, until when (ktime)
+    online: Mutex<StdHashMap<DstKey, u64>>,
     grace_ns: u64,
 }
 
@@ -142,6 +145,7 @@ impl Targets {
         Self {
             map: Mutex::new(map),
             entries: Mutex::new(StdHashMap::new()),
+            online: Mutex::new(StdHashMap::new()),
             grace_ns: grace_secs * 1_000_000_000,
         }
     }
@@ -161,6 +165,7 @@ impl Targets {
         }
         let entry = TargetEntry {
             grace_until_ns: monotonic_ns() + self.grace_ns,
+            online_until_ns: self.online.lock().unwrap().get(&key).copied().unwrap_or(0),
             kind: kind as u8,
             pad: [0; 7],
         };
@@ -186,6 +191,36 @@ impl Targets {
         }
         info!("Target {key}: removed");
         entries.remove(key);
+    }
+
+    /// Records that the java target `key` asked a client for encryption,
+    /// i.e. runs in online mode; valid for `ttl_ns` after the last sighting.
+    pub fn mark_online(&self, key: DstKey, ttl_ns: u64) {
+        if self.entries.lock().unwrap().get(&key).map(|e| e.0) != Some(Kind::Java) {
+            return;
+        }
+        let now = monotonic_ns();
+        let until = now + ttl_ns;
+        let was_online = self.online.lock().unwrap().insert(key, until).is_some_and(|u| u > now);
+        let mut map = self.map.lock().unwrap();
+        match map.get(&key, 0) {
+            Ok(mut entry) => {
+                entry.online_until_ns = until;
+                if let Err(e) = map.insert(key, entry, 0) {
+                    warn!("Failed to mark {key} online: {e}");
+                    return;
+                }
+                if !was_online {
+                    info!("Target {key}: online mode (offline-uuid logins are rejected)");
+                }
+            }
+            Err(e) => warn!("Failed to read target {key}: {e}"),
+        }
+    }
+
+    /// Whether the target currently counts as online mode.
+    pub fn is_online(&self, key: &DstKey) -> bool {
+        self.online.lock().unwrap().get(key).is_some_and(|u| *u > monotonic_ns())
     }
 
     pub fn snapshot(&self) -> Vec<(DstKey, Kind, Source)> {

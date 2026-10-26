@@ -202,11 +202,13 @@ enum target_kind
 // must match `TargetEntry` in loader/targets.rs
 struct target_entry
 {
-    __u64 grace_until_ns; // ktime until which established flows are adopted
-    __u8 kind;            // enum target_kind
+    __u64 grace_until_ns;  // ktime until which established flows are adopted
+    __u64 online_until_ns; // java: ktime until which the server counts as online mode
+    __u8 kind;             // enum target_kind
     __u8 pad[7];
 };
-_Static_assert(sizeof(struct target_entry) == 16, "target_entry size mismatch!");
+_Static_assert(sizeof(struct target_entry) == 24, "target_entry size mismatch!");
+
 
 // written by the loader at runtime, so targets can be added and removed
 // without reloading the program (which would drop all verified connections)
@@ -217,6 +219,18 @@ struct
     __type(key, struct dst_key);
     __type(value, struct target_entry);
 } protected_targets SEC(".maps");
+
+/*
+ * True while the java target was recently seen asking a client for
+ * encryption, i.e. it runs in online mode (set by the loader, which watches
+ * the server replies). Unknown means false: nobody is rejected then.
+ */
+static __always_inline __u8 target_online(const __u32 daddr, const __u16 dport)
+{
+    const struct dst_key key = {.daddr = daddr, .dport = dport, .proto = IPPROTO_TCP, .pad = 0};
+    const struct target_entry *target = bpf_map_lookup_elem(&protected_targets, &key);
+    return target && bpf_ktime_get_ns() < target->online_until_ns;
+}
 
 /*
  * Returns how daddr:dport/proto is protected. *grace is set when the target
@@ -1072,9 +1086,18 @@ __s32 minecraft_filter(struct xdp_md *ctx)
         if (state == AWAIT_LOGIN)
         read_login:
         {
-            if (!inspect_login_packet(tcp_payload, tcp_payload_end, data_end, initial_state->protocol))
+            __u8 uuid_version;
+            if (!inspect_login_packet(tcp_payload, tcp_payload_end, data_end, initial_state->protocol, &uuid_version))
             {
                 goto drop;
+            }
+            // an offline-mode uuid (cracked launcher, most bots) can never
+            // pass the authentication of an online mode server: reject it
+            // here instead of letting the server do the expensive part
+            if (uuid_version == 3 && target_online(ip->daddr, tcp->dest))
+            {
+                count_stats(stats_ptr, dst_stats_ptr, OFFLINE_REJECTED, 1);
+                goto drop_connection;
             }
             // tracking ends here, no need to update the expected sequence
             return switch_to_verified(raw_packet_len, stats_ptr, dst_stats_ptr, &flow_key, VERIFIED);

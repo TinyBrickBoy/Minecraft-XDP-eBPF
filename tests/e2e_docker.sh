@@ -41,6 +41,7 @@ ip netns exec cl ethtool -K c1 gso off tso off >/dev/null 2>&1
 ip netns exec sv ethtool -K s1 gso off tso off >/dev/null 2>&1
 
 ip netns exec sv $MC java-server 0.0.0.0 25565 & 
+ip netns exec sv $MC java-online-server 0.0.0.0 25575 &
 ip netns exec sv $MC bedrock-server 0.0.0.0 19132 &
 ip netns exec sv $MC echo-server 0.0.0.0 8000 &
 ip netns exec sv $MC udp-echo-server 0.0.0.0 40000 &
@@ -126,12 +127,12 @@ for i in $(seq 1 60); do
     # the sniffer samples 1 in 4 server replies: keep the traffic coming
     cl $MC http-get 10.99.1.2 8081 >/dev/null; cl $MC http-get 10.99.1.2 80 >/dev/null
     cl $MC https-get 10.99.1.2 8443 >/dev/null; cl $MC status 10.99.1.2 25565 >/dev/null
-    cl $MC bedrock-ping 10.99.1.2 19132 >/dev/null
+    cl $MC bedrock-ping 10.99.1.2 19132 >/dev/null; cl $MC status 10.99.1.2 25575 >/dev/null
     n=0
-    for t in 10.99.1.2:25565/tcp 10.99.1.2:19132/udp 10.99.2.1:25570/tcp 10.99.1.2:8081/tcp 10.99.1.2:80/tcp 10.99.1.2:8443/tcp; do
+    for t in 10.99.1.2:25565/tcp 10.99.1.2:19132/udp 10.99.2.1:25570/tcp 10.99.1.2:8081/tcp 10.99.1.2:80/tcp 10.99.1.2:8443/tcp 10.99.1.2:25575/tcp; do
         grep -q "Target $t: " $T/loader.log && n=$((n+1))
     done
-    [ $n -ge 6 ] && break; sleep 1
+    [ $n -ge 7 ] && break; sleep 1
 done
 curl -s 127.0.0.1:1999/metrics | grep '^minecraft_target_protected{' | sed 's/^/        /'
 check "remote java detected"   grep -q 'Target 10.99.1.2:25565/tcp: java (auto)' $T/loader.log
@@ -156,6 +157,17 @@ check "bedrock garbage dropped"     cl $MC bedrock-garbage 10.99.1.2 19132
 check "old java player survived"    wait $PLAYER
 check "old bedrock session survived" wait $BEDROCK
 check "old http keep-alive survived" wait $KEEPALIVE
+
+echo "== online mode"
+check "offline uuid ok before online mode is known" cl $MC login-uuid 10.99.1.2 25575 3
+check "premium login gets encryption request"      cl $MC login-uuid 10.99.1.2 25575 4
+sleep 2
+check "server detected as online mode"             grep -q 'Target 10.99.1.2:25575/tcp: online mode' $T/loader.log
+check "offline uuid rejected on online server"     cl $MC login-uuid-rejected 10.99.1.2 25575 3
+check "premium login still works"                  cl $MC login-uuid 10.99.1.2 25575 4
+check "floodgate-style uuid (v0) still works"      cl $MC login-uuid 10.99.1.2 25575 0
+check "offline uuid fine on offline server"        cl $MC login-uuid 10.99.1.2 25565 3
+check "rejections counted"                         bash -c "curl -s 127.0.0.1:1999/metrics | awk '\$1==\"minecraft_offline_rejected\"{exit !(\$2>=1)}'"
 
 echo "== web"
 check "http request works"        cl $MC http-get 10.99.1.2 8081
@@ -247,7 +259,7 @@ kill $LOADER; wait $LOADER 2>/dev/null
 check "filter detached on stop" bash -c "! ip link show c0 | grep -q xdp"
 start_loader
 sleep 3
-check "targets restored from state" grep -q 'Restored 6 detected server' $T/loader.log
+check "targets restored from state" grep -q 'Restored 7 detected server' $T/loader.log
 check "java player survived restart"    wait $PLAYER
 check "bedrock session survived restart" wait $BEDROCK
 sleep 13

@@ -106,10 +106,11 @@ statistics! {
     incoming_bytes  => "minecraft_incoming_bytes", "minecraft_target_incoming_bytes", "Total incoming bytes";
     dropped_bytes   => "minecraft_dropped_bytes", "minecraft_target_dropped_bytes", "Total dropped bytes";
     adopted         => "minecraft_adopted_connections", "minecraft_target_adopted_connections", "Total connections adopted during a grace window";
+    offline_rejected => "minecraft_offline_rejected", "minecraft_target_offline_rejected", "Logins with an offline-mode uuid rejected on online mode servers";
 }
 
 // compile-time layout check, mirrors the _Static_assert in xdp/stats.h
-const _: () = assert!(std::mem::size_of::<Statistics>() == 72);
+const _: () = assert!(std::mem::size_of::<Statistics>() == 80);
 
 static COUNTERS: LazyLock<Counters> = LazyLock::new(Counters::new);
 static DST_COUNTERS: LazyLock<DstCounters> = LazyLock::new(DstCounters::new);
@@ -171,7 +172,7 @@ static TARGET_INFO: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "minecraft_target_protected",
         "1 for every protected (or explicitly excluded, kind=none) destination",
-        &["dst_ip", "dst_port", "proto", "kind", "source"]
+        &["dst_ip", "dst_port", "proto", "kind", "source", "online_mode"]
     )
     .unwrap()
 });
@@ -365,7 +366,14 @@ fn publish_targets(targets: &Targets) {
         let addr = key.addr();
         let (ip, port) = (addr.ip().to_string(), addr.port().to_string());
         TARGET_INFO
-            .with_label_values(&[&ip, &port, key.proto_name(), kind.name(), source.name()])
+            .with_label_values(&[
+                ip.as_str(),
+                port.as_str(),
+                key.proto_name(),
+                kind.name(),
+                source.name(),
+                if targets.is_online(&key) { "ja" } else { "" },
+            ])
             .set(1);
     }
 }

@@ -188,10 +188,14 @@ pub fn start(
         };
         info!("Auto detection sniffing server replies on {interface}");
         let (scope, tx, shutdown) = (scope.clone(), tx.clone(), shutdown.clone());
+        let online = config
+            .filter
+            .online_mode_check
+            .then(|| (targets.clone(), config.filter.online_mode_cache_secs * 1_000_000_000));
         handles.push(
             thread::Builder::new()
                 .name(format!("detect-{interface}"))
-                .spawn(move || sniff_loop(socket, scope, tx, shutdown))?,
+                .spawn(move || sniff_loop(socket, scope, tx, online, shutdown))?,
         );
     }
     drop(tx);
@@ -702,30 +706,40 @@ impl Sniffer {
         // classic BPF, operating on the IP header: accept non-fragmented TCP
         // segments with SYN+ACK (server replies) or SYN only (client
         // connection attempts), both sampled 1 in 4 (a busy server is still
-        // seen at once, a flood costs a quarter), and UDP datagrams whose
-        // payload starts with the RakNet pong id. 256 bytes are enough for the
-        // headers and the pong magic
-        let filter: [libc::sock_filter; 20] = [
+        // seen at once, a flood costs a quarter); TCP segments whose payload
+        // starts like a minecraft Encryption Request (online mode server:
+        // packet id 1, empty server id, 162 byte key -> "01 00 a2 01" after
+        // the length varint); and UDP datagrams whose payload starts with the
+        // RakNet pong id. 256 bytes are enough for the headers and the pong
+        // magic
+        let filter: [libc::sock_filter; 27] = [
             bpf(0x30, 0, 0, 9),              // 0: ldb [9]            ip protocol
-            bpf(0x15, 0, 10, 6),             // 1: jeq #6 ? 2 : 12
+            bpf(0x15, 0, 17, 6),             // 1: tcp ? 2 : 19
             bpf(0x28, 0, 0, 6),              // 2: ldh [6]            frag_off
-            bpf(0x45, 15, 0, 0x1fff),        // 3: fragment -> reject
+            bpf(0x45, 22, 0, 0x1fff),        // 3: fragment -> reject
             bpf(0xb1, 0, 0, 0),              // 4: ldxb 4*([0]&0xf)   ip header length
             bpf(0x50, 0, 0, 13),             // 5: ldb [x+13]         tcp flags
             bpf(0x54, 0, 0, 0x12),           // 6: and #SYN|ACK
             bpf(0x15, 1, 0, 0x12),           // 7: SYN-ACK -> 9
-            bpf(0x15, 0, 10, 0x02),          // 8: SYN ? 9 : reject
+            bpf(0x15, 0, 3, 0x02),           // 8: SYN ? 9 : 12
             bpf(0x20, 0, 0, 0xffff_f038),    // 9: ld rand            (SKF_AD_RANDOM)
             bpf(0x54, 0, 0, 3),              // 10: and #3
-            bpf(0x15, 6, 7, 0),              // 11: 1 in 4 -> accept : reject
-            bpf(0x15, 0, 6, 17),             // 12: udp ? 13 : reject
-            bpf(0x28, 0, 0, 6),              // 13: ldh [6]
-            bpf(0x45, 4, 0, 0x1fff),         // 14: fragment -> reject
-            bpf(0xb1, 0, 0, 0),              // 15: ldxb 4*([0]&0xf)
-            bpf(0x50, 0, 0, 8),              // 16: ldb [x+8]         first payload byte
-            bpf(0x15, 0, 1, RAKNET_UNCONNECTED_PONG as u32), // 17: pong ? accept : reject
-            bpf(0x06, 0, 0, 256),            // 18: accept
-            bpf(0x06, 0, 0, 0),              // 19: reject
+            bpf(0x15, 13, 14, 0),            // 11: 1 in 4 -> accept : reject
+            bpf(0x50, 0, 0, 12),             // 12: ldb [x+12]        data offset
+            bpf(0x74, 0, 0, 4),              // 13: rsh #4
+            bpf(0x64, 0, 0, 2),              // 14: lsh #2            tcp header length
+            bpf(0x0c, 0, 0, 0),              // 15: add x             -> payload offset
+            bpf(0x07, 0, 0, 0),              // 16: tax
+            bpf(0x40, 0, 0, 2),              // 17: ld [x+2]          payload bytes 2..5
+            bpf(0x15, 6, 7, 0x0100_a201),    // 18: encryption request ? accept : reject
+            bpf(0x15, 0, 6, 17),             // 19: udp ? 20 : reject
+            bpf(0x28, 0, 0, 6),              // 20: ldh [6]
+            bpf(0x45, 4, 0, 0x1fff),         // 21: fragment -> reject
+            bpf(0xb1, 0, 0, 0),              // 22: ldxb 4*([0]&0xf)
+            bpf(0x50, 0, 0, 8),              // 23: ldb [x+8]         first payload byte
+            bpf(0x15, 0, 1, RAKNET_UNCONNECTED_PONG as u32), // 24: pong ? accept : reject
+            bpf(0x06, 0, 0, 256),            // 25: accept
+            bpf(0x06, 0, 0, 0),              // 26: reject
         ];
         let program = libc::sock_fprog {
             len: filter.len() as u16,
@@ -801,7 +815,13 @@ const fn bpf(code: u16, jt: u8, jf: u8, k: u32) -> libc::sock_filter {
     libc::sock_filter { code, jt, jf, k }
 }
 
-fn sniff_loop(sniffer: Sniffer, scope: Scope, tx: Sender<Candidate>, shutdown: Arc<Shutdown>) {
+fn sniff_loop(
+    sniffer: Sniffer,
+    scope: Scope,
+    tx: Sender<Candidate>,
+    online: Option<(Arc<Targets>, u64)>,
+    shutdown: Arc<Shutdown>,
+) {
     let mut reported: HashMap<DstKey, Instant> = HashMap::new();
     let mut syn_gate = SynGate::default();
     let mut buf = [0u8; 256];
@@ -811,6 +831,12 @@ fn sniff_loop(sniffer: Sniffer, scope: Scope, tx: Sender<Candidate>, shutdown: A
         };
         let candidate = match parse_observation(&buf[..len]) {
             Some(Observation::Reply(candidate)) => candidate,
+            Some(Observation::OnlineMode(key)) => {
+                if let Some((targets, ttl_ns)) = &online {
+                    targets.mark_online(key, *ttl_ns);
+                }
+                continue;
+            }
             Some(Observation::Syn { key, source }) => {
                 if !scope.allows(&key) || !syn_gate.passes(key, source, Instant::now()) {
                     continue;
@@ -846,6 +872,8 @@ enum Observation {
     Reply(Candidate),
     /// A client connection attempt to `key`, from `source`.
     Syn { key: DstKey, source: Ipv4Addr },
+    /// The java server `key` asked a client for encryption: online mode.
+    OnlineMode(DstKey),
 }
 
 fn parse_observation(packet: &[u8]) -> Option<Observation> {
@@ -860,6 +888,10 @@ fn parse_observation(packet: &[u8]) -> Option<Observation> {
     match packet[9] {
         6 => {
             let dport = u16::from_be_bytes([*l4.get(2)?, *l4.get(3)?]);
+            let doff = ((*l4.get(12)? >> 4) as usize) * 4;
+            if l4.get(doff + 2..doff + 6) == Some(&[0x01, 0x00, 0xa2, 0x01][..]) {
+                return Some(Observation::OnlineMode(DstKey::new(SocketAddrV4::new(src, sport), PROTO_TCP)));
+            }
             match *l4.get(13)? & 0x12 {
                 0x12 => Some(Observation::Reply(Candidate {
                     key: DstKey::new(SocketAddrV4::new(src, sport), PROTO_TCP),
@@ -914,7 +946,7 @@ impl SynGate {
 fn parse_server_reply(packet: &[u8]) -> Option<Candidate> {
     match parse_observation(packet)? {
         Observation::Reply(candidate) => Some(candidate),
-        Observation::Syn { .. } => None,
+        Observation::Syn { .. } | Observation::OnlineMode(_) => None,
     }
 }
 
@@ -1008,6 +1040,26 @@ mod tests {
         assert!(!gate.passes(key, ip(4), now)); // reported once per window
         let later = now + SYN_GATE_WINDOW;
         assert!(!gate.passes(key, ip(5), later)); // window restarted
+    }
+
+    #[test]
+    fn parses_encryption_requests() {
+        // ip (20) + tcp (20, data offset 5) + payload: length varint (2),
+        // packet id 1, empty server id, key length 162
+        let mut pkt = vec![0u8; 40];
+        pkt[0] = 0x45;
+        pkt[9] = 6;
+        pkt[12..16].copy_from_slice(&[85, 93, 5, 80]);
+        pkt[20..22].copy_from_slice(&25565u16.to_be_bytes());
+        pkt[32] = 5 << 4;
+        pkt[33] = 0x18; // PSH|ACK
+        pkt.extend_from_slice(&[0xab, 0x01, 0x01, 0x00, 0xa2, 0x01, 0x30, 0x81]);
+        match parse_observation(&pkt) {
+            Some(Observation::OnlineMode(key)) => assert_eq!(key.to_string(), "85.93.5.80:25565/tcp"),
+            _ => panic!("expected an online mode observation"),
+        }
+        pkt[42] = 0x02; // login success instead: not online mode
+        assert!(!matches!(parse_observation(&pkt), Some(Observation::OnlineMode(_))));
     }
 
     #[test]

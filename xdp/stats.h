@@ -17,6 +17,7 @@ enum stats_mask {
     INCOMING_BYTES  = 1u << 6,
     DROPPED_BYTES   = 1u << 7,
     ADOPTED         = 1u << 8,
+    OFFLINE_REJECTED = 1u << 9,
 };
 
 // one per-cpu slot of stats_map; must match `Statistics` in loader/metrics.rs
@@ -31,8 +32,9 @@ struct statistics
     __u64 incoming_bytes;
     __u64 dropped_bytes;
     __u64 adopted;
+    __u64 offline_rejected;
 };
-_Static_assert(sizeof(struct statistics) == 72, "statistics size mismatch!");
+_Static_assert(sizeof(struct statistics) == 80, "statistics size mismatch!");
 
 // key of dst_stats_map and protected_targets: one entry per destination
 // ip:port and l4 protocol, address and port in network byte order; must match
@@ -91,6 +93,11 @@ static __always_inline void add_stats(struct statistics *stats_ptr, const __u32 
     if (bitmask & ADOPTED)
     {
         stats_ptr->adopted += amount;
+    }
+
+    if (bitmask & OFFLINE_REJECTED)
+    {
+        stats_ptr->offline_rejected += amount;
     }
 }
 
