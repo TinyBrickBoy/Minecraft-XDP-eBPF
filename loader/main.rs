@@ -10,6 +10,8 @@ mod unused;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use aya::maps::HashMap;
@@ -186,6 +188,12 @@ fn run(args: &Args, config: &Config, shutdown: &Arc<Shutdown>) -> Result<()> {
         }
     }
 
+    // a NIC that is re-created (hotplug, queue changes by the hypervisor) comes
+    // back under the same name with a new index and without our program:
+    // exit with an error so the service manager restarts us onto the new one
+    let interface_lost = Arc::new(AtomicBool::new(false));
+    threads.push(watch_interface(interface, shutdown.clone(), interface_lost.clone())?);
+
     shutdown.wait();
 
     for handle in threads {
@@ -194,7 +202,39 @@ fn run(args: &Args, config: &Config, shutdown: &Arc<Shutdown>) -> Result<()> {
             .join()
             .map_err(|e| anyhow::anyhow!("{name} thread panicked: {e:?}"))?;
     }
+    if interface_lost.load(Ordering::SeqCst) {
+        anyhow::bail!("interface {interface} was re-created");
+    }
     Ok(())
+}
+
+/// Triggers shutdown (and sets `lost`) once `interface` disappears or gets
+/// another index than at attach time.
+fn watch_interface(
+    interface: &str,
+    shutdown: Arc<Shutdown>,
+    lost: Arc<AtomicBool>,
+) -> Result<std::thread::JoinHandle<()>> {
+    let name = std::ffi::CString::new(interface)?;
+    // SAFETY: name is a valid C string.
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    let interface = interface.to_owned();
+    Ok(std::thread::Builder::new()
+        .name("watch-interface".into())
+        .spawn(move || {
+            while shutdown.sleep(Duration::from_secs(2)) {
+                // SAFETY: name is a valid C string.
+                let current = unsafe { libc::if_nametoindex(name.as_ptr()) };
+                if current != index {
+                    error!(
+                        "Interface {interface} changed (index {index} -> {current}), the filter is no longer attached; exiting for a restart"
+                    );
+                    lost.store(true, Ordering::SeqCst);
+                    shutdown.trigger();
+                    return;
+                }
+            }
+        })?)
 }
 
 /// Writes the [targets] entries of the config into the kernel map.
