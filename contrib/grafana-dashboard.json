@@ -1,32 +1,57 @@
 {
-  "title": "Router DDoS-Schutz",
   "uid": "router-ddos-xdp",
+  "title": "Router DDoS-Schutz",
+  "description": "XDP-DDoS-Filter für 85.93.5.0/24: Minecraft-, Web- und Netzwerk-Schutz.",
   "tags": [
     "xdp",
     "ddos",
-    "minecraft",
     "router"
   ],
   "timezone": "browser",
-  "schemaVersion": 39,
-  "version": 6,
-  "editable": true,
   "refresh": "30s",
   "time": {
     "from": "now-6h",
     "to": "now"
   },
-  "templating": {
-    "list": []
+  "timepicker": {
+    "refresh_intervals": [
+      "15s",
+      "30s",
+      "1m",
+      "5m",
+      "15m"
+    ]
   },
+  "schemaVersion": 39,
+  "editable": true,
+  "graphTooltip": 1,
+  "fiscalYearStartMonth": 0,
+  "liveNow": false,
+  "links": [],
   "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "templating": {
     "list": []
   },
   "panels": [
     {
       "type": "row",
-      "title": "Übersicht",
       "id": 1,
+      "title": "Übersicht",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -38,13 +63,13 @@
     },
     {
       "type": "stat",
-      "title": "Filter",
       "id": 2,
+      "title": "Filter",
+      "description": "Ist der XDP-Filter (Exporter) für Prometheus erreichbar? 1 = läuft, 0 = ausgefallen.",
       "datasource": {
         "type": "prometheus",
         "uid": "ag2bkfabvaarke"
       },
-      "description": "1 = Filter läuft und liefert Metriken, 0 = aus",
       "gridPos": {
         "h": 4,
         "w": 3,
@@ -53,31 +78,57 @@
       },
       "targets": [
         {
-          "refId": "A",
-          "expr": "max(up{job=\"minecraft-xdp\"})",
           "datasource": {
             "type": "prometheus",
             "uid": "ag2bkfabvaarke"
-          }
+          },
+          "refId": "A",
+          "expr": "max(up{job=\"minecraft-xdp\"})",
+          "legendFormat": "Filter",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "none",
-          "decimals": 0,
+          "noValue": "Keine Daten – Prometheus erreicht den Filter nicht",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "Aktiv",
+                  "color": "#1a9e5c",
+                  "index": 0
+                },
+                "0": {
+                  "text": "Ausgefallen",
+                  "color": "#d93f3f",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "red",
+                "color": "#d93f3f",
                 "value": null
               },
               {
-                "color": "green",
+                "color": "#1a9e5c",
                 "value": 1
               }
             ]
-          }
+          },
+          "decimals": 0
         },
         "overrides": []
       },
@@ -90,21 +141,24 @@
           "values": false
         },
         "colorMode": "background",
-        "graphMode": "area",
-        "textMode": "value",
+        "graphMode": "none",
         "justifyMode": "center",
-        "orientation": "auto"
+        "textMode": "value",
+        "orientation": "auto",
+        "wideLayout": true,
+        "showPercentChange": false,
+        "percentChangeColorMode": "standard"
       }
     },
     {
       "type": "stat",
-      "title": "Verworfen (Minecraft)",
       "id": 3,
+      "title": "Verworfen gesamt (Pakete/s)",
+      "description": "Tatsächlich verworfene Pakete pro Sekunde: Minecraft-Filter plus Traffic an unbenutzte IPs. Web-Schutz und UDP-Reflection laufen im MONITOR-Modus und sind hier nicht enthalten.",
       "datasource": {
         "type": "prometheus",
         "uid": "ag2bkfabvaarke"
       },
-      "description": "",
       "gridPos": {
         "h": 4,
         "w": 4,
@@ -113,32 +167,41 @@
       },
       "targets": [
         {
-          "refId": "A",
-          "expr": "sum(rate(minecraft_dropped_packets[1m]))",
           "datasource": {
             "type": "prometheus",
             "uid": "ag2bkfabvaarke"
-          }
+          },
+          "refId": "A",
+          "expr": "(sum(rate(minecraft_target_dropped_packets[$__rate_interval]) unless on (dst_ip, dst_port, proto) minecraft_target_protected{kind=~\"http|https\"}) or vector(0)) + (sum(rate(xdp_unused_packets[$__rate_interval])) or vector(0))",
+          "legendFormat": "Verworfen",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "pps",
-          "decimals": 0,
+          "noValue": "Keine Angriffe im Zeitraum",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
+                "color": "#1a9e5c",
                 "value": null
               },
               {
-                "color": "orange",
-                "value": 1000
+                "color": "#e0a200",
+                "value": 100
               },
               {
-                "color": "red",
-                "value": 50000
+                "color": "#d93f3f",
+                "value": 10000
               }
             ]
           }
@@ -155,20 +218,23 @@
         },
         "colorMode": "background",
         "graphMode": "area",
-        "textMode": "value",
         "justifyMode": "center",
-        "orientation": "auto"
+        "textMode": "value",
+        "orientation": "auto",
+        "wideLayout": true,
+        "showPercentChange": false,
+        "percentChangeColorMode": "standard"
       }
     },
     {
       "type": "stat",
-      "title": "Verworfen (Reflection)",
       "id": 4,
+      "title": "Verworfen gesamt (bit/s)",
+      "description": "Bandbreite der tatsächlich verworfenen Pakete (Minecraft-Filter plus unbenutzte IPs).",
       "datasource": {
         "type": "prometheus",
         "uid": "ag2bkfabvaarke"
       },
-      "description": "Im Monitor-Modus nur gezählt, nicht verworfen",
       "gridPos": {
         "h": 4,
         "w": 4,
@@ -177,152 +243,41 @@
       },
       "targets": [
         {
-          "refId": "A",
-          "expr": "sum(rate(xdp_reflection_packets[1m])) or vector(0)",
           "datasource": {
             "type": "prometheus",
             "uid": "ag2bkfabvaarke"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "pps",
-          "decimals": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 1000
-              },
-              {
-                "color": "red",
-                "value": 50000
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "background",
-        "graphMode": "area",
-        "textMode": "value",
-        "justifyMode": "center",
-        "orientation": "auto"
-      }
-    },
-    {
-      "type": "stat",
-      "title": "Verworfen (unbenutzte IPs)",
-      "id": 5,
-      "datasource": {
-        "type": "prometheus",
-        "uid": "ag2bkfabvaarke"
-      },
-      "description": "",
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 11,
-        "y": 1
-      },
-      "targets": [
-        {
+          },
           "refId": "A",
-          "expr": "sum(rate(xdp_unused_packets[1m])) or vector(0)",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "ag2bkfabvaarke"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "pps",
-          "decimals": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 1000
-              },
-              {
-                "color": "red",
-                "value": 50000
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "background",
-        "graphMode": "area",
-        "textMode": "value",
-        "justifyMode": "center",
-        "orientation": "auto"
-      }
-    },
-    {
-      "type": "stat",
-      "title": "Verworfen gesamt",
-      "id": 6,
-      "datasource": {
-        "type": "prometheus",
-        "uid": "ag2bkfabvaarke"
-      },
-      "description": "",
-      "gridPos": {
-        "h": 4,
-        "w": 3,
-        "x": 15,
-        "y": 1
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "(sum(rate(minecraft_dropped_bytes[1m])) or vector(0)) * 8 + (sum(rate(xdp_reflection_bytes[1m])) or vector(0)) * 8 + (sum(rate(xdp_unused_bytes[1m])) or vector(0)) * 8",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "ag2bkfabvaarke"
-          }
+          "expr": "((sum(rate(minecraft_target_dropped_bytes[$__rate_interval]) unless on (dst_ip, dst_port, proto) minecraft_target_protected{kind=~\"http|https\"}) or vector(0)) + (sum(rate(xdp_unused_bytes[$__rate_interval])) or vector(0))) * 8",
+          "legendFormat": "Verworfen",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "bps",
-          "decimals": 0,
+          "noValue": "Keine Angriffe im Zeitraum",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
+                "color": "#1a9e5c",
                 "value": null
+              },
+              {
+                "color": "#e0a200",
+                "value": 1000000.0
+              },
+              {
+                "color": "#d93f3f",
+                "value": 100000000.0
               }
             ]
           }
@@ -339,45 +294,205 @@
         },
         "colorMode": "background",
         "graphMode": "area",
-        "textMode": "value",
         "justifyMode": "center",
-        "orientation": "auto"
+        "textMode": "value",
+        "orientation": "auto",
+        "wideLayout": true,
+        "showPercentChange": false,
+        "percentChangeColorMode": "standard"
       }
     },
     {
       "type": "stat",
-      "title": "Neue Spieler / min",
+      "id": 5,
+      "title": "Reflection (Monitor)",
+      "description": "UDP-Reflection-Pakete pro Sekunde (DNS, NTP, Memcached, SSDP, CLDAP, Fragmente …). Hinweis: läuft aktuell im MONITOR-Modus, die Werte zeigen nur, was verworfen würde; es wird nichts blockiert.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ag2bkfabvaarke"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 11,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          },
+          "refId": "A",
+          "expr": "sum(rate(xdp_reflection_packets[$__rate_interval])) or vector(0)",
+          "legendFormat": "Reflection",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "noValue": "Keine Reflection erkannt",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              },
+              {
+                "color": "#e0a200",
+                "value": 1000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "textMode": "value",
+        "orientation": "auto",
+        "wideLayout": true,
+        "showPercentChange": false,
+        "percentChangeColorMode": "standard"
+      }
+    },
+    {
+      "type": "stat",
+      "id": 6,
+      "title": "Unbenutzte IPs",
+      "description": "Verworfene Pakete pro Sekunde an nicht vergebene Adressen in 85.93.5.0/24 (aktiv, wird verworfen).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ag2bkfabvaarke"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 14,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          },
+          "refId": "A",
+          "expr": "sum(rate(xdp_unused_packets[$__rate_interval])) or vector(0)",
+          "legendFormat": "Unbenutzte IPs",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "noValue": "Kein Traffic an unbenutzte IPs",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#1a9e5c",
+                "value": null
+              },
+              {
+                "color": "#e0a200",
+                "value": 100
+              },
+              {
+                "color": "#d93f3f",
+                "value": 10000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "textMode": "value",
+        "orientation": "auto",
+        "wideLayout": true,
+        "showPercentChange": false,
+        "percentChangeColorMode": "standard"
+      }
+    },
+    {
+      "type": "stat",
       "id": 7,
+      "title": "Neue Spieler / min",
+      "description": "Neu verifizierte Minecraft-Verbindungen pro Minute (Spieler, die den Filter bestanden haben).",
       "datasource": {
         "type": "prometheus",
         "uid": "ag2bkfabvaarke"
       },
-      "description": "",
       "gridPos": {
         "h": 4,
         "w": 3,
-        "x": 18,
+        "x": 17,
         "y": 1
       },
       "targets": [
         {
-          "refId": "A",
-          "expr": "sum(increase(minecraft_verified_connections[1m]))",
           "datasource": {
             "type": "prometheus",
             "uid": "ag2bkfabvaarke"
-          }
+          },
+          "refId": "A",
+          "expr": "sum(rate(minecraft_verified_connections[$__rate_interval])) * 60",
+          "legendFormat": "Spieler",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "none",
-          "decimals": 0,
+          "unit": "cpm",
+          "noValue": "Keine neuen Spieler",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
+                "color": "#2a78d6",
                 "value": null
               }
             ]
@@ -393,53 +508,115 @@
           "fields": "",
           "values": false
         },
-        "colorMode": "background",
+        "colorMode": "value",
         "graphMode": "area",
-        "textMode": "value",
         "justifyMode": "center",
-        "orientation": "auto"
+        "textMode": "value",
+        "orientation": "auto",
+        "wideLayout": true,
+        "showPercentChange": false,
+        "percentChangeColorMode": "standard"
       }
     },
     {
       "type": "stat",
-      "title": "Geschützte Server",
       "id": 8,
+      "title": "Geschützte Ziele",
+      "description": "Anzahl der automatisch oder statisch geschützten Ziele (IP + Port) nach Typ. Ziele, die nur über den statischen Portbereich 25560-25760 abgedeckt sind, werden hier nicht gezählt.",
       "datasource": {
         "type": "prometheus",
         "uid": "ag2bkfabvaarke"
       },
-      "description": "Automatisch erkannte und manuell eingetragene Server (ohne festen Portbereich)",
       "gridPos": {
         "h": 4,
-        "w": 3,
-        "x": 21,
+        "w": 4,
+        "x": 20,
         "y": 1
       },
       "targets": [
         {
-          "refId": "A",
-          "expr": "count(minecraft_target_protected{kind!=\"none\"}) or vector(0)",
           "datasource": {
             "type": "prometheus",
             "uid": "ag2bkfabvaarke"
-          }
+          },
+          "refId": "A",
+          "expr": "count by (kind) (minecraft_target_protected{kind!=\"none\"})",
+          "legendFormat": "{{kind}}",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "none",
-          "decimals": 0,
+          "noValue": "Keine geschützten Ziele",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
+                "color": "#2a78d6",
                 "value": null
               }
             ]
-          }
+          },
+          "decimals": 0
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "java"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Java"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "bedrock"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Bedrock"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "http"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "HTTP"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "https"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "HTTPS"
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "reduceOptions": {
@@ -449,17 +626,20 @@
           "fields": "",
           "values": false
         },
-        "colorMode": "background",
-        "graphMode": "area",
-        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
         "justifyMode": "center",
-        "orientation": "auto"
+        "textMode": "value_and_name",
+        "orientation": "vertical",
+        "wideLayout": true,
+        "showPercentChange": false,
+        "percentChangeColorMode": "standard"
       }
     },
     {
       "type": "row",
-      "title": "Minecraft",
       "id": 9,
+      "title": "Minecraft",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -471,13 +651,13 @@
     },
     {
       "type": "timeseries",
-      "title": "Verworfene Pakete pro Server",
       "id": 10,
+      "title": "Verworfene Pakete pro Server",
+      "description": "Vom Filter verworfene Pakete pro Sekunde je Minecraft-Ziel (Java/Bedrock inkl. statischem Portbereich). Top 10.",
       "datasource": {
         "type": "prometheus",
         "uid": "ag2bkfabvaarke"
       },
-      "description": "Die 10 am stärksten angegriffenen Ziele",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -486,34 +666,76 @@
       },
       "targets": [
         {
-          "refId": "A",
-          "expr": "topk(10, sum by (dst_ip, dst_port, proto) (rate(minecraft_target_dropped_packets[1m]) * on (dst_ip, dst_port, proto) group_left(kind) max by (dst_ip, dst_port, proto, kind) (minecraft_target_protected{kind=~\"java|bedrock\"})))",
-          "legendFormat": "{{dst_ip}}:{{dst_port}}/{{proto}}",
           "datasource": {
             "type": "prometheus",
             "uid": "ag2bkfabvaarke"
-          }
+          },
+          "refId": "A",
+          "expr": "topk(10, sum by (dst_ip, dst_port, proto) ((rate(minecraft_target_dropped_packets[$__rate_interval]) unless on (dst_ip, dst_port, proto) minecraft_target_protected{kind=~\"http|https|none\"})) > 0)",
+          "legendFormat": "{{dst_ip}}:{{dst_port}}/{{proto}}",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "pps",
+          "noValue": "Keine Angriffe im Zeitraum",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 15,
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "none",
             "showPoints": "never",
-            "spanNulls": true,
+            "pointSize": 8,
+            "lineInterpolation": "smooth",
+            "spanNulls": 60000,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisSoftMin": 0,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "barAlignment": 0,
+            "insertNulls": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
             "stacking": {
               "mode": "none",
               "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
             }
-          }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
         },
         "overrides": []
       },
       "options": {
         "legend": {
+          "showLegend": true,
           "displayMode": "table",
           "placement": "right",
           "calcs": [
@@ -521,23 +743,25 @@
             "lastNotNull"
           ],
           "sortBy": "Max",
-          "sortDesc": true
+          "sortDesc": true,
+          "width": 300
         },
         "tooltip": {
           "mode": "multi",
-          "sort": "desc"
+          "sort": "desc",
+          "hideZeros": false
         }
       }
     },
     {
       "type": "timeseries",
-      "title": "Verbindungsversuche pro Server",
       "id": 11,
+      "title": "Verworfener Traffic pro Server",
+      "description": "Bandbreite der verworfenen Pakete je Minecraft-Ziel in bit/s. Top 10.",
       "datasource": {
         "type": "prometheus",
         "uid": "ag2bkfabvaarke"
       },
-      "description": "TCP-SYNs (Java) bzw. RakNet-Pings/Requests (Bedrock)",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -546,34 +770,76 @@
       },
       "targets": [
         {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          },
           "refId": "A",
-          "expr": "topk(10, sum by (dst_ip, dst_port, proto) (rate(minecraft_target_syn_packets[1m]) * on (dst_ip, dst_port, proto) group_left(kind) max by (dst_ip, dst_port, proto, kind) (minecraft_target_protected{kind=~\"java|bedrock\"})))",
+          "expr": "topk(10, sum by (dst_ip, dst_port, proto) ((rate(minecraft_target_dropped_bytes[$__rate_interval]) unless on (dst_ip, dst_port, proto) minecraft_target_protected{kind=~\"http|https|none\"})) * 8 > 0)",
           "legendFormat": "{{dst_ip}}:{{dst_port}}/{{proto}}",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "ag2bkfabvaarke"
-          }
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "pps",
+          "unit": "bps",
+          "noValue": "Keine Angriffe im Zeitraum",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 15,
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "none",
             "showPoints": "never",
-            "spanNulls": true,
+            "pointSize": 8,
+            "lineInterpolation": "smooth",
+            "spanNulls": 60000,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisSoftMin": 0,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "barAlignment": 0,
+            "insertNulls": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
             "stacking": {
               "mode": "none",
               "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
             }
-          }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
         },
         "overrides": []
       },
       "options": {
         "legend": {
+          "showLegend": true,
           "displayMode": "table",
           "placement": "right",
           "calcs": [
@@ -581,23 +847,25 @@
             "lastNotNull"
           ],
           "sortBy": "Max",
-          "sortDesc": true
+          "sortDesc": true,
+          "width": 300
         },
         "tooltip": {
           "mode": "multi",
-          "sort": "desc"
+          "sort": "desc",
+          "hideZeros": false
         }
       }
     },
     {
       "type": "timeseries",
-      "title": "Spieler-Verbindungen",
       "id": 12,
+      "title": "Verbindungsversuche pro Server",
+      "description": "Eingehende TCP-SYN- bzw. Verbindungsversuche pro Sekunde je Minecraft-Ziel. Top 10.",
       "datasource": {
         "type": "prometheus",
         "uid": "ag2bkfabvaarke"
       },
-      "description": "Neue geprüfte Verbindungen pro Minute; übernommen = nach Neustart/Update weitergeführt",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -606,43 +874,76 @@
       },
       "targets": [
         {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          },
           "refId": "A",
-          "expr": "sum by (dst_ip, dst_port) (rate(minecraft_target_verified_connections[5m])) * 60 > 0",
-          "legendFormat": "verifiziert {{dst_ip}}:{{dst_port}}",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "ag2bkfabvaarke"
-          }
-        },
-        {
-          "refId": "B",
-          "expr": "sum(rate(minecraft_adopted_connections[5m])) * 60",
-          "legendFormat": "übernommen (Neustart)",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "ag2bkfabvaarke"
-          }
+          "expr": "topk(10, sum by (dst_ip, dst_port, proto) ((rate(minecraft_target_syn_packets[$__rate_interval]) unless on (dst_ip, dst_port, proto) minecraft_target_protected{kind=~\"http|https|none\"})) > 0)",
+          "legendFormat": "{{dst_ip}}:{{dst_port}}/{{proto}}",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "cpm",
+          "unit": "pps",
+          "noValue": "Keine Verbindungsversuche im Zeitraum",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 15,
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "none",
             "showPoints": "never",
-            "spanNulls": true,
+            "pointSize": 8,
+            "lineInterpolation": "smooth",
+            "spanNulls": 60000,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisSoftMin": 0,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "barAlignment": 0,
+            "insertNulls": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
             "stacking": {
               "mode": "none",
               "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
             }
-          }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
         },
         "overrides": []
       },
       "options": {
         "legend": {
+          "showLegend": true,
           "displayMode": "table",
           "placement": "right",
           "calcs": [
@@ -650,23 +951,25 @@
             "lastNotNull"
           ],
           "sortBy": "Max",
-          "sortDesc": true
+          "sortDesc": true,
+          "width": 300
         },
         "tooltip": {
           "mode": "multi",
-          "sort": "desc"
+          "sort": "desc",
+          "hideZeros": false
         }
       }
     },
     {
       "type": "timeseries",
-      "title": "Verworfener Traffic Minecraft",
       "id": 13,
+      "title": "Spieler-Verbindungen",
+      "description": "Verbindungen pro Minute: verifiziert (neue Spieler), übernommen (bestehende Verbindungen nach Filter-Neustart) und abgelehnt (vom Filter verworfene Verbindungen).",
       "datasource": {
         "type": "prometheus",
         "uid": "ag2bkfabvaarke"
       },
-      "description": "",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -675,599 +978,148 @@
       },
       "targets": [
         {
-          "refId": "A",
-          "expr": "sum(rate(minecraft_dropped_bytes[1m])) * 8",
-          "legendFormat": "verworfen",
           "datasource": {
             "type": "prometheus",
             "uid": "ag2bkfabvaarke"
-          }
+          },
+          "refId": "A",
+          "expr": "sum(rate(minecraft_verified_connections[$__rate_interval])) * 60",
+          "legendFormat": "Verifiziert",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
         },
         {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          },
           "refId": "B",
-          "expr": "sum(rate(minecraft_incoming_bytes[1m])) * 8",
-          "legendFormat": "geprüft",
+          "expr": "sum(rate(minecraft_adopted_connections[$__rate_interval])) * 60",
+          "legendFormat": "Übernommen",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
+        },
+        {
           "datasource": {
             "type": "prometheus",
             "uid": "ag2bkfabvaarke"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "bps",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 15,
-            "showPoints": "never",
-            "spanNulls": true,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            }
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "right",
-          "calcs": [
-            "max",
-            "lastNotNull"
-          ],
-          "sortBy": "Max",
-          "sortDesc": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      }
-    },
-    {
-      "type": "table",
-      "title": "Geschützte Server",
-      "id": 14,
-      "datasource": {
-        "type": "prometheus",
-        "uid": "ag2bkfabvaarke"
-      },
-      "description": "",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 22
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "max by (dst_ip, dst_port, proto, kind, source) (minecraft_target_protected)",
-          "format": "table",
-          "instant": true,
-          "datasource": {
-            "type": "prometheus",
-            "uid": "ag2bkfabvaarke"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Port"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "none"
-              },
-              {
-                "id": "decimals",
-                "value": 0
-              },
-              {
-                "id": "custom.align",
-                "value": "left"
-              }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "showHeader": true,
-        "cellHeight": "sm",
-        "sortBy": [
-          {
-            "displayName": "Aktiv",
-            "desc": true
-          }
-        ]
-      },
-      "transformations": [
-        {
-          "id": "organize",
-          "options": {
-            "excludeByName": {
-              "Time": true,
-              "__name__": true,
-              "job": true,
-              "instance": true
-            },
-            "renameByName": {
-              "dst_ip": "IP",
-              "dst_port": "Port",
-              "proto": "Protokoll",
-              "kind": "Typ",
-              "source": "Quelle",
-              "Value": "Aktiv"
-            }
-          }
-        }
-      ]
-    },
-    {
-      "type": "table",
-      "title": "Meist angegriffen (Zeitraum)",
-      "id": 15,
-      "datasource": {
-        "type": "prometheus",
-        "uid": "ag2bkfabvaarke"
-      },
-      "description": "",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 22
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "topk(20, sum by (dst_ip, dst_port, proto) (increase(minecraft_target_dropped_packets[$__range]))) > 0",
-          "format": "table",
-          "instant": true,
-          "datasource": {
-            "type": "prometheus",
-            "uid": "ag2bkfabvaarke"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "noValue": "Keine Angriffe im Zeitraum"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Port"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "none"
-              },
-              {
-                "id": "decimals",
-                "value": 0
-              },
-              {
-                "id": "custom.align",
-                "value": "left"
-              }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "showHeader": true,
-        "cellHeight": "sm",
-        "sortBy": [
-          {
-            "displayName": "Verworfene Pakete",
-            "desc": true
-          }
-        ]
-      },
-      "transformations": [
-        {
-          "id": "organize",
-          "options": {
-            "excludeByName": {
-              "Time": true,
-              "__name__": true,
-              "job": true,
-              "instance": true
-            },
-            "renameByName": {
-              "dst_ip": "IP",
-              "dst_port": "Port",
-              "proto": "Protokoll",
-              "Value": "Verworfene Pakete"
-            }
-          }
-        }
-      ]
-    },
-    {
-      "type": "row",
-      "title": "Netzwerk-Schutz",
-      "id": 16,
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 30
-      },
-      "panels": []
-    },
-    {
-      "type": "timeseries",
-      "title": "Reflection nach Dienst",
-      "id": 17,
-      "datasource": {
-        "type": "prometheus",
-        "uid": "ag2bkfabvaarke"
-      },
-      "description": "Unaufgeforderte Antworten von DNS, NTP, Memcached, ... und UDP-Fragmente",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 31
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "sum by (service) (rate(xdp_reflection_packets[1m]))",
-          "legendFormat": "{{service}}",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "ag2bkfabvaarke"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "pps",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 15,
-            "showPoints": "never",
-            "spanNulls": true,
-            "stacking": {
-              "mode": "normal",
-              "group": "A"
-            }
           },
-          "noValue": "Keine Reflection-Angriffe"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "right",
-          "calcs": [
-            "max",
-            "lastNotNull"
-          ],
-          "sortBy": "Max",
-          "sortDesc": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Reflection nach Kunden-IP",
-      "id": 18,
-      "datasource": {
-        "type": "prometheus",
-        "uid": "ag2bkfabvaarke"
-      },
-      "description": "",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 31
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "topk(10, sum by (dst_ip) (rate(xdp_reflection_bytes[1m])) * 8)",
-          "legendFormat": "{{dst_ip}}",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "ag2bkfabvaarke"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "bps",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 15,
-            "showPoints": "never",
-            "spanNulls": true,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            }
-          },
-          "noValue": "Keine Reflection-Angriffe"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "right",
-          "calcs": [
-            "max",
-            "lastNotNull"
-          ],
-          "sortBy": "Max",
-          "sortDesc": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Traffic an unbenutzte IPs",
-      "id": 19,
-      "datasource": {
-        "type": "prometheus",
-        "uid": "ag2bkfabvaarke"
-      },
-      "description": "Ziele ohne Route im eigenen Prefix, z. B. noch nicht vergebene Adressen",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 39
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "topk(10, sum by (dst_ip) (rate(xdp_unused_packets[1m])))",
-          "legendFormat": "{{dst_ip}}",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "ag2bkfabvaarke"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "pps",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 15,
-            "showPoints": "never",
-            "spanNulls": true,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            }
-          },
-          "noValue": "Kein Traffic an unbenutzte IPs"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "right",
-          "calcs": [
-            "max",
-            "lastNotNull"
-          ],
-          "sortBy": "Max",
-          "sortDesc": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      }
-    },
-    {
-      "type": "table",
-      "title": "Reflection-Opfer (Zeitraum)",
-      "id": 20,
-      "datasource": {
-        "type": "prometheus",
-        "uid": "ag2bkfabvaarke"
-      },
-      "description": "",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 39
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "topk(20, sum by (dst_ip, service) (increase(xdp_reflection_packets[$__range]))) > 0",
-          "format": "table",
-          "instant": true,
-          "datasource": {
-            "type": "prometheus",
-            "uid": "ag2bkfabvaarke"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "noValue": "Keine Reflection-Angriffe im Zeitraum"
-        },
-        "overrides": []
-      },
-      "options": {
-        "showHeader": true,
-        "cellHeight": "sm",
-        "sortBy": [
-          {
-            "displayName": "Pakete",
-            "desc": true
-          }
-        ]
-      },
-      "transformations": [
-        {
-          "id": "organize",
-          "options": {
-            "excludeByName": {
-              "Time": true,
-              "__name__": true,
-              "job": true,
-              "instance": true
-            },
-            "renameByName": {
-              "dst_ip": "IP",
-              "service": "Dienst",
-              "Value": "Pakete"
-            }
-          }
-        }
-      ]
-    },
-    {
-      "type": "row",
-      "title": "Web (HTTP/HTTPS)",
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 47
-      },
-      "panels": [],
-      "id": 21
-    },
-    {
-      "type": "timeseries",
-      "title": "Web: verworfene Pakete",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "ag2bkfabvaarke"
-      },
-      "description": "Ungültige Handshakes, Müll statt HTTP-Anfrage/TLS-ClientHello, Pakete ohne Verbindung. Im Monitor-Modus nur gezählt.",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 48
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "topk(10, sum by (dst_ip, dst_port, kind) (rate(minecraft_target_dropped_packets[1m]) * on (dst_ip, dst_port, proto) group_left(kind) max by (dst_ip, dst_port, proto, kind) (minecraft_target_protected{kind=~\"http|https\"})))",
-          "legendFormat": "{{dst_ip}}:{{dst_port}} ({{kind}})",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "ag2bkfabvaarke"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "pps",
-          "noValue": "Kein verworfener Web-Traffic",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 15,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "right",
-          "calcs": [
-            "max",
-            "lastNotNull"
-          ],
-          "sortBy": "Max",
-          "sortDesc": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "id": 22
-    },
-    {
-      "type": "timeseries",
-      "title": "Web: neue Verbindungen",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "ag2bkfabvaarke"
-      },
-      "description": "Geprüfte Verbindungen (gültige HTTP-Anfrage bzw. TLS-ClientHello) pro Minute",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 48
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "topk(10, sum by (dst_ip, dst_port, kind) (rate(minecraft_target_verified_connections[5m]) * on (dst_ip, dst_port, proto) group_left(kind) max by (dst_ip, dst_port, proto, kind) (minecraft_target_protected{kind=~\"http|https\"}))) * 60",
-          "legendFormat": "{{dst_ip}}:{{dst_port}} ({{kind}})",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "ag2bkfabvaarke"
-          }
+          "refId": "C",
+          "expr": "sum(rate(minecraft_dropped_connections[$__rate_interval])) * 60",
+          "legendFormat": "Abgelehnt",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "cpm",
-          "noValue": "Keine Web-Verbindungen",
+          "noValue": "Keine Verbindungen im Zeitraum",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 15,
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "none",
             "showPoints": "never",
-            "spanNulls": true
-          }
+            "pointSize": 8,
+            "lineInterpolation": "smooth",
+            "spanNulls": 60000,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisSoftMin": 0,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "barAlignment": 0,
+            "insertNulls": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Verifiziert"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2a78d6"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Übernommen"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#1baf7a"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Abgelehnt"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#eb6834"
+                }
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {
+          "showLegend": true,
           "displayMode": "table",
           "placement": "right",
           "calcs": [
@@ -1275,18 +1127,21 @@
             "lastNotNull"
           ],
           "sortBy": "Max",
-          "sortDesc": true
+          "sortDesc": true,
+          "width": 300
         },
         "tooltip": {
           "mode": "multi",
-          "sort": "desc"
+          "sort": "desc",
+          "hideZeros": false
         }
-      },
-      "id": 23
+      }
     },
     {
-      "type": "table",
-      "title": "Erkannte Webserver",
+      "type": "timeseries",
+      "id": 14,
+      "title": "Eingehend vs. verworfen (gesamt)",
+      "description": "Gesamter vom Filter geprüfter eingehender Traffic im Vergleich zum verworfenen Anteil, in bit/s.",
       "datasource": {
         "type": "prometheus",
         "uid": "ag2bkfabvaarke"
@@ -1295,24 +1150,584 @@
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 56
+        "y": 22
       },
       "targets": [
         {
-          "refId": "A",
-          "expr": "max by (dst_ip, dst_port, kind, source) (minecraft_target_protected{kind=~\"http|https\"})",
-          "format": "table",
-          "instant": true,
           "datasource": {
             "type": "prometheus",
             "uid": "ag2bkfabvaarke"
+          },
+          "refId": "A",
+          "expr": "sum(rate(minecraft_incoming_bytes[$__rate_interval])) * 8",
+          "legendFormat": "Eingehend",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          },
+          "refId": "B",
+          "expr": "sum(rate(minecraft_dropped_bytes[$__rate_interval])) * 8",
+          "legendFormat": "Verworfen",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "noValue": "Kein Traffic im Zeitraum",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "pointSize": 8,
+            "lineInterpolation": "smooth",
+            "spanNulls": 60000,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisSoftMin": 0,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "barAlignment": 0,
+            "insertNulls": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Eingehend"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2a78d6"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Verworfen"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#eb6834"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ],
+          "sortBy": "Max",
+          "sortDesc": true,
+          "width": 300
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc",
+          "hideZeros": false
+        }
+      }
+    },
+    {
+      "type": "row",
+      "id": 15,
+      "title": "Web (HTTP/HTTPS)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 29
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 16,
+      "title": "Web: würde verwerfen (Pakete/s)",
+      "description": "Pakete pro Sekunde, die der Web-Schutz je HTTP/HTTPS-Ziel verwerfen würde. Top 10. Hinweis: läuft aktuell im MONITOR-Modus, die Werte zeigen nur, was verworfen würde; es wird nichts blockiert.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ag2bkfabvaarke"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 30
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          },
+          "refId": "A",
+          "expr": "topk(10, sum by (dst_ip, dst_port, proto, kind) ((rate(minecraft_target_dropped_packets[$__rate_interval]) * on (dst_ip, dst_port, proto) group_left(kind) max by (dst_ip, dst_port, proto, kind) (minecraft_target_protected{kind=~\"http|https\"}))) > 0)",
+          "legendFormat": "{{dst_ip}}:{{dst_port}} ({{kind}})",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "noValue": "Keine auffälligen Web-Pakete im Zeitraum",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "pointSize": 8,
+            "lineInterpolation": "smooth",
+            "spanNulls": 60000,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisSoftMin": 0,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "barAlignment": 0,
+            "insertNulls": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ],
+          "sortBy": "Max",
+          "sortDesc": true,
+          "width": 300
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc",
+          "hideZeros": false
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 17,
+      "title": "Web: neue Verbindungen",
+      "description": "TCP-SYN-Pakete pro Sekunde je HTTP/HTTPS-Ziel. Top 10. Hinweis: läuft aktuell im MONITOR-Modus, die Werte zeigen nur, was verworfen würde; es wird nichts blockiert.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ag2bkfabvaarke"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 30
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          },
+          "refId": "A",
+          "expr": "topk(10, sum by (dst_ip, dst_port, proto, kind) ((rate(minecraft_target_syn_packets[$__rate_interval]) * on (dst_ip, dst_port, proto) group_left(kind) max by (dst_ip, dst_port, proto, kind) (minecraft_target_protected{kind=~\"http|https\"}))) > 0)",
+          "legendFormat": "{{dst_ip}}:{{dst_port}} ({{kind}})",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "noValue": "Keine Web-Verbindungen im Zeitraum",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "pointSize": 8,
+            "lineInterpolation": "smooth",
+            "spanNulls": 60000,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisSoftMin": 0,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "barAlignment": 0,
+            "insertNulls": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ],
+          "sortBy": "Max",
+          "sortDesc": true,
+          "width": 300
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc",
+          "hideZeros": false
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 18,
+      "title": "Web: eingehender Traffic",
+      "description": "Eingehender Traffic je HTTP/HTTPS-Ziel in bit/s. Top 10. Hinweis: läuft aktuell im MONITOR-Modus, die Werte zeigen nur, was verworfen würde; es wird nichts blockiert.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ag2bkfabvaarke"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 30
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          },
+          "refId": "A",
+          "expr": "topk(10, sum by (dst_ip, dst_port, proto, kind) ((rate(minecraft_target_incoming_bytes[$__rate_interval]) * on (dst_ip, dst_port, proto) group_left(kind) max by (dst_ip, dst_port, proto, kind) (minecraft_target_protected{kind=~\"http|https\"}))) * 8 > 0)",
+          "legendFormat": "{{dst_ip}}:{{dst_port}} ({{kind}})",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "noValue": "Kein Web-Traffic im Zeitraum",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "pointSize": 8,
+            "lineInterpolation": "smooth",
+            "spanNulls": 60000,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisSoftMin": 0,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "barAlignment": 0,
+            "insertNulls": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ],
+          "sortBy": "Max",
+          "sortDesc": true,
+          "width": 300
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc",
+          "hideZeros": false
+        }
+      }
+    },
+    {
+      "type": "row",
+      "id": 19,
+      "title": "Tabellen",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 38
+      },
+      "panels": []
+    },
+    {
+      "type": "table",
+      "id": 20,
+      "title": "Geschützte Ziele",
+      "description": "Alle vom Filter erkannten bzw. konfigurierten Ziele. Typ „Ausgenommen“ = bewusst vom Schutz ausgenommen. Ziele nur im statischen Portbereich 25560-25760 erscheinen hier nicht.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ag2bkfabvaarke"
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 12,
+        "x": 0,
+        "y": 39
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          },
+          "refId": "A",
+          "expr": "max by (dst_ip, dst_port, proto, kind, source) (minecraft_target_protected)",
+          "legendFormat": "__auto",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "convertFieldType",
+          "options": {
+            "fields": {},
+            "conversions": [
+              {
+                "targetField": "dst_port",
+                "destinationType": "number"
+              }
+            ]
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "instance": true,
+              "job": true,
+              "Value": true
+            },
+            "indexByName": {
+              "dst_ip": 0,
+              "dst_port": 1,
+              "proto": 2,
+              "kind": 3,
+              "source": 4
+            },
+            "renameByName": {
+              "dst_ip": "IP",
+              "dst_port": "Port",
+              "proto": "Protokoll",
+              "kind": "Typ",
+              "source": "Quelle"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "IP"
+              }
+            ]
           }
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
-          "noValue": "Keine Webserver erkannt"
+          "noValue": "Keine geschützten Ziele",
+          "mappings": [],
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false,
+            "filterable": false
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
         },
         "overrides": [
           {
@@ -1332,6 +1747,104 @@
               {
                 "id": "custom.align",
                 "value": "left"
+              },
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Typ"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "java": {
+                        "text": "Java",
+                        "index": 0
+                      },
+                      "bedrock": {
+                        "text": "Bedrock",
+                        "index": 1
+                      },
+                      "http": {
+                        "text": "HTTP",
+                        "index": 2
+                      },
+                      "https": {
+                        "text": "HTTPS",
+                        "index": 3
+                      },
+                      "none": {
+                        "text": "Ausgenommen",
+                        "index": 4
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Quelle"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "auto": {
+                        "text": "Automatisch",
+                        "index": 0
+                      },
+                      "static": {
+                        "text": "Statisch",
+                        "index": 1
+                      },
+                      "exclude": {
+                        "text": "Ausnahme",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Protokoll"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "tcp": {
+                        "text": "TCP",
+                        "index": 0
+                      },
+                      "udp": {
+                        "text": "UDP",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
               }
             ]
           }
@@ -1339,26 +1852,1105 @@
       },
       "options": {
         "showHeader": true,
-        "cellHeight": "sm"
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": "",
+          "countRows": false
+        },
+        "sortBy": [
+          {
+            "displayName": "IP",
+            "desc": false
+          }
+        ]
+      }
+    },
+    {
+      "type": "table",
+      "id": 21,
+      "title": "Meist angegriffene Ziele (Zeitraum)",
+      "description": "Die 10 Ziele mit den meisten verworfenen Paketen im gewählten Zeitraum (alle Typen; Web-Werte nur Monitor).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ag2bkfabvaarke"
       },
+      "gridPos": {
+        "h": 12,
+        "w": 12,
+        "x": 12,
+        "y": 39
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          },
+          "refId": "A",
+          "expr": "topk(10, sum by (dst_ip, dst_port, proto) (increase(minecraft_target_dropped_packets[$__range])) > 0)",
+          "legendFormat": "__auto",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          },
+          "refId": "B",
+          "expr": "sum by (dst_ip, dst_port, proto) (increase(minecraft_target_dropped_bytes[$__range])) and on (dst_ip, dst_port, proto) topk(10, sum by (dst_ip, dst_port, proto) (increase(minecraft_target_dropped_packets[$__range])) > 0)",
+          "legendFormat": "__auto",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "convertFieldType",
+          "options": {
+            "fields": {},
+            "conversions": [
+              {
+                "targetField": "dst_port",
+                "destinationType": "number"
+              }
+            ]
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "instance": true,
+              "job": true
+            },
+            "indexByName": {
+              "dst_ip": 0,
+              "dst_port": 1,
+              "proto": 2,
+              "Value #A": 3,
+              "Value #B": 4
+            },
+            "renameByName": {
+              "dst_ip": "IP",
+              "dst_port": "Port",
+              "proto": "Protokoll",
+              "Value #A": "Verworfene Pakete",
+              "Value #B": "Verworfene Daten"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "Verworfene Pakete",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Keine Angriffe im Zeitraum",
+          "mappings": [],
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false,
+            "filterable": false
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Port"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.align",
+                "value": "left"
+              },
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Protokoll"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "tcp": {
+                        "text": "TCP",
+                        "index": 0
+                      },
+                      "udp": {
+                        "text": "UDP",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Verworfene Pakete"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 170
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic",
+                  "valueDisplayMode": "text"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2a78d6"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Verworfene Daten"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "decbytes"
+              },
+              {
+                "id": "decimals",
+                "value": null
+              },
+              {
+                "id": "custom.width",
+                "value": 170
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic",
+                  "valueDisplayMode": "text"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2a78d6"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": "",
+          "countRows": false
+        },
+        "sortBy": [
+          {
+            "displayName": "Verworfene Pakete",
+            "desc": true
+          }
+        ]
+      }
+    },
+    {
+      "type": "table",
+      "id": 22,
+      "title": "Reflection-Opfer (Zeitraum)",
+      "description": "Kunden-IPs mit den meisten UDP-Reflection-Paketen im gewählten Zeitraum, nach Dienst. Top 10. Hinweis: läuft aktuell im MONITOR-Modus, die Werte zeigen nur, was verworfen würde; es wird nichts blockiert.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ag2bkfabvaarke"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 51
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          },
+          "refId": "A",
+          "expr": "topk(10, sum by (dst_ip, service) (increase(xdp_reflection_packets[$__range])) > 0)",
+          "legendFormat": "__auto",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "editorMode": "code"
+        }
+      ],
       "transformations": [
         {
           "id": "organize",
           "options": {
             "excludeByName": {
               "Time": true,
-              "Value": true
+              "__name__": true,
+              "instance": true,
+              "job": true
+            },
+            "indexByName": {
+              "dst_ip": 0,
+              "service": 1,
+              "Value": 2
             },
             "renameByName": {
               "dst_ip": "IP",
-              "dst_port": "Port",
-              "kind": "Typ",
-              "source": "Quelle"
+              "service": "Dienst",
+              "Value": "Pakete"
             }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "Pakete",
+                "desc": true
+              }
+            ]
           }
         }
       ],
-      "id": 24
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Keine Reflection-Angriffe im Zeitraum",
+          "mappings": [],
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false,
+            "filterable": false
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Pakete"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 170
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic",
+                  "valueDisplayMode": "text"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2a78d6"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": "",
+          "countRows": false
+        },
+        "sortBy": []
+      }
+    },
+    {
+      "type": "table",
+      "id": 23,
+      "title": "Unbenutzte IPs (Zeitraum)",
+      "description": "Nicht vergebene Adressen mit den meisten verworfenen Paketen im gewählten Zeitraum. Top 10.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ag2bkfabvaarke"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 51
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          },
+          "refId": "A",
+          "expr": "topk(10, sum by (dst_ip) (increase(xdp_unused_packets[$__range])) > 0)",
+          "legendFormat": "__auto",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "instance": true,
+              "job": true
+            },
+            "indexByName": {
+              "dst_ip": 0,
+              "Value": 1
+            },
+            "renameByName": {
+              "dst_ip": "IP",
+              "Value": "Verworfene Pakete"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "Verworfene Pakete",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Kein Traffic an unbenutzte IPs",
+          "mappings": [],
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false,
+            "filterable": false
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Verworfene Pakete"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 170
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic",
+                  "valueDisplayMode": "text"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2a78d6"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": "",
+          "countRows": false
+        },
+        "sortBy": []
+      }
+    },
+    {
+      "type": "row",
+      "id": 24,
+      "title": "Netzwerk-Schutz",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 60
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 25,
+      "title": "Reflection nach Dienst",
+      "description": "UDP-Reflection-Pakete pro Sekunde nach Quelldienst. Hinweis: läuft aktuell im MONITOR-Modus, die Werte zeigen nur, was verworfen würde; es wird nichts blockiert.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ag2bkfabvaarke"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 61
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          },
+          "refId": "A",
+          "expr": "sum by (service) (rate(xdp_reflection_packets[$__rate_interval])) > 0",
+          "legendFormat": "{{service}}",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "noValue": "Keine Reflection-Angriffe im Zeitraum",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "pointSize": 8,
+            "lineInterpolation": "smooth",
+            "spanNulls": 60000,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisSoftMin": 0,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "barAlignment": 0,
+            "insertNulls": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dns"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2a78d6"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ntp"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#eb6834"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "memcached"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#1baf7a"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ssdp"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#eda100"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cldap"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#e87ba4"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "fragment"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#6250d6"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ],
+          "sortBy": "Max",
+          "sortDesc": true,
+          "width": 300
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc",
+          "hideZeros": false
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 26,
+      "title": "Reflection nach Ziel-IP",
+      "description": "UDP-Reflection-Pakete pro Sekunde je betroffener Kunden-IP. Top 10. Hinweis: läuft aktuell im MONITOR-Modus, die Werte zeigen nur, was verworfen würde; es wird nichts blockiert.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ag2bkfabvaarke"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 61
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          },
+          "refId": "A",
+          "expr": "topk(10, sum by (dst_ip) (rate(xdp_reflection_packets[$__rate_interval])) > 0)",
+          "legendFormat": "{{dst_ip}}",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "noValue": "Keine Reflection-Angriffe im Zeitraum",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "pointSize": 8,
+            "lineInterpolation": "smooth",
+            "spanNulls": 60000,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisSoftMin": 0,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "barAlignment": 0,
+            "insertNulls": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ],
+          "sortBy": "Max",
+          "sortDesc": true,
+          "width": 300
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc",
+          "hideZeros": false
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 27,
+      "title": "Unbenutzte IPs: verworfene Pakete",
+      "description": "Verworfene Pakete pro Sekunde an nicht vergebene Adressen (Scans, Angriffe auf freie IPs). Top 10.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ag2bkfabvaarke"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 69
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          },
+          "refId": "A",
+          "expr": "topk(10, sum by (dst_ip) (rate(xdp_unused_packets[$__rate_interval])) > 0)",
+          "legendFormat": "{{dst_ip}}",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "noValue": "Kein Traffic an unbenutzte IPs",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "pointSize": 8,
+            "lineInterpolation": "smooth",
+            "spanNulls": 60000,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisSoftMin": 0,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "barAlignment": 0,
+            "insertNulls": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ],
+          "sortBy": "Max",
+          "sortDesc": true,
+          "width": 300
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc",
+          "hideZeros": false
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 28,
+      "title": "Unbenutzte IPs: verworfener Traffic",
+      "description": "Gesamte verworfene Bandbreite an nicht vergebene Adressen in bit/s.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ag2bkfabvaarke"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 69
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          },
+          "refId": "A",
+          "expr": "sum(rate(xdp_unused_bytes[$__rate_interval])) * 8",
+          "legendFormat": "Unbenutzte IPs",
+          "range": true,
+          "instant": false,
+          "format": "time_series",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "noValue": "Kein Traffic an unbenutzte IPs",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "pointSize": 8,
+            "lineInterpolation": "smooth",
+            "spanNulls": 60000,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisSoftMin": 0,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "barAlignment": 0,
+            "insertNulls": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Unbenutzte IPs"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2a78d6"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ],
+          "sortBy": "Max",
+          "sortDesc": true,
+          "width": 300
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc",
+          "hideZeros": false
+        }
+      }
     }
   ]
 }
