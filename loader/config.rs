@@ -142,6 +142,17 @@ drop_fragments = true
 # Seconds a recorded request accepts answers. Must be between 1 and 300.
 reply_window_secs = 30
 
+[penalty]
+# Penalty box: a java client that ran into the connection throttle (and
+# recently completed a real status ping or login, so it is no spoofed flood)
+# is redirected for `seconds` to a small service that shows `message` in
+# the server list and as the disconnect reason of a join attempt.
+enabled = true
+seconds = 10
+port = 25599
+message = "Too many connection attempts - please wait 10 seconds, then you can reconnect."
+verified_window_secs = 600
+
 [blocklist]
 # Sources that are always dropped, checked before everything else: one
 # address or prefix per line in `file` (re-read live when it changes, `#`
@@ -258,6 +269,7 @@ pub struct Config {
     pub targets: TargetsConfig,
     pub autodetect: AutodetectConfig,
     pub web: WebConfig,
+    pub penalty: PenaltyConfig,
     pub reflection: ReflectionConfig,
     pub blocklist: BlocklistConfig,
     pub ratelimit: RatelimitConfig,
@@ -440,6 +452,40 @@ impl ReflectionConfig {
             bail!("[reflection] networks must not be empty when the protection is on");
         }
         check_range("[reflection] reply_window_secs", self.reply_window_secs, 1, 300)
+    }
+}
+
+/// `[penalty]` — "please wait" message for throttled java clients.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PenaltyConfig {
+    pub enabled: bool,
+    pub seconds: u64,
+    pub port: u16,
+    pub message: String,
+    pub verified_window_secs: u64,
+}
+
+impl Default for PenaltyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            seconds: 10,
+            port: 25599,
+            message: "Too many connection attempts - please wait 10 seconds, then you can reconnect.".into(),
+            verified_window_secs: 600,
+        }
+    }
+}
+
+impl PenaltyConfig {
+    fn validate(&self) -> Result<()> {
+        check_range("[penalty] seconds", self.seconds, 1, 3_600)?;
+        check_range("[penalty] verified_window_secs", self.verified_window_secs, 10, 86_400)?;
+        if self.message.len() > 256 {
+            bail!("[penalty] message is limited to 256 bytes");
+        }
+        Ok(())
     }
 }
 
@@ -712,6 +758,7 @@ impl Config {
         self.targets.validate()?;
         self.autodetect.validate()?;
         self.web.validate()?;
+        self.penalty.validate()?;
         self.reflection.validate()?;
         self.blocklist.validate()?;
         self.ratelimit.validate()?;

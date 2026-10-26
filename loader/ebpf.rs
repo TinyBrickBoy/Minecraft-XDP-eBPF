@@ -45,6 +45,8 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
     let ratelimit_pps: u64 = config.ratelimit.pps;
     let ratelimit_ban_ns: u64 = config.ratelimit.ban_secs * 1_000_000_000;
     let strike_limit: u64 = config.ratelimit.strikes;
+    let penalty_ns: u64 = if config.penalty.enabled { config.penalty.seconds * 1_000_000_000 } else { 0 };
+    let penalty_verified_ns: u64 = config.penalty.verified_window_secs * 1_000_000_000;
     let dns_scan: u8 = (config.blocklist.enabled && config.blocklist.dns_scan && !config.ratelimit.networks.is_empty()) as u8;
     let dns_recheck_ns: u64 = config.blocklist.dns_recheck_secs * 1_000_000_000;
     let strike_window_ns: u64 = config.ratelimit.strike_window_secs * 1_000_000_000;
@@ -68,6 +70,8 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
         .override_global("STRIKE_LIMIT", &strike_limit, true)
         .override_global("STRIKE_WINDOW_NS", &strike_window_ns, true)
         .override_global("DNS_SCAN", &dns_scan, true)
+        .override_global("PENALTY_NS", &penalty_ns, true)
+        .override_global("PENALTY_VERIFIED_NS", &penalty_verified_ns, true)
         .override_global("DNS_RECHECK_NS", &dns_recheck_ns, true)
         .override_global("WEB_ENFORCE", &web_enforce, true)
         .override_global("WEB_HIT_COUNT", &web_hit_count, true)

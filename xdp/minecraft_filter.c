@@ -257,6 +257,8 @@ static __always_inline __u8 lookup_target(const __u32 daddr, const __u16 dport, 
     return KIND_NONE;
 }
 
+#include "penalty.h"
+
 /*
  * Looks up the global and the per destination statistics slots. Returns 0
  * only if the global slot is missing, which can not happen (per-cpu array
@@ -937,8 +939,20 @@ __s32 minecraft_filter(struct xdp_md *ctx)
             goto drop;
         }
 
+        // a client in the penalty box is redirected to the penalty service
+        if (penalized(src_ip))
+        {
+            return XDP_PASS;
+        }
+
         if (!throttle_allows(src_ip))
         {
+            // a known real client gets the penalty box (a "please wait"
+            // message) instead of a silent drop; spoofed floods are dropped
+            if (try_penalize(src_ip))
+            {
+                return XDP_PASS;
+            }
             goto drop;
         }
 
@@ -969,6 +983,12 @@ __s32 minecraft_filter(struct xdp_md *ctx)
     struct initial_state *initial_state = bpf_map_lookup_elem(&conntrack_map, &flow_key);
     if (!initial_state)
     {
+        // a connection to the penalty service
+        if (penalized(src_ip))
+        {
+            return XDP_PASS;
+        }
+
         // neither tracked nor verified: during the grace window this is a
         // connection that was established before the target was protected,
         // adopt it instead of cutting the player off. Teardown segments of
@@ -1087,6 +1107,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
                 goto drop;
             }
             initial_state->state = PING_COMPLETE;
+            note_verified_source(src_ip);
             goto update_state;
         }
         if (state == AWAIT_LOGIN)
@@ -1105,6 +1126,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
                 count_stats(stats_ptr, dst_stats_ptr, OFFLINE_REJECTED, 1);
                 goto drop_connection;
             }
+            note_verified_source(src_ip);
             // tracking ends here, no need to update the expected sequence
             return switch_to_verified(raw_packet_len, stats_ptr, dst_stats_ptr, &flow_key, VERIFIED);
         }

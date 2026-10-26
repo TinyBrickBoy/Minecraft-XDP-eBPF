@@ -27,7 +27,7 @@ ip addr add 10.99.0.1/24 dev c0; ip link set c0 up
 ip addr add 10.99.1.1/24 dev s0; ip link set s0 up
 ip link add dummy0 type dummy; ip addr add 10.99.2.1/32 dev dummy0; ip link set dummy0 up
 for ns in cl sv; do ip -n $ns link set lo up; done
-ip -n cl addr add 10.99.0.2/24 dev c1; ip -n cl addr add 10.99.0.3/24 dev c1; ip -n cl addr add 10.99.0.4/24 dev c1; ip -n cl addr add 10.99.0.5/24 dev c1; ip -n cl addr add 10.99.0.6/24 dev c1; ip -n cl addr add 10.99.0.7/24 dev c1; ip -n cl link set c1 up; ip -n cl route add default via 10.99.0.1
+ip -n cl addr add 10.99.0.2/24 dev c1; ip -n cl addr add 10.99.0.3/24 dev c1; ip -n cl addr add 10.99.0.4/24 dev c1; ip -n cl addr add 10.99.0.5/24 dev c1; ip -n cl addr add 10.99.0.6/24 dev c1; ip -n cl addr add 10.99.0.7/24 dev c1; ip -n cl addr add 10.99.0.8/24 dev c1; ip -n cl link set c1 up; ip -n cl route add default via 10.99.0.1
 ip -n sv addr add 10.99.1.2/24 dev s1; ip -n sv link set s1 up; ip -n sv route add default via 10.99.1.1
 sysctl -qw net.ipv4.ip_forward=1
 # customer prefix like on the router: unreachable /24, one address routed
@@ -235,6 +235,17 @@ sleep 2
 check "scanner banned (violations)"   cl $S5 $MC udp-no-echo 10.99.1.2 40000 5012
 check "logged as violations"          grep -q 'banned 10.99.0.5 .*violations' $T/loader.log
 check "banned source still reaches the router itself" cl $S5 $MC udp-echo 10.99.0.1 40100 5013
+
+echo "== penalty box"
+P7="env E2E_BIND=10.99.0.7"; P8="env E2E_BIND=10.99.0.8"
+check "redirect rules installed"      bash -c "nft list table ip xdp_penalty | grep -q 'dnat to 10.99.0.1:25599'"
+check "real client: server list ping" cl $P7 $MC status 10.99.1.2 25565
+cl $P7 $MC connect-spam 10.99.1.2 25565 15
+check "throttled real client gets the please-wait message" cl $P7 $MC penalty-message 10.99.1.2 25565
+cl $P8 $MC connect-spam 10.99.1.2 25565 15
+check "unknown (spoofable) source is just dropped"         cl $P8 $MC no-penalty-message 10.99.1.2 25565
+sleep 11
+check "after the penalty the real server works again"     cl $P7 $MC status 10.99.1.2 25565
 
 echo "== DNS scanners"
 D6="env E2E_BIND=10.99.0.6"; D7="env E2E_BIND=10.99.0.7"

@@ -4,6 +4,7 @@ mod detect;
 mod ebpf;
 mod logging;
 mod metrics;
+mod penalty;
 mod reflection;
 mod shutdown;
 mod targets;
@@ -172,6 +173,18 @@ fn run(args: &Args, config: &Config, shutdown: &Arc<Shutdown>) -> Result<()> {
     };
 
     let unused_stats = unused::setup(&mut ebpf, config)?;
+    // keeps the redirect rules alive until the end of run()
+    let penalty = match penalty::setup(&mut ebpf, interface, config, shutdown) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Penalty box disabled: {e:#}");
+            None
+        }
+    };
+    let (_penalty_redirect, penalty_thread) = match penalty {
+        Some((redirect, thread)) => (Some(redirect), Some(thread)),
+        None => (None, None),
+    };
     let (block_handles, block_thread) = match blocklist::setup(&mut ebpf, config, shutdown) {
         Ok(v) => v,
         Err(e) => {
@@ -187,6 +200,7 @@ fn run(args: &Args, config: &Config, shutdown: &Arc<Shutdown>) -> Result<()> {
         blocklist: block_handles,
     };
     threads.extend(block_thread);
+    threads.extend(penalty_thread);
     if let Some(handle) = metrics::start(&mut ebpf, config, targets.clone(), extra, shutdown)? {
         threads.push(handle);
     }

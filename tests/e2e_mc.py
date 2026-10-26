@@ -160,7 +160,8 @@ def bedrock_server(host, port):
 # ---------------------------------------------------------------- clients
 
 def status(host, port):
-    with socket.create_connection((host, port), timeout=3) as s:
+    bind = os.environ.get("E2E_BIND")
+    with socket.create_connection((host, port), timeout=3, source_address=(bind, 0) if bind else None) as s:
         s.sendall(handshake(host, port, 1) + b"\x01\x00")
         read_varint(s)
         assert read_varint(s) == 0
@@ -359,6 +360,48 @@ def login_uuid_rejected(host, port, version):
     return not login_uuid(host, port, version)
 
 
+def connect_spam(host, port, count):
+    """Opens and closes `count` connections quickly (connection throttle)."""
+    for _ in range(int(count)):
+        try:
+            s = socket.socket()
+            s.bind((os.environ.get("E2E_BIND", "0.0.0.0"), 0))
+            s.settimeout(0.3)
+            s.connect((host, port))
+            s.close()
+        except OSError:
+            pass
+    return True
+
+
+def login_message(host, port):
+    """Joins and returns the disconnect message, or None."""
+    try:
+        s = socket.socket()
+        s.bind((os.environ.get("E2E_BIND", "0.0.0.0"), 0))
+        s.settimeout(3)
+        s.connect((host, port))
+        s.sendall(handshake(host, port, 2) + packet(b"\x00" + varint(6) + b"Tester" + bytes(16)))
+        read_varint(s)
+        if read_varint(s) != 0:
+            return None
+        text = recv_exact(s, read_varint(s)).decode()
+        s.close()
+        return text
+    except (OSError, EOFError, ValueError):
+        return None
+
+
+def penalty_message(host, port):
+    text = login_message(host, port)
+    print(text or "(keine Nachricht)")
+    return bool(text) and "wait" in text
+
+
+def no_penalty_message(host, port):
+    return not login_message(host, port)
+
+
 def udp_flood(host, port, count):
     """Sends `count` small datagrams as fast as possible (rate limit test)."""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -410,7 +453,9 @@ def main():
               "udp-no-echo": udp_no_echo, "http-get": http_get, "https-get": https_get,
               "http-keepalive": http_keepalive, "tcp-junk": tcp_junk,
               "http-answered": http_answered, "udp-flood": udp_flood,
-              "login-uuid": login_uuid, "login-uuid-rejected": login_uuid_rejected}[cmd]
+              "login-uuid": login_uuid, "login-uuid-rejected": login_uuid_rejected,
+              "connect-spam": connect_spam, "penalty-message": penalty_message,
+              "no-penalty-message": no_penalty_message}[cmd]
         try:
             ok = fn(host, port, *extra)
         except Exception as e:  # noqa: BLE001 - any failure is a test failure

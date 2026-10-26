@@ -3,5 +3,5 @@
 FROM rust:1-trixie
 RUN apt-get update -qq \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-       clang llvm libbpf-dev gcc-multilib iproute2 python3 ethtool curl >/dev/null \
+       clang llvm libbpf-dev gcc-multilib iproute2 python3 ethtool curl nftables >/dev/null \
     && rm -rf /var/lib/apt/lists/*
