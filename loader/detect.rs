@@ -375,7 +375,10 @@ impl Prober {
         }
     }
 
-    /// Minecraft first (it is what most targets are), then http, then TLS.
+    /// Minecraft first (it is what most targets are), then TLS, then http.
+    /// TLS has to come before http: servers like nginx answer a plain http
+    /// request on their TLS port with "HTTP/1.1 400", while no plain http
+    /// server answers a ClientHello with a ServerHello.
     fn probe_tcp(&self, addr: SocketAddrV4, timeout: Duration) -> Option<Kind2> {
         if probe_java(addr, timeout) {
             return Some(Kind2::Java);
@@ -383,10 +386,10 @@ impl Prober {
         if !self.web {
             return None;
         }
-        if probe_http(addr, timeout) {
-            return Some(Kind2::Http);
+        if probe_tls(addr, timeout) {
+            return Some(Kind2::Https);
         }
-        probe_tls(addr, timeout).then_some(Kind2::Https)
+        probe_http(addr, timeout).then_some(Kind2::Http)
     }
 
     fn save(&self) {

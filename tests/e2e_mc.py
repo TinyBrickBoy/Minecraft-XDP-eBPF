@@ -264,6 +264,11 @@ def http_conn(conn, first=b""):
 def https_conn(conn, ctx):
     try:
         first = conn.recv(1, socket.MSG_PEEK)
+        if first[:1].isalpha():
+            # like nginx: a plain http request on the TLS port gets an http 400
+            conn.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            conn.close()
+            return
         if first != b"\x16":
             conn.sendall(b"BAD")
             conn.close()
