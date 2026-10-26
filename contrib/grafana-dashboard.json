@@ -9,7 +9,7 @@
   ],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 5,
+  "version": 6,
   "editable": true,
   "refresh": "30s",
   "time": {
@@ -487,7 +487,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "topk(10, sum by (dst_ip, dst_port, proto) (rate(minecraft_target_dropped_packets[1m])))",
+          "expr": "topk(10, sum by (dst_ip, dst_port, proto) (rate(minecraft_target_dropped_packets[1m]) * on (dst_ip, dst_port, proto) group_left(kind) max by (dst_ip, dst_port, proto, kind) (minecraft_target_protected{kind=~\"java|bedrock\"})))",
           "legendFormat": "{{dst_ip}}:{{dst_port}}/{{proto}}",
           "datasource": {
             "type": "prometheus",
@@ -547,7 +547,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "topk(10, sum by (dst_ip, dst_port, proto) (rate(minecraft_target_syn_packets[1m])))",
+          "expr": "topk(10, sum by (dst_ip, dst_port, proto) (rate(minecraft_target_syn_packets[1m]) * on (dst_ip, dst_port, proto) group_left(kind) max by (dst_ip, dst_port, proto, kind) (minecraft_target_protected{kind=~\"java|bedrock\"})))",
           "legendFormat": "{{dst_ip}}:{{dst_port}}/{{proto}}",
           "datasource": {
             "type": "prometheus",
@@ -1156,6 +1156,209 @@
           }
         }
       ]
+    },
+    {
+      "type": "row",
+      "title": "Web (HTTP/HTTPS)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 47
+      },
+      "panels": [],
+      "id": 21
+    },
+    {
+      "type": "timeseries",
+      "title": "Web: verworfene Pakete",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ag2bkfabvaarke"
+      },
+      "description": "Ungültige Handshakes, Müll statt HTTP-Anfrage/TLS-ClientHello, Pakete ohne Verbindung. Im Monitor-Modus nur gezählt.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(10, sum by (dst_ip, dst_port, kind) (rate(minecraft_target_dropped_packets[1m]) * on (dst_ip, dst_port, proto) group_left(kind) max by (dst_ip, dst_port, proto, kind) (minecraft_target_protected{kind=~\"http|https\"})))",
+          "legendFormat": "{{dst_ip}}:{{dst_port}} ({{kind}})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "noValue": "Kein verworfener Web-Traffic",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 15,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ],
+          "sortBy": "Max",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 22
+    },
+    {
+      "type": "timeseries",
+      "title": "Web: neue Verbindungen",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ag2bkfabvaarke"
+      },
+      "description": "Geprüfte Verbindungen (gültige HTTP-Anfrage bzw. TLS-ClientHello) pro Minute",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 48
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(10, sum by (dst_ip, dst_port, kind) (rate(minecraft_target_verified_connections[5m]) * on (dst_ip, dst_port, proto) group_left(kind) max by (dst_ip, dst_port, proto, kind) (minecraft_target_protected{kind=~\"http|https\"}))) * 60",
+          "legendFormat": "{{dst_ip}}:{{dst_port}} ({{kind}})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cpm",
+          "noValue": "Keine Web-Verbindungen",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 15,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ],
+          "sortBy": "Max",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 23
+    },
+    {
+      "type": "table",
+      "title": "Erkannte Webserver",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ag2bkfabvaarke"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 56
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (dst_ip, dst_port, kind, source) (minecraft_target_protected{kind=~\"http|https\"})",
+          "format": "table",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ag2bkfabvaarke"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "Keine Webserver erkannt"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Port"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.align",
+                "value": "left"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true
+            },
+            "renameByName": {
+              "dst_ip": "IP",
+              "dst_port": "Port",
+              "kind": "Typ",
+              "source": "Quelle"
+            }
+          }
+        }
+      ],
+      "id": 24
     }
   ]
 }
