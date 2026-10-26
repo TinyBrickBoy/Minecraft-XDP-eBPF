@@ -165,6 +165,14 @@ auto_state_file = "auto-blocklist.json"
 # many seconds (0 keeps it until auto_duration_secs).
 auto_idle_secs = 300
 
+# DNS scanners: a source sending a DNS query to a protected address (the
+# [ratelimit] networks) where no DNS server answers is blocklisted
+# permanently. Whether an address runs a DNS server is probed once and
+# trusted for dns_recheck_secs, so it is re-probed only when queries keep
+# coming.
+dns_scan = true
+dns_recheck_secs = 300
+
 [ratelimit]
 # Automatic bans: a source sending more than `pps` packets per second to
 # `networks` is banned (all its traffic dropped) for `ban_secs`. Sources in
@@ -449,6 +457,8 @@ pub struct BlocklistConfig {
     pub auto_duration_secs: u64,
     pub auto_state_file: String,
     pub auto_idle_secs: u64,
+    pub dns_scan: bool,
+    pub dns_recheck_secs: u64,
 }
 
 impl Default for BlocklistConfig {
@@ -464,6 +474,8 @@ impl Default for BlocklistConfig {
             auto_duration_secs: 604_800,
             auto_state_file: "auto-blocklist.json".into(),
             auto_idle_secs: 300,
+            dns_scan: true,
+            dns_recheck_secs: 300,
         }
     }
 }
@@ -477,6 +489,7 @@ impl BlocklistConfig {
         check_range("[blocklist] auto_after_bans", self.auto_after_bans, 1, 100)?;
         check_range("[blocklist] auto_window_secs", self.auto_window_secs, 10, 30 * 86_400)?;
         check_range("[blocklist] auto_duration_secs", self.auto_duration_secs, 10, 365 * 86_400)?;
+        check_range("[blocklist] dns_recheck_secs", self.dns_recheck_secs, 5, 86_400)?;
         if self.auto_idle_secs != 0 {
             check_range("[blocklist] auto_idle_secs", self.auto_idle_secs, 10, 30 * 86_400)?;
         }

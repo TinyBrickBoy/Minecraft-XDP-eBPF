@@ -825,6 +825,12 @@ __s32 minecraft_filter(struct xdp_md *ctx)
         return XDP_DROP;
     }
 
+    // DNS queries to protected addresses without a DNS server (resolver scans)
+    if (dns_scan_check(ip, data_end))
+    {
+        return XDP_DROP;
+    }
+
     // addresses without a route would be dropped by the stack anyway; hitting
     // them is what scanners do, so it counts as a violation
     if (unused_destination(ctx, ip))

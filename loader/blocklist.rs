@@ -49,6 +49,28 @@ pub struct BlockStats {
 // SAFETY: repr(C) struct of plain integers without padding.
 unsafe impl Pod for BlockStats {}
 
+/// Userspace mirror of `struct dns_verdict`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DnsVerdict {
+    pub checked_ns: u64,
+    pub has_server: u64,
+}
+// SAFETY: repr(C) struct of plain integers without padding.
+unsafe impl Pod for DnsVerdict {}
+
+/// Userspace mirror of `struct dns_query`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DnsQuery {
+    pub dst: u32,
+    pub pad: u32,
+    pub last_ns: u64,
+    pub count: u64,
+}
+// SAFETY: repr(C) struct of plain integers without padding.
+unsafe impl Pod for DnsQuery {}
+
 /// Blocklist map values (`enum block_scope`).
 const BLOCK_ALL: u8 = 1;
 const BLOCK_PROTECTED: u8 = 2;
@@ -102,7 +124,8 @@ pub fn parse_list(text: &str, origin: &str) -> HashSet<(Ipv4Addr, u8)> {
 fn parse_scoped(text: &str, origin: &str) -> HashMap<(Ipv4Addr, u8), u8> {
     let mut out: HashMap<(Ipv4Addr, u8), u8> = HashMap::new();
     for (no, raw) in text.lines().enumerate() {
-        let scope = if auto_until(raw).is_some() { BLOCK_PROTECTED } else { BLOCK_ALL };
+        // anything this program wrote only concerns the protected networks
+        let scope = if raw.contains(AUTO_TAG) { BLOCK_PROTECTED } else { BLOCK_ALL };
         let line = raw.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
@@ -121,6 +144,30 @@ fn parse_scoped(text: &str, origin: &str) -> HashMap<(Ipv4Addr, u8), u8> {
 
 /// Marker of lines this program writes; only those are ever removed by it.
 const AUTO_MARK: &str = "# auto until=";
+/// Every automatically written line contains this.
+const AUTO_TAG: &str = "# auto";
+
+/// A permanent entry for a DNS scanner.
+fn dns_line(ip: Ipv4Addr, dst: Ipv4Addr) -> String {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M");
+    format!("{ip}   {AUTO_TAG} dns-scan: queried {dst}:53 without a DNS server ({now})")
+}
+
+/// True if `dst` answers a DNS query on udp/53 (any answer, also REFUSED).
+fn probe_dns(dst: Ipv4Addr, timeout: Duration) -> bool {
+    let result = (|| -> std::io::Result<bool> {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        socket.set_read_timeout(Some(timeout))?;
+        socket.connect((dst, 53))?;
+        // id 0x5a5a, recursion desired, one question: ". IN NS"
+        let query = [0x5a, 0x5a, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 0x00, 0x00, 0x02, 0x00, 0x01];
+        socket.send(&query)?;
+        let mut buf = [0u8; 512];
+        let len = socket.recv(&mut buf)?;
+        Ok(len >= 12 && buf[0] == 0x5a && buf[1] == 0x5a)
+    })();
+    result.unwrap_or(false)
+}
 
 /// The expiry (unix seconds) of an automatically written line.
 fn auto_until(line: &str) -> Option<u64> {
@@ -251,7 +298,9 @@ pub fn setup(ebpf: &mut Ebpf, config: &Config, shutdown: &Arc<Shutdown>) -> Resu
     for entry in &rl.allow {
         allow_nets.push(parse_cidr(entry)?);
     }
-    if rl.mode != ProtectionMode::Off {
+    // the protected networks: used by the rate limit, the scope of automatic
+    // entries and the DNS scan detection
+    if rl.mode != ProtectionMode::Off || (config.blocklist.enabled && !rl.networks.is_empty()) {
         if rl.networks.len() > 8 {
             anyhow::bail!("[ratelimit] supports at most 8 networks");
         }
@@ -262,6 +311,8 @@ pub fn setup(ebpf: &mut Ebpf, config: &Config, shutdown: &Arc<Shutdown>) -> Resu
             let (addr, len) = parse_cidr(network)?;
             networks.set(index as u32, UnusedNetwork::new(addr, len), 0)?;
         }
+    }
+    if rl.mode != ProtectionMode::Off {
         let mut allow: LpmTrie<MapData, u32, u8> = LpmTrie::try_from(
             ebpf.take_map("ratelimit_allow").context("can't take map 'ratelimit_allow'")?,
         )?;
@@ -281,6 +332,16 @@ pub fn setup(ebpf: &mut Ebpf, config: &Config, shutdown: &Arc<Shutdown>) -> Resu
         let size: Array<MapData, u64> =
             Array::try_from(ebpf.take_map("blocklist_size").context("can't take map 'blocklist_size'")?)?;
         Some((map, size))
+    } else {
+        None
+    };
+    let dns = if bl.enabled && bl.dns_scan && !rl.networks.is_empty() {
+        let verdicts: BpfHashMap<MapData, u32, DnsVerdict> =
+            BpfHashMap::try_from(ebpf.take_map("dns_verdicts").context("can't take map 'dns_verdicts'")?)?;
+        let queries: BpfHashMap<MapData, u32, DnsQuery> =
+            BpfHashMap::try_from(ebpf.take_map("dns_queries").context("can't take map 'dns_queries'")?)?;
+        info!("DNS scan detection: sources querying protected addresses without a DNS server are blocklisted permanently (verdict cached {} s)", bl.dns_recheck_secs);
+        Some(Dns { verdicts, queries, cache: HashMap::new(), recheck: bl.dns_recheck_secs })
     } else {
         None
     };
@@ -325,6 +386,8 @@ pub fn setup(ebpf: &mut Ebpf, config: &Config, shutdown: &Arc<Shutdown>) -> Resu
         static_entries: parse_scoped(&bl.entries.join("\n"), "[blocklist] entries"),
         file: PathBuf::from(&bl.file),
         auto,
+        dns,
+        allow: allow_nets.clone(),
         ban_secs: rl.ban_secs,
         entries: handles.entries.clone(),
         auto_entries: handles.auto_entries.clone(),
@@ -360,6 +423,8 @@ struct Worker {
     static_entries: HashMap<(Ipv4Addr, u8), u8>,
     file: PathBuf,
     auto: Option<Auto>,
+    dns: Option<Dns>,
+    allow: Vec<(Ipv4Addr, u8)>,
     ban_secs: u64,
     entries: Arc<AtomicUsize>,
     auto_entries: Arc<AtomicUsize>,
@@ -386,6 +451,20 @@ impl Worker {
             }
         }
         *self.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = active;
+
+        // DNS scanners: probe unknown destinations, blocklist their sources
+        if let Some(dns) = &mut self.dns {
+            for (src, dst) in dns.process(now) {
+                if self.allow.iter().any(|net| contains(*net, src))
+                    || self.current.keys().any(|net| contains(*net, src))
+                    || add.iter().any(|l| line_ip(l) == Some(src))
+                {
+                    continue;
+                }
+                warn!("DNS scan: {src} queried {dst}:53 where no DNS server runs, blocklisted permanently");
+                add.push(dns_line(src, dst));
+            }
+        }
 
         // per source counters of blocklisted addresses
         let mut sources = HashMap::new();
@@ -448,7 +527,7 @@ impl Worker {
                     let entry = wanted.entry(net).or_insert(scope);
                     *entry = (*entry).min(scope);
                 }
-                auto = text.lines().filter(|l| auto_until(l).is_some()).count();
+                auto = text.lines().filter(|l| l.contains(AUTO_TAG)).count();
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => warn!("Can't read blocklist {}: {e}", self.file.display()),
@@ -483,6 +562,55 @@ impl Worker {
         if let Err(e) = size.set(0, self.current.len() as u64, 0) {
             warn!("Can't update blocklist size: {e}");
         }
+    }
+}
+
+/// Probing state of the DNS scan detection.
+struct Dns {
+    verdicts: BpfHashMap<MapData, u32, DnsVerdict>,
+    queries: BpfHashMap<MapData, u32, DnsQuery>,
+    /// destination -> (has a DNS server, unix time of the probe)
+    cache: HashMap<Ipv4Addr, (bool, u64)>,
+    recheck: u64,
+}
+
+impl Dns {
+    /// Consumes the noted queries; returns (source, destination) for every
+    /// query to a destination without a DNS server. A destination is probed
+    /// at most once per `recheck` seconds, and only while queries come in.
+    fn process(&mut self, now: u64) -> Vec<(Ipv4Addr, Ipv4Addr)> {
+        let noted: Vec<(u32, DnsQuery)> = self.queries.iter().filter_map(|e| e.ok()).collect();
+        let mut found = Vec::new();
+        let mut probes = 0;
+        for (src_raw, q) in noted {
+            let _ = self.queries.remove(&src_raw);
+            let (src, dst) = (Ipv4Addr::from(src_raw.to_ne_bytes()), Ipv4Addr::from(q.dst.to_ne_bytes()));
+            let has_server = match self.cache.get(&dst) {
+                Some(&(has, at)) if now < at + self.recheck => has,
+                _ => {
+                    if probes >= 32 {
+                        continue; // the rest waits for the next round
+                    }
+                    probes += 1;
+                    let has = probe_dns(dst, Duration::from_millis(1500));
+                    self.cache.insert(dst, (has, now));
+                    let verdict = DnsVerdict { checked_ns: crate::targets::monotonic_ns(), has_server: has as u64 };
+                    if let Err(e) = self.verdicts.insert(q.dst, verdict, 0) {
+                        warn!("Can't store DNS verdict for {dst}: {e}");
+                    }
+                    if has {
+                        info!("DNS scan: {dst} runs a DNS server, queries to it are fine");
+                    }
+                    has
+                }
+            };
+            if !has_server {
+                found.push((src, dst));
+            }
+        }
+        let recheck = self.recheck;
+        self.cache.retain(|_, (_, at)| now < *at + recheck);
+        found
     }
 }
 

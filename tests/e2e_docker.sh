@@ -27,7 +27,7 @@ ip addr add 10.99.0.1/24 dev c0; ip link set c0 up
 ip addr add 10.99.1.1/24 dev s0; ip link set s0 up
 ip link add dummy0 type dummy; ip addr add 10.99.2.1/32 dev dummy0; ip link set dummy0 up
 for ns in cl sv; do ip -n $ns link set lo up; done
-ip -n cl addr add 10.99.0.2/24 dev c1; ip -n cl addr add 10.99.0.3/24 dev c1; ip -n cl addr add 10.99.0.4/24 dev c1; ip -n cl addr add 10.99.0.5/24 dev c1; ip -n cl link set c1 up; ip -n cl route add default via 10.99.0.1
+ip -n cl addr add 10.99.0.2/24 dev c1; ip -n cl addr add 10.99.0.3/24 dev c1; ip -n cl addr add 10.99.0.4/24 dev c1; ip -n cl addr add 10.99.0.5/24 dev c1; ip -n cl addr add 10.99.0.6/24 dev c1; ip -n cl addr add 10.99.0.7/24 dev c1; ip -n cl link set c1 up; ip -n cl route add default via 10.99.0.1
 ip -n sv addr add 10.99.1.2/24 dev s1; ip -n sv link set s1 up; ip -n sv route add default via 10.99.1.1
 sysctl -qw net.ipv4.ip_forward=1
 # customer prefix like on the router: unreachable /24, one address routed
@@ -35,6 +35,7 @@ ip route add unreachable 10.99.3.0/24
 ip -n sv addr add 10.99.3.7/32 dev lo
 ip route add 10.99.3.7/32 via 10.99.1.2
 ip netns exec sv $MC udp-echo-server 10.99.3.7 40001 &
+ip netns exec sv $MC udp-echo-server 10.99.3.7 53 &   # "DNS server" (echoes the query id)
 # veth + generic XDP: keep segments MTU sized like a real NIC would
 for dev in c0 s0; do ethtool -K $dev gro off gso off tso off >/dev/null 2>&1; done
 ip netns exec cl ethtool -K c1 gso off tso off >/dev/null 2>&1
@@ -89,6 +90,7 @@ auto_window_secs = 600
 auto_duration_secs = 120
 auto_idle_secs = 12
 auto_state_file = "$T/auto-blocklist.json"
+dns_recheck_secs = 30
 [ratelimit]
 mode = "enforce"
 networks = ["10.99.1.0/24", "10.99.3.0/24"]
@@ -233,6 +235,19 @@ sleep 2
 check "scanner banned (violations)"   cl $S5 $MC udp-no-echo 10.99.1.2 40000 5012
 check "logged as violations"          grep -q 'banned 10.99.0.5 .*violations' $T/loader.log
 check "banned source still reaches the router itself" cl $S5 $MC udp-echo 10.99.0.1 40100 5013
+
+echo "== DNS scanners"
+D6="env E2E_BIND=10.99.0.6"; D7="env E2E_BIND=10.99.0.7"
+check "dns scanner works before"      cl $D6 $MC udp-echo 10.99.1.2 40000 5020
+cl $D6 $MC udp-echo 10.99.1.2 53 5021 >/dev/null 2>&1   # query where no DNS server runs
+cl $D7 $MC udp-echo 10.99.3.7 53 5022 >/dev/null 2>&1   # query to a real DNS server
+sleep 5
+check "dns scanner blocklisted"       grep -q '^10.99.0.6 .*dns-scan' $T/blocklist.txt
+check "dns scanner dropped"           cl $D6 $MC udp-no-echo 10.99.1.2 40000 5023
+check "dns scanner reaches the router" cl $D6 $MC udp-echo 10.99.0.1 40100 5024
+check "legit dns client not blocked"  bash -c "! grep -q '^10.99.0.7 ' $T/blocklist.txt"
+check "dns server answers its client" cl $D7 $MC udp-echo 10.99.3.7 53 5025
+check "dns entry is permanent (not idle-removed)" bash -c "sleep 14; grep -q '^10.99.0.6 .*dns-scan' $T/blocklist.txt"
 
 echo "== automatic blocklist"
 check "1st ban not yet blocklisted"   bash -c "! grep -q 'auto until=' $T/blocklist.txt"

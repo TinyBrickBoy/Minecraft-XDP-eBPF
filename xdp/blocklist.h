@@ -356,4 +356,81 @@ static __always_inline void add_strike(const __u32 src)
     issue_ban(src, now, strikes, BAN_STRIKES);
 }
 
+/*
+ * DNS scanners: a query to a protected address that runs no DNS server is a
+ * scan for open resolvers. Queries to destinations without a fresh verdict
+ * are noted for the loader, which probes the destination once (the verdict
+ * is trusted for DNS_RECHECK_NS, so it is re-probed only when queries keep
+ * coming) and blocklists the sources if nothing answers. Queries to
+ * destinations known to have no DNS server are dropped right away.
+ */
+struct dns_verdict
+{
+    __u64 checked_ns;
+    __u64 has_server;
+};
+
+struct
+{
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u32); // destination address
+    __type(value, struct dns_verdict);
+} dns_verdicts SEC(".maps");
+
+// must match `DnsQuery` in loader/blocklist.rs
+struct dns_query
+{
+    __u32 dst;
+    __u32 pad;
+    __u64 last_ns;
+    __u64 count;
+};
+
+struct
+{
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 8192);
+    __type(key, __u32); // source address
+    __type(value, struct dns_query);
+} dns_queries SEC(".maps");
+
+// returns 1 when the packet is a DNS query to a protected address that is
+// known to run no DNS server (drop it)
+static __always_inline __u8 dns_scan_check(const struct iphdr *ip, const void *data_end)
+{
+    if (!DNS_SCAN || ip->protocol != IPPROTO_UDP || (ip->frag_off & bpf_htons(IP_OFFSET)))
+    {
+        return 0;
+    }
+    const struct udphdr *udp = (const void *)ip + (ip->ihl * 4);
+    if ((const void *)(udp + 1) > data_end || udp->dest != bpf_htons(53) || !in_ratelimit_networks(ip->daddr))
+    {
+        return 0;
+    }
+    const __u32 dst = ip->daddr;
+    const __u64 now = bpf_ktime_get_ns();
+    const struct dns_verdict *verdict = bpf_map_lookup_elem(&dns_verdicts, &dst);
+    const __u8 fresh = verdict && now - verdict->checked_ns < DNS_RECHECK_NS;
+    if (fresh && verdict->has_server)
+    {
+        return 0;
+    }
+    // unknown or no server: note the source for the loader
+    const __u32 src = ip->saddr;
+    struct dns_query *q = bpf_map_lookup_elem(&dns_queries, &src);
+    if (q)
+    {
+        q->dst = dst;
+        q->last_ns = now;
+        __sync_fetch_and_add(&q->count, 1);
+    }
+    else
+    {
+        const struct dns_query fresh_q = {.dst = dst, .pad = 0, .last_ns = now, .count = 1};
+        bpf_map_update_elem(&dns_queries, &src, &fresh_q, BPF_ANY);
+    }
+    return fresh; // known to have no server: drop
+}
+
 #endif
