@@ -59,8 +59,6 @@ adopt_grace_secs = 120
 # Destinations protected regardless of auto detection, as "ip:port".
 java = []
 bedrock = []
-http = []
-https = []
 
 # Destinations that are never protected, as "ip:port/tcp" or "ip:port/udp".
 # Overrides the static range and auto detection.
@@ -98,28 +96,6 @@ retry_negative_secs = 21600
 
 # File that keeps the detected servers across restarts.
 state_file = "targets.json"
-
-[web]
-# HTTP/HTTPS protection: a clean TCP handshake, then the first segment of a
-# connection has to be an http request line (HTTP) or a TLS ClientHello
-# (HTTPS); everything else is dropped. Encrypted request floods can not be
-# told apart from visitors at this layer, that needs a reverse proxy.
-# "off", "monitor" (only count what would be dropped) or "enforce".
-mode = "off"
-
-# Let auto detection probe for web servers (http request, TLS handshake) on
-# every candidate port, plus these ports below min_port.
-detect = true
-ports = [80, 443]
-
-# Verified web connections are forgotten after this many idle seconds
-# (keep-alive, HTTP/2 and websockets idle much longer than game clients).
-# Must be between 60 and 86400.
-idle_timeout_secs = 900
-
-# Max new connections per source ip per throttle window on web targets, 0
-# disables it. Browsers, NATs and CDNs open many connections from one ip.
-hit_count = 0
 
 [reflection]
 # UDP reflection/amplification protection for whole networks: answers from
@@ -268,7 +244,6 @@ pub struct Config {
     pub filter: FilterConfig,
     pub targets: TargetsConfig,
     pub autodetect: AutodetectConfig,
-    pub web: WebConfig,
     pub penalty: PenaltyConfig,
     pub reflection: ReflectionConfig,
     pub blocklist: BlocklistConfig,
@@ -332,10 +307,6 @@ pub struct TargetsConfig {
     pub java: Vec<String>,
     /// "ip:port" destinations always protected as bedrock.
     pub bedrock: Vec<String>,
-    /// "ip:port" destinations always protected as http.
-    pub http: Vec<String>,
-    /// "ip:port" destinations always protected as https.
-    pub https: Vec<String>,
     /// "ip:port/tcp|udp" destinations that are never protected.
     pub exclude: Vec<String>,
 }
@@ -375,40 +346,6 @@ impl Default for AutodetectConfig {
             retry_negative_secs: 21600,
             state_file: "targets.json".into(),
         }
-    }
-}
-
-/// `[web]` — HTTP/HTTPS targets.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct WebConfig {
-    pub mode: ProtectionMode,
-    pub detect: bool,
-    pub ports: Vec<u16>,
-    pub idle_timeout_secs: u64,
-    pub hit_count: u32,
-}
-
-impl Default for WebConfig {
-    fn default() -> Self {
-        Self {
-            mode: ProtectionMode::Off,
-            detect: true,
-            ports: vec![80, 443],
-            idle_timeout_secs: 900,
-            hit_count: 0,
-        }
-    }
-}
-
-impl WebConfig {
-    /// Whether auto detection probes for web servers.
-    pub fn detects(&self) -> bool {
-        self.mode != ProtectionMode::Off && self.detect
-    }
-
-    fn validate(&self) -> Result<()> {
-        check_range("[web] idle_timeout_secs", self.idle_timeout_secs, 60, 86_400)
     }
 }
 
@@ -757,7 +694,6 @@ impl Config {
         self.filter.validate()?;
         self.targets.validate()?;
         self.autodetect.validate()?;
-        self.web.validate()?;
         self.penalty.validate()?;
         self.reflection.validate()?;
         self.blocklist.validate()?;
@@ -808,7 +744,7 @@ impl FilterConfig {
 
 impl TargetsConfig {
     fn validate(&self) -> Result<()> {
-        for entry in self.java.iter().chain(&self.bedrock).chain(&self.http).chain(&self.https) {
+        for entry in self.java.iter().chain(&self.bedrock) {
             parse_socket_addr(entry).with_context(|| format!("[targets] invalid entry '{entry}'"))?;
         }
         for entry in &self.exclude {

@@ -33,7 +33,6 @@ enum connection_state
     PING_COMPLETE = 7,
     DIRECT_READ_STATUS_REQUEST = 8,
     DIRECT_READ_LOGIN = 9,
-    AWAIT_WEB_DATA = 10, // web target: handshake done, the first request is pending
 };
 
 /*

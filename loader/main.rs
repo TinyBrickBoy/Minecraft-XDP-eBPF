@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use aya::maps::HashMap;
-use log::{error, info, warn};
+use log::{error, info};
 
 use config::Config;
 use shutdown::Shutdown;
@@ -266,14 +266,7 @@ fn apply_config_targets(config: &Config, targets: &Targets) -> Result<()> {
     for (entries, kind) in [
         (&config.targets.java, Kind::Java),
         (&config.targets.bedrock, Kind::Bedrock),
-        (&config.targets.http, Kind::Http),
-        (&config.targets.https, Kind::Https),
     ] {
-        let web = matches!(kind, Kind::Http | Kind::Https);
-        if web && !entries.is_empty() && config.web.mode == config::ProtectionMode::Off {
-            warn!("[targets] {} entries ignored: web protection is off", kind.name());
-            continue;
-        }
         for entry in entries {
             let addr = config::parse_socket_addr(entry)?;
             targets.set(DstKey::new(addr, kind.proto()), kind, Source::Static)?;

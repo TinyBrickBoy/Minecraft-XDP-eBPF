@@ -79,9 +79,6 @@ state_file = "$T/targets.json"
 mode = "enforce"
 networks = ["10.99.1.0/24", "10.99.2.0/24"]
 reply_window_secs = 5
-[web]
-mode = "enforce"
-idle_timeout_secs = 60
 [blocklist]
 file = "$T/blocklist.txt"
 reload_secs = 1
@@ -131,19 +128,17 @@ for i in $(seq 1 60); do
     cl $MC https-get 10.99.1.2 8443 >/dev/null; cl $MC status 10.99.1.2 25565 >/dev/null
     cl $MC bedrock-ping 10.99.1.2 19132 >/dev/null; cl $MC status 10.99.1.2 25575 >/dev/null
     n=0
-    for t in 10.99.1.2:25565/tcp 10.99.1.2:19132/udp 10.99.2.1:25570/tcp 10.99.1.2:8081/tcp 10.99.1.2:80/tcp 10.99.1.2:8443/tcp 10.99.1.2:25575/tcp; do
+    for t in 10.99.1.2:25565/tcp 10.99.1.2:19132/udp 10.99.2.1:25570/tcp 10.99.1.2:25575/tcp; do
         grep -q "Target $t: " $T/loader.log && n=$((n+1))
     done
-    [ $n -ge 7 ] && break; sleep 1
+    [ $n -ge 4 ] && break; sleep 1
 done
 curl -s 127.0.0.1:1999/metrics | grep '^minecraft_target_protected{' | sed 's/^/        /'
 check "remote java detected"   grep -q 'Target 10.99.1.2:25565/tcp: java (auto)' $T/loader.log
 check "remote bedrock detected" grep -q 'Target 10.99.1.2:19132/udp: bedrock (auto)' $T/loader.log
 check "local java detected"    grep -q 'Target 10.99.2.1:25570/tcp: java (auto)' $T/loader.log
 check "echo service not protected" bash -c "! grep -q '10.99.1.2:8000' $T/loader.log"
-check "http on 8081 detected"   grep -q 'Target 10.99.1.2:8081/tcp: http (auto)' $T/loader.log
-check "http on port 80 detected" grep -q 'Target 10.99.1.2:80/tcp: http (auto)' $T/loader.log
-check "https on 8443 detected"  grep -q 'Target 10.99.1.2:8443/tcp: https (auto)' $T/loader.log
+check "web servers not protected" bash -c "! grep -qE 'Target 10.99.1.2:(8081|80|8443)/tcp' $T/loader.log"
 
 echo "== waiting for the grace window to end"
 sleep 17
@@ -171,14 +166,12 @@ check "floodgate-style uuid (v0) still works"      cl $MC login-uuid 10.99.1.2 2
 check "offline uuid fine on offline server"        cl $MC login-uuid 10.99.1.2 25565 3
 check "rejections counted"                         bash -c "curl -s 127.0.0.1:1999/metrics | awk '\$1==\"minecraft_offline_rejected\"{exit !(\$2>=1)}'"
 
-echo "== web"
+echo "== web (not filtered)"
 check "http request works"        cl $MC http-get 10.99.1.2 8081
 check "http on port 80 works"     cl $MC http-get 10.99.1.2 80
 check "https request works"       cl $MC https-get 10.99.1.2 8443
-check "http junk dropped"         cl $MC tcp-junk 10.99.1.2 8081
-check "https junk dropped"        cl $MC tcp-junk 10.99.1.2 8443
+check "http junk reaches the server" bash -c "! ip netns exec cl $MC tcp-junk 10.99.1.2 8081"
 check "new http keep-alive works" cl $MC http-keepalive 10.99.1.2 8081 3
-check "plain http on https port passes" cl $MC http-answered 10.99.1.2 8443
 
 echo "== udp reflection protection"
 check "recorder attached"              grep -q 'reflection protection: enforcing' $T/loader.log
@@ -288,7 +281,7 @@ kill $LOADER; wait $LOADER 2>/dev/null
 check "filter detached on stop" bash -c "! ip link show c0 | grep -q xdp"
 start_loader
 sleep 3
-check "targets restored from state" grep -q 'Restored 7 detected server' $T/loader.log
+check "targets restored from state" grep -q 'Restored 4 detected server' $T/loader.log
 check "java player survived restart"    wait $PLAYER
 check "bedrock session survived restart" wait $BEDROCK
 sleep 13

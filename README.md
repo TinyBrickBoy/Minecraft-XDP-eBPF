@@ -43,12 +43,6 @@ This fork of [Outfluencer/Minecraft-XDP-eBPF](https://github.com/Outfluencer/Min
   blackhole, prohibit; decided per packet with `bpf_fib_lookup`) is dropped
   at the driver instead of walking the stack and triggering ICMP errors.
   Routing an address makes it reachable at once (`xdp_unused_*` metrics).
-- **HTTP/HTTPS** (`[web]`): web servers are detected on any port (plus 80
-  and 443) with a real http request / TLS handshake; on protected web
-  targets only clean TCP handshakes pass and the first segment has to be an
-  http request line or a TLS ClientHello. Verified connections get their own
-  idle timeout (keep-alive, HTTP/2, websockets) and an optional per ip SYN
-  limit. `mode = "monitor"` only counts.
 - **Blocklist and rate limit** (`[blocklist]`, `[ratelimit]`): sources in a
   live reloaded file (addresses and prefixes) are dropped before anything
   else; a source sending more than `pps` packets per second to the protected

@@ -121,15 +121,6 @@ struct
     __type(value, struct throttle_entry); // window timer + hit counter
 } connection_throttle SEC(".maps");
 
-// same, for web targets (own limit: browsers open many connections at once)
-struct
-{
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 65535);           // placeholder, set by the loader ([xdp] max_throttled_ips)
-    __type(key, __u32);                   // ipv4 source address
-    __type(value, struct throttle_entry); // window timer + hit counter
-} web_throttle SEC(".maps");
-
 // while connection_throttle is full, only retry inserting after this long
 // (per core): a failed insert on a full preallocated map scans every cpu's
 // freelist under spinlocks, so during that time we drop without even trying
@@ -195,8 +186,6 @@ enum target_kind
     KIND_NONE = 0,    // explicitly unprotected (overrides the static range)
     KIND_JAVA = 1,    // TCP, minecraft java state machine
     KIND_BEDROCK = 2, // UDP, RakNet offline handshake checks
-    KIND_HTTP = 3,    // TCP, first segment must be an http request line
-    KIND_HTTPS = 4,   // TCP, first segment must be a TLS ClientHello
 };
 
 // must match `TargetEntry` in loader/targets.rs
@@ -600,201 +589,6 @@ drop:
 }
 
 /* ------------------------------------------------------------------------
- * Web (HTTP and HTTPS over TCP)
- * --------------------------------------------------------------------- */
-
-// longest request method token checked (WebDAV's PROPPATCH has 9 letters)
-#define HTTP_METHOD_MAX 10
-
-/*
- * The first segment of a plain http connection starts with a request line:
- * a method of 3 to HTTP_METHOD_MAX uppercase letters followed by a space.
- * This covers every method including WebDAV, HTTP/2 prior knowledge ("PRI *")
- * and the PROXY protocol v1 header ("PROXY TCP4 ...").
- */
-static __always_inline __u8 http_request_start(const __u8 *p, const __u8 *end, const void *data_end)
-{
-    const __u8 *cursor = p;
-    for (__u32 i = 0; i <= HTTP_METHOD_MAX; i++)
-    {
-        CHECK_BOUNDS_OR_RETURN(cursor, 1, end, data_end);
-        const __u8 c = *cursor;
-        if (c == ' ')
-        {
-            return i >= 3;
-        }
-        if (c < 'A' || c > 'Z')
-        {
-            return 0;
-        }
-        cursor++;
-    }
-    return 0;
-}
-
-/*
- * The first segment of a TLS connection starts with a handshake record
- * (0x16), version 3.x, carrying a ClientHello (handshake type 1 at byte 5).
- * Only the header is checked: modern ClientHellos (post-quantum key shares)
- * are larger than one segment.
- */
-static __always_inline __u8 tls_client_hello_start(const __u8 *p, const __u8 *end, const void *data_end)
-{
-    CHECK_BOUNDS_OR_RETURN(p, 6, end, data_end);
-    return p[0] == 0x16 && p[1] == 0x03 && p[2] <= 0x04 && p[5] == 0x01;
-}
-
-/*
- * TCP packets for protected web targets: a clean handshake, then the first
- * data segment has to be an http request or a TLS ClientHello. Both are
- * accepted on http and https targets alike: proxies like traefik serve both
- * on one port, and a wrong http/https classification must never break a
- * site. Afterwards the flow is verified and passes uninspected until
- * it is idle for WEB_IDLE_NS. Unlike the java path the empty ACK finishing
- * the handshake passes, so preconnected browser sockets that send their
- * request later keep working. Without WEB_ENFORCE everything is only counted.
- */
-static __always_inline __s32 handle_web(const void *data, const void *data_end, const struct iphdr *ip,
-                                        const struct tcphdr *tcp, const __u8 kind, const __u8 grace)
-{
-    if (tcp->doff < 5)
-    {
-        return XDP_DROP;
-    }
-    const __u32 tcp_hdr_len = tcp->doff * 4;
-    if ((const void *)tcp + tcp_hdr_len > data_end)
-    {
-        return XDP_DROP;
-    }
-
-    struct statistics *stats_ptr = NULL;
-    struct statistics *dst_stats_ptr = NULL;
-    if (!lookup_stats(ip->daddr, tcp->dest, IPPROTO_TCP, &stats_ptr, &dst_stats_ptr))
-    {
-        return XDP_DROP;
-    }
-
-    const __u64 raw_packet_len = (__u64)(data_end - data);
-    count_stats(stats_ptr, dst_stats_ptr, INCOMING_BYTES, raw_packet_len);
-
-    const struct ipv4_flow_key flow_key = gen_ipv4_flow_key(ip->saddr, ip->daddr, tcp->source, tcp->dest);
-
-    // see the java path: legitimate tcp never fragments
-    if (ip->frag_off & bpf_htons(IP_MF))
-    {
-        goto drop;
-    }
-
-    if (detect_tcp_bypass(tcp))
-    {
-        count_stats(stats_ptr, dst_stats_ptr, TCP_BYPASS, 1);
-        add_strike(ip->saddr);
-        goto drop;
-    }
-
-    if (tcp->syn)
-    {
-        count_stats(stats_ptr, dst_stats_ptr, SYN_RECEIVE, 1);
-        if (bpf_ntohs(ip->tot_len) > (ip->ihl * 4) + tcp_hdr_len)
-        {
-            count_stats(stats_ptr, dst_stats_ptr, TCP_BYPASS, 1);
-            add_strike(ip->saddr);
-            goto drop;
-        }
-        if (!throttle_allows_in(&web_throttle, ip->saddr, WEB_HIT_COUNT))
-        {
-            goto drop;
-        }
-        const struct initial_state new_state = gen_initial_state(AWAIT_ACK, 0, bpf_ntohl(tcp->seq) + 1);
-        if (bpf_map_update_elem(&conntrack_map, &flow_key, &new_state, BPF_ANY) < 0)
-        {
-            goto drop;
-        }
-        return XDP_PASS;
-    }
-
-    struct player_entry *verified = bpf_map_lookup_elem(&player_connection_map, &flow_key);
-    if (verified)
-    {
-        verified->packets++;
-        return XDP_PASS;
-    }
-
-    struct initial_state *initial_state = bpf_map_lookup_elem(&conntrack_map, &flow_key);
-    if (!initial_state)
-    {
-        if (grace)
-        {
-            if (tcp->ack)
-            {
-                const __s32 v = switch_to_verified_idle(raw_packet_len, stats_ptr, dst_stats_ptr, &flow_key, ADOPTED, WEB_IDLE_NS);
-                return WEB_ENFORCE ? v : XDP_PASS;
-            }
-            return XDP_PASS;
-        }
-        goto drop;
-    }
-
-    const __u8 *payload = (const __u8 *)tcp + tcp_hdr_len;
-    const __u16 payload_len = bpf_ntohs(ip->tot_len) - (ip->ihl * 4) - tcp_hdr_len;
-    const __u8 *payload_end = payload + payload_len;
-    if (payload_end > (const __u8 *)data_end)
-    {
-        goto drop;
-    }
-
-    if (initial_state->state == AWAIT_ACK)
-    {
-        if (!tcp->ack || initial_state->expected_sequence != bpf_ntohl(tcp->seq))
-        {
-            goto drop;
-        }
-        initial_state->state = AWAIT_WEB_DATA;
-    }
-
-    // pure ACKs, FIN and RST while the first request is pending
-    if (payload >= payload_end)
-    {
-        return XDP_PASS;
-    }
-
-    if (!tcp->ack)
-    {
-        goto drop_connection;
-    }
-    if (initial_state->expected_sequence != bpf_ntohl(tcp->seq))
-    {
-        // retransmission or reordering before the first request
-        if (++initial_state->fails > MAX_OUT_OF_ORDER)
-        {
-            goto drop_connection;
-        }
-        goto drop;
-    }
-
-    // the expected protocol of the target first, the other one as fallback
-    const __u8 valid = kind == KIND_HTTP
-                           ? (http_request_start(payload, payload_end, data_end) || tls_client_hello_start(payload, payload_end, data_end))
-                           : (tls_client_hello_start(payload, payload_end, data_end) || http_request_start(payload, payload_end, data_end));
-    if (!valid)
-    {
-        goto drop_connection;
-    }
-    count_stats(stats_ptr, dst_stats_ptr, STATE_SWITCH, 1);
-    const __s32 v = switch_to_verified_idle(raw_packet_len, stats_ptr, dst_stats_ptr, &flow_key, VERIFIED, WEB_IDLE_NS);
-    return WEB_ENFORCE ? v : XDP_PASS;
-
-drop_connection:
-    count_stats(stats_ptr, dst_stats_ptr, DROP_CONNECTION, 1);
-    add_strike(ip->saddr);
-    bpf_map_delete_elem(&conntrack_map, &flow_key);
-drop:
-    count_stats(stats_ptr, dst_stats_ptr, DROPPED_PACKET, 1);
-    count_stats(stats_ptr, dst_stats_ptr, DROPPED_BYTES, raw_packet_len);
-    return WEB_ENFORCE ? XDP_DROP : XDP_PASS;
-}
-
-/* ------------------------------------------------------------------------
  * XDP entry point
  * --------------------------------------------------------------------- */
 
@@ -871,13 +665,9 @@ __s32 minecraft_filter(struct xdp_md *ctx)
         return XDP_DROP;
     }
 
-    // everything that is not a protected java or web target is not our business
+    // everything that is not a protected java target is not our business
     __u8 grace = 0;
     const __u8 kind = lookup_target(ip->daddr, tcp->dest, IPPROTO_TCP, &grace);
-    if (kind == KIND_HTTP || kind == KIND_HTTPS)
-    {
-        return handle_web(data, data_end, ip, tcp, kind, grace);
-    }
     if (kind != KIND_JAVA)
     {
         return XDP_PASS;

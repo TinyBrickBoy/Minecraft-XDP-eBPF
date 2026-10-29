@@ -50,9 +50,6 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
     let dns_scan: u8 = (config.blocklist.enabled && config.blocklist.dns_scan && !config.ratelimit.networks.is_empty()) as u8;
     let dns_recheck_ns: u64 = config.blocklist.dns_recheck_secs * 1_000_000_000;
     let strike_window_ns: u64 = config.ratelimit.strike_window_secs * 1_000_000_000;
-    let web_enforce: u8 = (config.web.mode == crate::config::ProtectionMode::Enforce) as u8;
-    let web_hit_count: u32 = config.web.hit_count;
-    let web_idle_ns: u64 = config.web.idle_timeout_secs * 1_000_000_000;
     let static_grace_until_ns: u64 =
         crate::targets::monotonic_ns() + filter.adopt_grace_secs * 1_000_000_000;
 
@@ -73,9 +70,6 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
         .override_global("PENALTY_NS", &penalty_ns, true)
         .override_global("PENALTY_VERIFIED_NS", &penalty_verified_ns, true)
         .override_global("DNS_RECHECK_NS", &dns_recheck_ns, true)
-        .override_global("WEB_ENFORCE", &web_enforce, true)
-        .override_global("WEB_HIT_COUNT", &web_hit_count, true)
-        .override_global("WEB_IDLE_NS", &web_idle_ns, true)
         .override_global("HIT_COUNT", &hit_count, true)
         .override_global("HIT_COUNT_RESET_NS", &hit_count_reset_ns, true)
         .override_global("PLAYER_IDLE_NS", &player_idle_ns, true)
@@ -86,7 +80,6 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
         .map_max_entries("conntrack_map", config.xdp.max_pending_connections)
         .map_max_entries("player_connection_map", config.xdp.max_player_connections)
         .map_max_entries("connection_throttle", config.xdp.max_throttled_ips)
-        .map_max_entries("web_throttle", config.xdp.max_throttled_ips)
         .load(object)
         .context("failed to load BPF program")?;
 
