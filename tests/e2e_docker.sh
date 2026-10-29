@@ -27,7 +27,7 @@ ip addr add 10.99.0.1/24 dev c0; ip link set c0 up
 ip addr add 10.99.1.1/24 dev s0; ip link set s0 up
 ip link add dummy0 type dummy; ip addr add 10.99.2.1/32 dev dummy0; ip link set dummy0 up
 for ns in cl sv; do ip -n $ns link set lo up; done
-ip -n cl addr add 10.99.0.2/24 dev c1; ip -n cl addr add 10.99.0.3/24 dev c1; ip -n cl addr add 10.99.0.4/24 dev c1; ip -n cl addr add 10.99.0.5/24 dev c1; ip -n cl addr add 10.99.0.6/24 dev c1; ip -n cl addr add 10.99.0.7/24 dev c1; ip -n cl addr add 10.99.0.8/24 dev c1; ip -n cl link set c1 up; ip -n cl route add default via 10.99.0.1
+ip -n cl addr add 10.99.0.2/24 dev c1; ip -n cl addr add 10.99.0.3/24 dev c1; ip -n cl addr add 10.99.0.4/24 dev c1; ip -n cl addr add 10.99.0.5/24 dev c1; ip -n cl addr add 10.99.0.6/24 dev c1; ip -n cl addr add 10.99.0.7/24 dev c1; ip -n cl addr add 10.99.0.8/24 dev c1; ip -n cl addr add 10.99.0.9/24 dev c1; ip -n cl link set c1 up; ip -n cl route add default via 10.99.0.1
 ip -n sv addr add 10.99.1.2/24 dev s1; ip -n sv link set s1 up; ip -n sv route add default via 10.99.1.1
 sysctl -qw net.ipv4.ip_forward=1
 # customer prefix like on the router: unreachable /24, one address routed
@@ -213,6 +213,11 @@ check "flooding source banned"        cl $B $MC udp-no-echo 10.99.1.2 40000 5004
 check "other source not affected"     cl $MC udp-echo 10.99.1.2 40000 5005
 cl env E2E_BIND=10.99.0.4 $MC udp-flood 10.99.1.2 40000 4000
 check "allowlisted source not banned" cl env E2E_BIND=10.99.0.4 $MC udp-echo 10.99.1.2 40000 5006
+# a download the server started itself (QUIC to port 443): the answer is fast
+ip netns exec sv $MC dns-answer 10.99.0.9 443 0
+cl env E2E_BIND=10.99.0.9 $MC udp-flood 10.99.1.2 40000 4000
+check "outbound recorder attached"  bash -c "! grep -q 'outbound recorder failed' $T/loader.log"
+check "answers to the server's own traffic not banned" cl env E2E_BIND=10.99.0.9 $MC udp-echo 10.99.1.2 40000 5007
 sleep 3
 bans=$(metric xdp_ratelimit_bans)
 check "ban counted and logged ($bans)" bash -c "test '${bans:-0}' -ge 1 && grep -q 'Rate limit: banned 10.99.0.3' $T/loader.log"

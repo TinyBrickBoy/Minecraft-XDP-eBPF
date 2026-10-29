@@ -14,6 +14,7 @@ use aya::Ebpf;
 use aya::Pod;
 use aya::maps::lpm_trie::{Key, LpmTrie};
 use aya::maps::{Array, HashMap as BpfHashMap, MapData, PerCpuArray};
+use aya::programs::{SchedClassifier, TcAttachType};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
@@ -294,8 +295,28 @@ impl Auto {
 /// Fills the rate limit networks and allowlist, starts the thread that keeps
 /// the blocklist map in sync with the config and the blocklist file, follows
 /// the automatic bans and escalates repeated ones onto the blocklist.
-pub fn setup(ebpf: &mut Ebpf, config: &Config, shutdown: &Arc<Shutdown>) -> Result<(Option<Handles>, Option<JoinHandle<()>>)> {
+pub fn setup(
+    ebpf: &mut Ebpf,
+    interface: &str,
+    config: &Config,
+    shutdown: &Arc<Shutdown>,
+) -> Result<(Option<Handles>, Option<JoinHandle<()>>)> {
     let rl = &config.ratelimit;
+    // answers to connections our servers opened themselves (downloads) are
+    // exempt; without the recorder they are rate limited like any other
+    // traffic. Loaded first: it uses maps that are taken out below.
+    if rl.mode != ProtectionMode::Off {
+        let recorder: Result<()> = (|| {
+            let program: &mut SchedClassifier =
+                ebpf.program_mut("outbound_record").context("program 'outbound_record' not found")?.try_into()?;
+            program.load()?;
+            program.attach(interface, TcAttachType::Egress)?;
+            Ok(())
+        })();
+        if let Err(e) = recorder {
+            warn!("Rate limit: outbound recorder failed, downloads of protected servers can be banned: {e:#}");
+        }
+    }
     let mut allow_nets = Vec::new();
     for entry in &rl.allow {
         allow_nets.push(parse_cidr(entry)?);

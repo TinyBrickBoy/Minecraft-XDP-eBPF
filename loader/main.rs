@@ -185,7 +185,7 @@ fn run(args: &Args, config: &Config, shutdown: &Arc<Shutdown>) -> Result<()> {
         Some((redirect, thread)) => (Some(redirect), Some(thread)),
         None => (None, None),
     };
-    let (block_handles, block_thread) = match blocklist::setup(&mut ebpf, config, shutdown) {
+    let (block_handles, block_thread) = match blocklist::setup(&mut ebpf, interface, config, shutdown) {
         Ok(v) => v,
         Err(e) => {
             error!("Blocklist/rate limit setup failed: {e:#}");

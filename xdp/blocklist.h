@@ -99,6 +99,36 @@ static __always_inline __u8 in_ratelimit_networks(const __u32 daddr)
     return 0;
 }
 
+/*
+ * Remote hosts our protected addresses recently connected to (recorded on egress
+ * by outbound_record below). Their answers, e.g. a fast download a server
+ * started itself, are no flood and never trip the rate limit. A spoofer
+ * would have to know both the remote host and which of our addresses is
+ * talking to it right now.
+ */
+struct outbound_key
+{
+    __u32 remote;
+    __u32 local;
+};
+
+struct
+{
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct outbound_key);
+    __type(value, __u64); // ktime of the last packet sent
+} outbound_peers SEC(".maps");
+
+#define OUTBOUND_WINDOW_NS (30ULL * 1000000000ULL)
+
+static __always_inline __u8 outbound_peer(const __u32 remote, const __u32 local)
+{
+    const struct outbound_key key = {.remote = remote, .local = local};
+    const __u64 *last = bpf_map_lookup_elem(&outbound_peers, &key);
+    return last && bpf_ktime_get_ns() - *last < OUTBOUND_WINDOW_NS;
+}
+
 static __always_inline __u8 blocklist_nonempty(void)
 {
     __u32 zero = 0;
@@ -303,8 +333,9 @@ static __always_inline __u8 blocked_source(const struct iphdr *ip, const __u64 b
     {
         return 0;
     }
-    // the allowlist is only consulted for sources above the limit
-    if (lpm_contains(&ratelimit_allow, src))
+    // the allowlist and the outbound peers are only consulted for sources
+    // above the limit
+    if (lpm_contains(&ratelimit_allow, src) || outbound_peer(src, ip->daddr))
     {
         window->start_ns = now;
         window->packets = 1;
@@ -440,6 +471,64 @@ static __always_inline __u8 dns_scan_check(const struct iphdr *ip, const void *d
         bpf_map_update_elem(&dns_queries, &src, &fresh_q, BPF_ANY);
     }
     return fresh; // known to have no server: drop
+}
+
+/*
+ * tc egress: notes which remote hosts the protected addresses open
+ * connections to (see outbound_peers). Refreshes an entry at most once a
+ * second.
+ */
+SEC("classifier")
+__s32 outbound_record(struct __sk_buff *skb)
+{
+    const void *data = (const void *)(long)skb->data;
+    const void *data_end = (const void *)(long)skb->data_end;
+    const struct ethhdr *eth = data;
+    if ((const void *)(eth + 1) > data_end || eth->h_proto != bpf_htons(ETH_P_IP))
+    {
+        return TC_ACT_UNSPEC;
+    }
+    const struct iphdr *ip = (const void *)(eth + 1);
+    if ((const void *)(ip + 1) > data_end || ip->ihl < 5 || !in_ratelimit_networks(ip->saddr))
+    {
+        return TC_ACT_UNSPEC;
+    }
+    const struct outbound_key key = {.remote = ip->daddr, .local = ip->saddr};
+    const __u64 now = bpf_ktime_get_ns();
+    __u64 *last = bpf_map_lookup_elem(&outbound_peers, &key);
+    if (last)
+    {
+        // any packet keeps a known peer alive
+        if (now - *last >= 1000000000ULL)
+        {
+            *last = now;
+        }
+        return TC_ACT_UNSPEC;
+    }
+    // a new peer only when the server opens the connection itself: a TCP
+    // SYN, or UDP from an ephemeral client port to a well-known service port
+    // (QUIC 443, DNS 53, ...). Answers to clients (that could be an
+    // attacker) never exempt them.
+    __u8 opens = 0;
+    if (!(ip->frag_off & bpf_htons(IP_OFFSET)))
+    {
+        if (ip->protocol == IPPROTO_TCP)
+        {
+            const struct tcphdr *tcp = (const void *)ip + (ip->ihl * 4);
+            opens = (const void *)(tcp + 1) <= data_end && tcp->syn && !tcp->ack;
+        }
+        else if (ip->protocol == IPPROTO_UDP)
+        {
+            const struct udphdr *udp = (const void *)ip + (ip->ihl * 4);
+            opens = (const void *)(udp + 1) <= data_end && bpf_ntohs(udp->source) >= 32768 &&
+                    bpf_ntohs(udp->dest) < 1024;
+        }
+    }
+    if (opens)
+    {
+        bpf_map_update_elem(&outbound_peers, &key, &now, BPF_ANY);
+    }
+    return TC_ACT_UNSPEC;
 }
 
 #endif
