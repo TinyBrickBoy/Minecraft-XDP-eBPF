@@ -358,6 +358,20 @@ pub fn setup(
     } else {
         None
     };
+    let whitelist = {
+        let map: LpmTrie<MapData, u32, u8> =
+            LpmTrie::try_from(ebpf.take_map("whitelist").context("can't take map 'whitelist'")?)?;
+        let size: Array<MapData, u64> =
+            Array::try_from(ebpf.take_map("whitelist_size").context("can't take map 'whitelist_size'")?)?;
+        Whitelist {
+            map,
+            size,
+            file: PathBuf::from(&bl.whitelist_file),
+            static_entries: parse_scoped(&bl.whitelist.join("\n"), "[blocklist] whitelist").into_keys().collect(),
+            current: HashSet::new(),
+            last_mtime: None,
+        }
+    };
     let dns = if bl.enabled && bl.dns_scan && !rl.networks.is_empty() {
         let verdicts: BpfHashMap<MapData, u32, DnsVerdict> =
             BpfHashMap::try_from(ebpf.take_map("dns_verdicts").context("can't take map 'dns_verdicts'")?)?;
@@ -419,6 +433,7 @@ pub fn setup(
         file: PathBuf::from(&bl.file),
         auto,
         dns,
+        whitelist,
         allow: allow_nets.clone(),
         ban_secs: rl.ban_secs,
         entries: handles.entries.clone(),
@@ -456,6 +471,7 @@ struct Worker {
     file: PathBuf,
     auto: Option<Auto>,
     dns: Option<Dns>,
+    whitelist: Whitelist,
     allow: Vec<(Ipv4Addr, u8)>,
     ban_secs: u64,
     entries: Arc<AtomicUsize>,
@@ -468,6 +484,7 @@ struct Worker {
 
 impl Worker {
     fn tick(&mut self, first: bool) {
+        self.whitelist.sync(first);
         // automatic bans: log new ones, publish them, escalate repeated ones
         let active = active_bans(&self.bans, crate::targets::monotonic_ns());
         log_new_bans(&active, &mut self.logged, self.ban_secs);
@@ -475,8 +492,8 @@ impl Worker {
         let mut add = Vec::new();
         if let Some(auto) = &mut self.auto {
             for (ip, bans) in auto.record(&active, now) {
-                if self.current.keys().any(|net| contains(*net, ip)) {
-                    continue; // already blocked, manually or automatically
+                if self.current.keys().any(|net| contains(*net, ip)) || self.whitelist.contains(ip) {
+                    continue; // already blocked, or whitelisted
                 }
                 warn!("Auto blocklist: {ip} banned {bans} times, blocklisted for {} s", auto.duration);
                 add.push(auto_line(ip, now + auto.duration, bans));
@@ -488,6 +505,7 @@ impl Worker {
         if let Some(dns) = &mut self.dns {
             for (src, dst) in dns.process(now) {
                 if self.allow.iter().any(|net| contains(*net, src))
+                    || self.whitelist.contains(src)
                     || self.current.keys().any(|net| contains(*net, src))
                     || add.iter().any(|l| line_ip(l) == Some(src))
                 {
@@ -593,6 +611,63 @@ impl Worker {
         // lets the kernel skip the trie entirely while the list is empty
         if let Err(e) = size.set(0, self.current.len() as u64, 0) {
             warn!("Can't update blocklist size: {e}");
+        }
+    }
+}
+
+/// Sources that get past the blocklist and are never banned.
+struct Whitelist {
+    map: LpmTrie<MapData, u32, u8>,
+    size: Array<MapData, u64>,
+    file: PathBuf,
+    static_entries: HashSet<(Ipv4Addr, u8)>,
+    current: HashSet<(Ipv4Addr, u8)>,
+    last_mtime: Option<SystemTime>,
+}
+
+impl Whitelist {
+    fn contains(&self, ip: Ipv4Addr) -> bool {
+        self.current.iter().any(|net| contains(*net, ip))
+    }
+
+    /// Re-reads the file when it changed and applies the difference.
+    fn sync(&mut self, force: bool) {
+        let mtime = std::fs::metadata(&self.file).and_then(|m| m.modified()).ok();
+        if !force && mtime == self.last_mtime {
+            return;
+        }
+        self.last_mtime = mtime;
+        let mut wanted = self.static_entries.clone();
+        match std::fs::read_to_string(&self.file) {
+            Ok(text) => wanted.extend(parse_scoped(&text, &self.file.display().to_string()).into_keys()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("Can't read whitelist {}: {e}", self.file.display()),
+        }
+        let (mut added, mut removed) = (0, 0);
+        let gone: Vec<_> = self.current.difference(&wanted).copied().collect();
+        for net in gone {
+            if self.map.remove(&key_of(net)).is_ok() {
+                self.current.remove(&net);
+                removed += 1;
+            }
+        }
+        for net in wanted {
+            if self.current.contains(&net) {
+                continue;
+            }
+            match self.map.insert(&key_of(net), 1, 0) {
+                Ok(()) => {
+                    self.current.insert(net);
+                    added += 1;
+                }
+                Err(e) => warn!("Can't whitelist {}/{}: {e}", net.0, net.1),
+            }
+        }
+        if added + removed > 0 {
+            info!("Whitelist: {added} added, {removed} removed, {} active", self.current.len());
+        }
+        if let Err(e) = self.size.set(0, self.current.len() as u64, 0) {
+            warn!("Can't update whitelist size: {e}");
         }
     }
 }

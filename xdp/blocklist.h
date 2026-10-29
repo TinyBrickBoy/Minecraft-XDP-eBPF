@@ -60,6 +60,25 @@ struct
     __type(value, __u8);
 } ratelimit_allow SEC(".maps");
 
+// whitelist: sources that are never blocklisted, banned or striked
+struct
+{
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 4096);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct net_key);
+    __type(value, __u8);
+} whitelist SEC(".maps");
+
+// [0] = number of whitelist entries (an empty list costs no trie lookup)
+struct
+{
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} whitelist_size SEC(".maps");
+
 // networks whose inbound traffic is rate limited per source (customer
 // prefix), as masks like unused_networks: cheaper than a trie per packet
 struct
@@ -256,9 +275,20 @@ static __always_inline void issue_ban(const __u32 src, const __u64 now, const __
  * Returns 1 when the packet has to be dropped because of its source.
  * bytes is the frame length, for the statistics.
  */
+static __always_inline __u8 whitelisted(const __u32 src)
+{
+    __u32 zero = 0;
+    const __u64 *size = bpf_map_lookup_elem(&whitelist_size, &zero);
+    return size && *size && lpm_contains(&whitelist, src);
+}
+
 static __always_inline __u8 blocked_source(const struct iphdr *ip, const __u64 bytes)
 {
     const __u32 src = ip->saddr;
+    if (whitelisted(src))
+    {
+        return 0;
+    }
 
     const __u8 scope = BLOCKLIST_ACTIVE && blocklist_nonempty() ? lpm_value(&blocklist, src) : 0;
     if (scope == BLOCK_ALL || (scope == BLOCK_PROTECTED && in_ratelimit_networks(ip->daddr)))
@@ -356,7 +386,7 @@ static __always_inline __u8 blocked_source(const struct iphdr *ip, const __u64 b
  */
 static __always_inline void add_strike(const __u32 src)
 {
-    if (RATELIMIT_MODE == RATELIMIT_OFF || !STRIKE_LIMIT)
+    if (RATELIMIT_MODE == RATELIMIT_OFF || !STRIKE_LIMIT || whitelisted(src))
     {
         return;
     }

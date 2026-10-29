@@ -160,6 +160,13 @@ auto_idle_secs = 300
 dns_scan = true
 dns_recheck_secs = 300
 
+# Whitelist: sources (addresses or prefixes) that are never blocklisted,
+# banned or counted as violations; they get past the blocklist even when
+# listed there. One per line in `whitelist_file` (reloaded live, like `file`)
+# and/or in `whitelist`. The minecraft checks still apply.
+whitelist_file = "whitelist.txt"
+whitelist = []
+
 [ratelimit]
 # Automatic bans: a source sending more than `pps` packets per second to
 # `networks` is banned (all its traffic dropped) for `ban_secs`. Sources in
@@ -442,6 +449,8 @@ pub struct BlocklistConfig {
     pub auto_idle_secs: u64,
     pub dns_scan: bool,
     pub dns_recheck_secs: u64,
+    pub whitelist_file: String,
+    pub whitelist: Vec<String>,
 }
 
 impl Default for BlocklistConfig {
@@ -459,6 +468,8 @@ impl Default for BlocklistConfig {
             auto_idle_secs: 300,
             dns_scan: true,
             dns_recheck_secs: 300,
+            whitelist_file: "whitelist.txt".into(),
+            whitelist: Vec::new(),
         }
     }
 }
@@ -467,6 +478,9 @@ impl BlocklistConfig {
     fn validate(&self) -> Result<()> {
         for entry in &self.entries {
             parse_cidr(entry).context("[blocklist] entries")?;
+        }
+        for entry in &self.whitelist {
+            parse_cidr(entry).context("[blocklist] whitelist")?;
         }
         check_range("[blocklist] reload_secs", self.reload_secs, 1, 3_600)?;
         check_range("[blocklist] auto_after_bans", self.auto_after_bans, 1, 100)?;

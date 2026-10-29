@@ -87,6 +87,7 @@ auto_window_secs = 600
 auto_duration_secs = 120
 auto_idle_secs = 12
 auto_state_file = "$T/auto-blocklist.json"
+whitelist_file = "$T/whitelist.txt"
 dns_recheck_secs = 30
 [ratelimit]
 mode = "enforce"
@@ -206,6 +207,13 @@ check "other source still works"      cl $MC udp-echo 10.99.1.2 40000 5003
 check "blocklist hits per source"     bash -c "curl -s 127.0.0.1:1999/metrics | grep -q 'xdp_blocklist_source_packets{src_ip=\"10.99.0.3\"}'"
 : > $T/blocklist.txt; sleep 3
 check "removed entry works again"     cl $B $MC udp-echo 10.99.1.2 40000 5002
+echo "10.99.0.5   # e2e" > $T/blocklist.txt; echo "10.99.0.5   # whitelisted" > $T/whitelist.txt; sleep 3
+check "whitelist gets past the blocklist" cl env E2E_BIND=10.99.0.5 $MC udp-echo 10.99.1.2 40000 5012
+cl env E2E_BIND=10.99.0.5 $MC udp-flood 10.99.1.2 40000 4000
+check "whitelisted source never banned" cl env E2E_BIND=10.99.0.5 $MC udp-echo 10.99.1.2 40000 5013
+: > $T/whitelist.txt; sleep 3
+check "without whitelist it is blocked" cl env E2E_BIND=10.99.0.5 $MC udp-no-echo 10.99.1.2 40000 5014
+: > $T/blocklist.txt; sleep 3
 
 echo "== rate limit"
 cl $B $MC udp-flood 10.99.1.2 40000 4000
