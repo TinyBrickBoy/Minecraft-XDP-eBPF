@@ -257,6 +257,10 @@ impl Prober {
             if !self.scope.allows(&key) {
                 continue;
             }
+            // web protection switched off: forget detected web servers
+            if !self.web && record.kind.is_some_and(Kind2::is_web) {
+                continue;
+            }
             if let Some(kind) = record.kind {
                 if let Err(e) = self.targets.set(key, kind.into(), Source::Auto) {
                     warn!("{e:#}");

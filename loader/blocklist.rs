@@ -147,10 +147,9 @@ const AUTO_MARK: &str = "# auto until=";
 /// Every automatically written line contains this.
 const AUTO_TAG: &str = "# auto";
 
-/// A permanent entry for a DNS scanner.
-fn dns_line(ip: Ipv4Addr, dst: Ipv4Addr) -> String {
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M");
-    format!("{ip}   {AUTO_TAG} dns-scan: queried {dst}:53 without a DNS server ({now})")
+/// An entry for a DNS scanner, expiring like the other automatic entries.
+fn dns_line(ip: Ipv4Addr, dst: Ipv4Addr, until: u64) -> String {
+    format!("{ip}   {AUTO_MARK}{until} ({}) dns-scan: queried {dst}:53 without a DNS server", local_time(until))
 }
 
 /// True if `dst` answers a DNS query on udp/53 (any answer, also REFUSED).
@@ -175,11 +174,14 @@ fn auto_until(line: &str) -> Option<u64> {
     rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
 }
 
-fn auto_line(ip: Ipv4Addr, until: u64, bans: usize) -> String {
-    let human = chrono::DateTime::from_timestamp(until as i64, 0)
+fn local_time(unix: u64) -> String {
+    chrono::DateTime::from_timestamp(unix as i64, 0)
         .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
-        .unwrap_or_default();
-    format!("{ip}   {AUTO_MARK}{until} ({human}) after {bans} rate limit bans")
+        .unwrap_or_default()
+}
+
+fn auto_line(ip: Ipv4Addr, until: u64, bans: usize) -> String {
+    format!("{ip}   {AUTO_MARK}{until} ({}) after {bans} rate limit bans", local_time(until))
 }
 
 /// The address of a line, if it is a single address.
@@ -340,8 +342,17 @@ pub fn setup(ebpf: &mut Ebpf, config: &Config, shutdown: &Arc<Shutdown>) -> Resu
             BpfHashMap::try_from(ebpf.take_map("dns_verdicts").context("can't take map 'dns_verdicts'")?)?;
         let queries: BpfHashMap<MapData, u32, DnsQuery> =
             BpfHashMap::try_from(ebpf.take_map("dns_queries").context("can't take map 'dns_queries'")?)?;
-        info!("DNS scan detection: sources querying protected addresses without a DNS server are blocklisted permanently (verdict cached {} s)", bl.dns_recheck_secs);
-        Some(Dns { verdicts, queries, cache: HashMap::new(), recheck: bl.dns_recheck_secs })
+        info!(
+            "DNS scan detection: sources querying protected addresses without a DNS server are blocklisted for {} s (verdict cached {} s)",
+            bl.auto_duration_secs, bl.dns_recheck_secs
+        );
+        Some(Dns {
+            verdicts,
+            queries,
+            cache: HashMap::new(),
+            recheck: bl.dns_recheck_secs,
+            duration: bl.auto_duration_secs,
+        })
     } else {
         None
     };
@@ -461,8 +472,8 @@ impl Worker {
                 {
                     continue;
                 }
-                warn!("DNS scan: {src} queried {dst}:53 where no DNS server runs, blocklisted permanently");
-                add.push(dns_line(src, dst));
+                warn!("DNS scan: {src} queried {dst}:53 where no DNS server runs, blocklisted for {} s", dns.duration);
+                add.push(dns_line(src, dst, now + dns.duration));
             }
         }
 
@@ -572,6 +583,8 @@ struct Dns {
     /// destination -> (has a DNS server, unix time of the probe)
     cache: HashMap<Ipv4Addr, (bool, u64)>,
     recheck: u64,
+    /// how long a scanner stays blocklisted
+    duration: u64,
 }
 
 impl Dns {

@@ -261,10 +261,10 @@ check "dns scanner dropped"           cl $D6 $MC udp-no-echo 10.99.1.2 40000 502
 check "dns scanner reaches the router" cl $D6 $MC udp-echo 10.99.0.1 40100 5024
 check "legit dns client not blocked"  bash -c "! grep -q '^10.99.0.7 ' $T/blocklist.txt"
 check "dns server answers its client" cl $D7 $MC udp-echo 10.99.3.7 53 5025
-check "dns entry is permanent (not idle-removed)" bash -c "sleep 14; grep -q '^10.99.0.6 .*dns-scan' $T/blocklist.txt"
+check "dns entry expires like the other auto entries" grep -q '^10.99.0.6 .*auto until=.*dns-scan' $T/blocklist.txt
 
 echo "== automatic blocklist"
-check "1st ban not yet blocklisted"   bash -c "! grep -q 'auto until=' $T/blocklist.txt"
+check "1st ban not yet blocklisted"   bash -c "! grep -q 'auto until=.*rate limit bans' $T/blocklist.txt"
 cl $B $MC udp-flood 10.99.1.2 40000 4000; sleep 3
 check "2nd ban writes auto entry"     grep -q '^10.99.0.3 .*auto until=' $T/blocklist.txt
 sleep 4
@@ -272,8 +272,8 @@ check "still dropped after the ban"   cl $B $MC udp-no-echo 10.99.1.2 40000 5008
 check "auto entries counted"          bash -c "test \"\$(curl -s 127.0.0.1:1999/metrics | awk '\$1==\"xdp_blocklist_auto_entries\"{print \$2}')\" -ge 1"
 check "logged"                        grep -q 'Auto blocklist: 10.99.0.3 banned 2 times' $T/loader.log
 # the source stays silent now: removed after auto_idle_secs, long before auto_duration_secs
-for i in $(seq 1 40); do grep -q 'auto until=' $T/blocklist.txt || break; sleep 1; done
-check "idle auto entry removed"       bash -c "! grep -q 'auto until=' $T/blocklist.txt && grep -q 'Auto blocklist: 10.99.0.3 sent nothing' $T/loader.log"
+for i in $(seq 1 40); do grep -q 'auto until=.*rate limit bans' $T/blocklist.txt || break; sleep 1; done
+check "idle auto entry removed"       bash -c "! grep -q 'auto until=.*rate limit bans' $T/blocklist.txt && grep -q 'Auto blocklist: 10.99.0.3 sent nothing' $T/loader.log"
 sleep 2
 check "works again after expiry"      cl $B $MC udp-echo 10.99.1.2 40000 5009
 

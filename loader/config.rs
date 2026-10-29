@@ -169,7 +169,7 @@ reload_secs = 5
 auto = true
 auto_after_bans = 3
 auto_window_secs = 86400
-auto_duration_secs = 604800
+auto_duration_secs = 21600
 auto_state_file = "auto-blocklist.json"
 
 # An automatic entry is also removed once its source sent nothing for this
@@ -177,8 +177,8 @@ auto_state_file = "auto-blocklist.json"
 auto_idle_secs = 300
 
 # DNS scanners: a source sending a DNS query to a protected address (the
-# [ratelimit] networks) where no DNS server answers is blocklisted
-# permanently. Whether an address runs a DNS server is probed once and
+# [ratelimit] networks) where no DNS server answers is blocklisted for
+# auto_duration_secs. Whether an address runs a DNS server is probed once and
 # trusted for dns_recheck_secs, so it is re-probed only when queries keep
 # coming.
 dns_scan = true
@@ -192,7 +192,7 @@ dns_recheck_secs = 300
 mode = "off"
 networks = []
 pps = 3000
-ban_secs = 300
+ban_secs = 900
 allow = []
 
 # Violations (packets to unused addresses, invalid handshakes, forged TCP
@@ -517,7 +517,7 @@ impl Default for BlocklistConfig {
             auto: true,
             auto_after_bans: 3,
             auto_window_secs: 86_400,
-            auto_duration_secs: 604_800,
+            auto_duration_secs: 21_600,
             auto_state_file: "auto-blocklist.json".into(),
             auto_idle_secs: 300,
             dns_scan: true,
@@ -562,7 +562,7 @@ impl Default for RatelimitConfig {
             mode: ProtectionMode::Off,
             networks: Vec::new(),
             pps: 3000,
-            ban_secs: 300,
+            ban_secs: 900,
             allow: Vec::new(),
             strikes: 30,
             strike_window_secs: 60,
