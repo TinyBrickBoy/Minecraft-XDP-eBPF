@@ -203,6 +203,13 @@ networks = []
 #             slower; use it when the driver misbehaves in native mode.
 mode = "auto"
 
+# Further interfaces the same filter is attached to (always generic mode),
+# e.g. the GRE tunnel of an upstream DDoS protection that delivers the
+# traffic of the protected network. Interfaces without a link layer header
+# (GRE, IPIP) are handled. A missing interface is skipped; the filter
+# restarts itself once it appears.
+extra_interfaces = []
+
 # Sizes of the in-kernel connection tables below. The maps are preallocated,
 # so higher limits cost kernel memory up front, not per connection.
 
@@ -575,6 +582,8 @@ pub struct XdpConfig {
     /// Capacity of `connection_throttle`: source IPs with an active throttle
     /// window.
     pub max_throttled_ips: u32,
+    /// Further interfaces, attached in skb mode.
+    pub extra_interfaces: Vec<String>,
 }
 
 impl Default for XdpConfig {
@@ -584,6 +593,7 @@ impl Default for XdpConfig {
             max_pending_connections: 16384,
             max_player_connections: 65535,
             max_throttled_ips: 65535,
+            extra_interfaces: Vec::new(),
         }
     }
 }
@@ -820,6 +830,11 @@ impl AutodetectConfig {
 
 impl XdpConfig {
     fn validate(&self) -> Result<()> {
+        for name in &self.extra_interfaces {
+            if name.is_empty() || name.len() > 15 || name.contains(['/', ' ']) {
+                bail!("[xdp] extra_interfaces: invalid interface name '{name}'");
+            }
+        }
         const MAX_ENTRIES: u64 = 1 << 20;
         check_range(
             "[xdp] max_pending_connections",

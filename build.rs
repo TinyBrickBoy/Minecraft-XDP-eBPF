@@ -10,6 +10,7 @@ fn main() {
         "xdp/blocklist.h",
         "xdp/common.h",
         "xdp/config.h",
+        "xdp/l3.h",
         "xdp/penalty.h",
         "xdp/protocol.h",
         "xdp/reflection.h",

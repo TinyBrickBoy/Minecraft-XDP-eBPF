@@ -190,8 +190,9 @@ def player(host, port, secs):
 
 
 def garbage(host, port):
+    bind = os.environ.get("E2E_BIND")
     try:
-        with socket.create_connection((host, port), timeout=2) as s:
+        with socket.create_connection((host, port), timeout=2, source_address=(bind, 0) if bind else None) as s:
             # long enough that the fake server reads a full bogus "packet"
             # and answers BAD when nothing filters it
             s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n" + b"X" * 200)

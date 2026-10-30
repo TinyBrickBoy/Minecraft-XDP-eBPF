@@ -30,6 +30,12 @@ for ns in cl sv; do ip -n $ns link set lo up; done
 ip -n cl addr add 10.99.0.2/24 dev c1; ip -n cl addr add 10.99.0.3/24 dev c1; ip -n cl addr add 10.99.0.4/24 dev c1; ip -n cl addr add 10.99.0.5/24 dev c1; ip -n cl addr add 10.99.0.6/24 dev c1; ip -n cl addr add 10.99.0.7/24 dev c1; ip -n cl addr add 10.99.0.8/24 dev c1; ip -n cl addr add 10.99.0.9/24 dev c1; ip -n cl link set c1 up; ip -n cl route add default via 10.99.0.1
 ip -n sv addr add 10.99.1.2/24 dev s1; ip -n sv link set s1 up; ip -n sv route add default via 10.99.1.1
 sysctl -qw net.ipv4.ip_forward=1
+# upstream DDoS protection: a GRE tunnel (no link layer header) that delivers
+# traffic of the client 10.99.6.2
+ip link add gre-t type gre local 10.99.0.1 remote 10.99.0.2; ip addr add 100.64.0.5/31 dev gre-t; ip link set gre-t up
+ip route add 10.99.6.0/24 dev gre-t; sysctl -qw net.ipv4.conf.gre-t.rp_filter=0 net.ipv4.conf.all.rp_filter=0
+ip -n cl link add gre-t type gre local 10.99.0.2 remote 10.99.0.1; ip -n cl addr add 100.64.0.4/31 dev gre-t; ip -n cl link set gre-t up
+ip -n cl addr add 10.99.6.2/32 dev lo; ip -n cl rule add from 10.99.6.2 lookup 100; ip -n cl route add default dev gre-t table 100
 # customer prefix like on the router: unreachable /24, one address routed
 ip route add unreachable 10.99.3.0/24
 ip -n sv addr add 10.99.3.7/32 dev lo
@@ -102,6 +108,7 @@ enabled = true
 networks = ["10.99.3.0/24"]
 [xdp]
 mode = "skb"
+extra_interfaces = ["gre-t", "gre-missing"]
 [metrics]
 enabled = true
 addr = "127.0.0.1:1999"
@@ -147,6 +154,11 @@ check "java status works"           cl $MC status 10.99.1.2 25565
 check "java local status works"     cl $MC status 10.99.2.1 25570
 check "java new player works"       cl $MC player 10.99.1.2 25565 3
 check "java garbage dropped"        cl $MC garbage 10.99.1.2 25565
+G="env E2E_BIND=10.99.6.2"
+check "filter attached to the gre tunnel" grep -q 'Filter attached to gre-t in skb mode (xdp.*no link layer header' $T/loader.log
+check "missing extra interface skipped" grep -q 'Interface gre-missing does not exist yet' $T/loader.log
+check "java status through the gre tunnel" cl $G $MC status 10.99.1.2 25565
+check "java garbage through the gre tunnel dropped" cl $G $MC garbage 10.99.1.2 25565
 check "java local garbage dropped"  cl $MC garbage 10.99.2.1 25570
 check "unprotected service works"   cl $MC echo 10.99.1.2 8000
 check "bedrock ping works"          cl $MC bedrock-ping 10.99.1.2 19132

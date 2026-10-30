@@ -40,6 +40,7 @@
 #define IP_OFFSET 0x1FFF // "fragment offset" part
 #endif
 
+#include "l3.h"
 #include "reflection.h"
 #include "unused.h"
 #include "blocklist.h"
@@ -598,19 +599,12 @@ __s32 minecraft_filter(struct xdp_md *ctx)
     const void *data = (const void *)(long)ctx->data;
     const void *data_end = (const void *)(long)ctx->data_end;
 
-    const struct ethhdr *eth = data;
-    if ((const void *)(eth + 1) > data_end)
-    {
-        return XDP_DROP;
-    }
-
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
+    const struct iphdr *ip = ipv4_header(data, data_end, ctx->ingress_ifindex);
+    if (!ip)
     {
         return XDP_PASS;
     }
-
-    const struct iphdr *ip = data + sizeof(struct ethhdr);
-    if ((const void *)(ip + 1) > data_end || ip->ihl < 5)
+    if (ip->ihl < 5)
     {
         return XDP_DROP;
     }

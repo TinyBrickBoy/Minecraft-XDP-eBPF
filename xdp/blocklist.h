@@ -513,13 +513,8 @@ __s32 outbound_record(struct __sk_buff *skb)
 {
     const void *data = (const void *)(long)skb->data;
     const void *data_end = (const void *)(long)skb->data_end;
-    const struct ethhdr *eth = data;
-    if ((const void *)(eth + 1) > data_end || eth->h_proto != bpf_htons(ETH_P_IP))
-    {
-        return TC_ACT_UNSPEC;
-    }
-    const struct iphdr *ip = (const void *)(eth + 1);
-    if ((const void *)(ip + 1) > data_end || ip->ihl < 5 || !in_ratelimit_networks(ip->saddr))
+    const struct iphdr *ip = ipv4_header(data, data_end, skb->ifindex);
+    if (!ip || ip->ihl < 5 || !in_ratelimit_networks(ip->saddr))
     {
         return TC_ACT_UNSPEC;
     }

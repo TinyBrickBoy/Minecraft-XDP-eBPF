@@ -32,6 +32,7 @@ volatile const __u64 PENALTY_NS = 0;          // penalty box length for throttle
 volatile const __u64 PENALTY_VERIFIED_NS = 0; // a source counts as a real client this long after a ping/login
 volatile const __u8 DNS_SCAN = 0;             // note DNS queries to protected addresses for the loader
 volatile const __u64 DNS_RECHECK_NS = 0;      // how long a "DNS server / no DNS server" verdict is trusted          // drop traffic to unrouted addresses of unused_networks
+volatile const __u8 L3_INTERFACES = 0;      // 1 when interfaces without link layer header are attached (see l3.h)
 volatile const __u32 HIT_COUNT = 0;           // max SYNs per source ip per window, 0 disables the throttle
 volatile const __u64 HIT_COUNT_RESET_NS = 0;  // throttle window length in nanoseconds
 volatile const __u64 PLAYER_IDLE_NS = 0;      // idle check interval for verified connections in nanoseconds;

@@ -50,11 +50,13 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
     let dns_scan: u8 = (config.blocklist.enabled && config.blocklist.dns_scan && !config.ratelimit.networks.is_empty()) as u8;
     let dns_recheck_ns: u64 = config.blocklist.dns_recheck_secs * 1_000_000_000;
     let strike_window_ns: u64 = config.ratelimit.strike_window_secs * 1_000_000_000;
+    let l3_interfaces: u8 = (crate::interfaces::is_l3(interface) || !config.xdp.extra_interfaces.is_empty()) as u8;
     let static_grace_until_ns: u64 =
         crate::targets::monotonic_ns() + filter.adopt_grace_secs * 1_000_000_000;
 
     let mut ebpf = EbpfLoader::new()
         .override_global("PROMETHEUS", &prometheus, true)
+        .override_global("L3_INTERFACES", &l3_interfaces, true)
         .override_global("ONLINE_NAMES", &online_names, true)
         .override_global("START_PORT", &start_port, true)
         .override_global("END_PORT", &end_port, true)
@@ -88,6 +90,11 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
         .context("program 'minecraft_filter' not found")?
         .try_into()?;
     program.load()?;
+    crate::interfaces::register(&mut ebpf, interface)?;
+    let program: &mut Xdp = ebpf
+        .program_mut("minecraft_filter")
+        .context("program 'minecraft_filter' not found")?
+        .try_into()?;
 
     // Auto does its own driver -> skb fallback instead of leaving the choice
     // to the kernel, so the mode that is actually active can be logged.
