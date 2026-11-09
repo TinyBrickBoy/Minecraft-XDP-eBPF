@@ -16,6 +16,7 @@ use crate::shutdown::Shutdown;
 use crate::reflection::{self, StatsMap as ReflectionStatsMap};
 use crate::targets::{DstKey, Targets};
 use crate::blocklist;
+use crate::players::{PlayerMap, Tracker};
 use crate::unused::{self, StatsMap as UnusedStatsMap};
 
 /// Optional statistics maps of the network wide protections.
@@ -199,6 +200,15 @@ pub fn start(
         .take_map("dst_stats_map")
         .context("can't take map 'dst_stats_map'")?;
     let dst_stats = PerCpuHashMap::try_from(dst_map)?;
+    // players per server: read only, the eBPF program keeps using the map
+    let players = match ebpf.take_map("player_connection_map").map(PlayerMap::try_from) {
+        Some(Ok(map)) => Some(map),
+        Some(Err(e)) => {
+            error!("Players per server disabled: {e}");
+            None
+        }
+        None => None,
+    };
 
     match &config.metrics.addr {
         Some(addr) => serve_http(addr.clone()),
@@ -210,7 +220,7 @@ pub fn start(
     let handle = thread::Builder::new()
         .name("track-stats".into())
         .spawn(move || {
-            poll_loop(stats, dst_stats, targets, extra, shutdown, poll_interval)
+            poll_loop(stats, dst_stats, players, targets, extra, shutdown, poll_interval)
         })?;
     Ok(Some(handle))
 }
@@ -222,11 +232,13 @@ pub fn start(
 fn poll_loop(
     stats: PerCpuArray<MapData, Statistics>,
     dst_stats: PerCpuHashMap<MapData, DstKey, Statistics>,
+    players: Option<PlayerMap>,
     targets: Arc<Targets>,
     extra: Extra,
     shutdown: Arc<Shutdown>,
     poll_interval: Duration,
 ) {
+    let mut tracker = Tracker::default();
     loop {
         match stats.get(&0, 0) {
             Ok(per_cpu) => {
@@ -243,6 +255,9 @@ fn poll_loop(
         }
         publish_dst_stats(&dst_stats);
         publish_targets(&targets);
+        if let Some(map) = &players {
+            tracker.publish(map, &targets);
+        }
         if let Some(map) = &extra.reflection {
             publish_reflection(map);
         }

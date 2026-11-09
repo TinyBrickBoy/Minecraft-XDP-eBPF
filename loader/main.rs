@@ -6,6 +6,7 @@ mod interfaces;
 mod logging;
 mod metrics;
 mod penalty;
+mod players;
 mod reflection;
 mod shutdown;
 mod targets;
