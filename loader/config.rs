@@ -45,6 +45,16 @@ ipv6_source_prefix = 64
 ipv6_aggregate_prefix = 48
 ipv6_aggregate_factor = 8
 
+# Verified connections (players past the handshake checks) per source:
+# per IPv4 address, per IPv6 ipv6_source_prefix and per IPv6
+# ipv6_aggregate_prefix. Further handshakes of a source at its cap are
+# dropped until one of its connections goes idle, so one source can not fill
+# the player table (bedrock handshakes are not proven to come from the
+# claimed address). 0 = no cap; at most 1048576.
+max_verified_per_ipv4 = 64
+max_verified_per_ipv6_prefix = 64
+max_verified_per_ipv6_aggregate = 512
+
 # Idle timeout for verified player connections in seconds, enforced inside the
 # eBPF program: a connection's entry is removed after one to two timeout
 # intervals without packets, so a returning client has to redo the handshake.
@@ -309,6 +319,12 @@ pub struct FilterConfig {
     pub ipv6_aggregate_prefix: u8,
     /// SYN budget of the aggregate tier as a multiple of `hit_count`.
     pub ipv6_aggregate_factor: u32,
+    /// Verified flows per IPv4 address (0 = no cap). Maps to `VERIFIED_PER_IPV4`.
+    pub max_verified_per_ipv4: u32,
+    /// Verified flows per IPv6 source prefix. Maps to `VERIFIED_PER_IPV6_PREFIX`.
+    pub max_verified_per_ipv6_prefix: u32,
+    /// Verified flows per IPv6 aggregate prefix. Maps to `VERIFIED_PER_IPV6_AGGREGATE`.
+    pub max_verified_per_ipv6_aggregate: u32,
     /// Idle timeout for verified connections in seconds; an entry is removed
     /// in-kernel after one to two intervals without packets. Maps to
     /// `PLAYER_IDLE_NS` (converted to ns).
@@ -336,6 +352,10 @@ impl Default for FilterConfig {
             // gains at most a factor of 8 instead of 65536
             ipv6_aggregate_prefix: 48,
             ipv6_aggregate_factor: 8,
+            // a household or a small NAT; a site (/48) with many players
+            max_verified_per_ipv4: 64,
+            max_verified_per_ipv6_prefix: 64,
+            max_verified_per_ipv6_aggregate: 512,
             player_idle_timeout_secs: 60,
             online_names: true,
             adopt_grace_secs: 120,
@@ -789,6 +809,13 @@ impl FilterConfig {
             u64::from(self.ipv6_source_prefix),
         )?;
         check_range("[filter] ipv6_aggregate_factor", u64::from(self.ipv6_aggregate_factor), 1, 1024)?;
+        for (option, value) in [
+            ("[filter] max_verified_per_ipv4", self.max_verified_per_ipv4),
+            ("[filter] max_verified_per_ipv6_prefix", self.max_verified_per_ipv6_prefix),
+            ("[filter] max_verified_per_ipv6_aggregate", self.max_verified_per_ipv6_aggregate),
+        ] {
+            check_range(option, u64::from(value), 0, 1 << 20)?;
+        }
         check_range(
             "[filter] hit_count_reset_secs",
             self.hit_count_reset_secs,
@@ -1175,6 +1202,20 @@ mod tests {
         // IPv4-only configs load unchanged
         let v4: Config = toml::from_str("[filter]\nhit_count = 5").unwrap();
         v4.validate().unwrap();
+    }
+
+    #[test]
+    fn verified_caps() {
+        let cfg = Config::default();
+        assert_eq!(
+            (cfg.filter.max_verified_per_ipv4, cfg.filter.max_verified_per_ipv6_prefix, cfg.filter.max_verified_per_ipv6_aggregate),
+            (64, 64, 512)
+        );
+        let parsed: Config = toml::from_str("[filter]\nmax_verified_per_ipv4 = 0\nmax_verified_per_ipv6_aggregate = 1048576").unwrap();
+        parsed.validate().unwrap();
+        let mut cfg = Config::default();
+        cfg.filter.max_verified_per_ipv6_prefix = (1 << 20) + 1;
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

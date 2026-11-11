@@ -246,6 +246,7 @@ def bedrock_ping(host, port):
 
 def bedrock_session(host, port, secs):
     with socket.socket(family(host), socket.SOCK_DGRAM) as s:
+        s.bind((os.environ.get("E2E_BIND", any_addr(host)), 0))
         s.connect((host, port))
         r = udp_exchange(s, b"\x05" + MAGIC + b"\x0b" + bytes(1000))
         if not r or r[0] != 0x06:

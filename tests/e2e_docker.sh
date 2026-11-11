@@ -632,6 +632,8 @@ end_port = 0
 adopt_grace_secs = 0
 hit_count_reset_secs = 10
 ipv6_aggregate_factor = 1
+max_verified_per_ipv4 = 2
+player_idle_timeout_secs = 2
 [targets]
 java = ["10.99.1.2:25565", "[fd99:1::2]:25565"]
 [autodetect]
@@ -667,6 +669,16 @@ check "/48 throttle leaves IPv4 alone" cl env E2E_BIND=10.99.0.3 $MC status 10.9
 # 14 handshake packets from one address (hit_count 10): request 2 takes no
 # throttle hit of its own, so the second console still gets in
 check "two bedrock consoles behind one address join" cl env E2E_BIND=10.99.0.8 $MC bedrock-household 10.99.1.2 19132
+# max_verified_per_ipv4 = 2: a third verified flow of one address is
+# refused while two are alive, and the slots come back once they idle out
+cl env E2E_BIND=10.99.0.9 $MC bedrock-session 10.99.1.2 19132 4 & CAP1=$!
+cl env E2E_BIND=10.99.0.9 $MC bedrock-session 10.99.1.2 19132 4 & CAP2=$!
+sleep 1
+check "verified flows per address capped" bash -c "! ip netns exec cl env E2E_BIND=10.99.0.9 $MC bedrock-session 10.99.1.2 19132 1"
+check "flows within the cap work"   wait $CAP1
+check "flows within the cap work (2)" wait $CAP2
+sleep 6   # idle timeout 2 s: entries go after 2-4 s without packets
+check "the cap frees up when flows idle out" cl env E2E_BIND=10.99.0.9 $MC bedrock-session 10.99.1.2 19132 1
 # 15 + 15 violations from two /64s: each /64 stays below 20. Strikes and
 # bans have no /48 tier (forged strikes from many /64s must not ban a whole
 # /48 and its verified players)

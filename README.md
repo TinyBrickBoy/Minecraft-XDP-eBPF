@@ -26,7 +26,11 @@ This fork of [Outfluencer/Minecraft-XDP-eBPF](https://github.com/Outfluencer/Min
   connection request 2 (address family 4 or 6, MTU 400-1500) verifies the
   flow, but only within 10 s after a request 1 of the same flow passed the
   per source throttle, and each passed request 1 verifies at most one flow
-  (request 2 takes no second throttle hit). Amplification source ports and
+  (request 2 takes no second throttle hit). Known limitation: unlike TCP,
+  the RakNet offline handshake proves nothing about the source address, so
+  spoofed request 1 + request 2 pairs still verify flows (tracked with
+  F-BLINDVERIFY); `max_verified_per_*` caps how much of the player table one
+  source can take. Amplification source ports and
   fragments are dropped.
 - **No kicks on restart/update**: established connections are adopted during
   `adopt_grace_secs` after the loader starts and after a target is added.
@@ -214,6 +218,9 @@ restart the loader. Use `--config <path>` to point at a different file.
 | `ipv6_source_prefix` | int | 64 | Prefix length per IPv6 source for throttling, rate limits and bans (32–128). IPv4 is always per address. |
 | `ipv6_aggregate_prefix` | int | 48 | Second, coarser IPv6 tier of the connection throttle (16–`ipv6_source_prefix`; equal turns it off). |
 | `ipv6_aggregate_factor` | int | 8 | SYN budget of the aggregate tier as a multiple of `hit_count` (1–1024). |
+| `max_verified_per_ipv4` | int | 64 | Verified (java and bedrock) connections per IPv4 address; further handshakes of the address are dropped until one goes idle (`0` = no cap, max 1048576). |
+| `max_verified_per_ipv6_prefix` | int | 64 | The same per IPv6 `ipv6_source_prefix`. |
+| `max_verified_per_ipv6_aggregate` | int | 512 | The same per IPv6 `ipv6_aggregate_prefix` (only while the aggregate tier is on). |
 
 **`[xdp]`** — how the program attaches and the capacity of its in-kernel tables
 (the maps are preallocated, so higher limits cost kernel memory up front):

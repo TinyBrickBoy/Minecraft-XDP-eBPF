@@ -72,6 +72,110 @@ struct
 } player_connection_map SEC(".maps");
 
 /*
+ * Verified flows per source: IPv4 address / IPv6 source prefix
+ * (VERIFIED_PER_IPV4, VERIFIED_PER_IPV6_PREFIX) and IPv6 aggregate prefix
+ * (VERIFIED_PER_IPV6_AGGREGATE). A source that can complete handshakes
+ * (bedrock has no return-routability check) must not fill the player map
+ * that every other client needs. Counted up when a flow enters
+ * player_connection_map and down on every deletion of an entry (there are
+ * two: the idle timer and the failed timer setup), so the counts can not
+ * drift up; races (an entry deleted at 0 while a CPU increments it) only
+ * lose counts, which the signed counter and the delete at <= 0 keep
+ * harmless. Plain hash maps sized like the player map: there is at most one
+ * counter per verified flow, so they never fill before it.
+ */
+struct
+{
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65535); // placeholder, set by the loader ([xdp] max_player_connections)
+    __type(key, struct addr6);  // source prefix (src_prefix)
+    __type(value, __s64);
+} verified_per_source SEC(".maps");
+
+struct
+{
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65535); // placeholder, set by the loader ([xdp] max_player_connections)
+    __type(key, struct addr6);  // aggregate prefix (src_aggregate)
+    __type(value, __s64);
+} verified_per_aggregate SEC(".maps");
+
+// takes one slot of key in map; 0 when cap slots are taken already
+static __always_inline __u8 verified_take(void *map, const struct addr6 *key, const __u32 cap)
+{
+    if (!cap)
+    {
+        return 1;
+    }
+    __s64 *count = bpf_map_lookup_elem(map, key);
+    if (!count)
+    {
+        const __s64 one = 1;
+        if (bpf_map_update_elem(map, key, &one, BPF_NOEXIST) == 0)
+        {
+            return 1;
+        }
+        count = bpf_map_lookup_elem(map, key); // a racing CPU created it
+        if (!count)
+        {
+            return 0;
+        }
+    }
+    if (__sync_fetch_and_add(count, 1) >= (__s64)cap)
+    {
+        __sync_fetch_and_add(count, -1);
+        return 0;
+    }
+    return 1;
+}
+
+static __always_inline void verified_release(void *map, const struct addr6 *key, const __u32 cap)
+{
+    if (!cap)
+    {
+        return;
+    }
+    __s64 *count = bpf_map_lookup_elem(map, key);
+    if (count && __sync_fetch_and_add(count, -1) <= 1)
+    {
+        bpf_map_delete_elem(map, key);
+    }
+}
+
+static __always_inline __u32 verified_cap(const struct addr6 *src)
+{
+    return addr_is_v4(src) ? VERIFIED_PER_IPV4 : VERIFIED_PER_IPV6_PREFIX;
+}
+
+// both tiers of src, or nothing (0) when one of them is full
+static __always_inline __u8 verified_take_source(const struct addr6 *src)
+{
+    const struct addr6 pfx = src_prefix(src);
+    if (!verified_take(&verified_per_source, &pfx, verified_cap(src)))
+    {
+        return 0;
+    }
+    struct addr6 agg;
+    if (src_aggregate(src, &agg) && !verified_take(&verified_per_aggregate, &agg, VERIFIED_PER_IPV6_AGGREGATE))
+    {
+        verified_release(&verified_per_source, &pfx, verified_cap(src));
+        return 0;
+    }
+    return 1;
+}
+
+static __always_inline void verified_release_source(const struct addr6 *src)
+{
+    const struct addr6 pfx = src_prefix(src);
+    verified_release(&verified_per_source, &pfx, verified_cap(src));
+    struct addr6 agg;
+    if (src_aggregate(src, &agg))
+    {
+        verified_release(&verified_per_aggregate, &agg, VERIFIED_PER_IPV6_AGGREGATE);
+    }
+}
+
+/*
  * bpf_timer callback: delete the verified connection if it was idle for a
  * full interval, otherwise snapshot the counter and check again next interval
  */
@@ -80,7 +184,11 @@ static __s32 player_connection_idle_check(void *map, struct flow_key *key, struc
     const __u64 packets = entry->packets;
     if (packets == entry->last_packets)
     {
-        bpf_map_delete_elem(map, key);
+        const struct addr6 src = key->src;
+        if (bpf_map_delete_elem(map, key) == 0)
+        {
+            verified_release_source(&src);
+        }
         return 0;
     }
     entry->last_packets = packets;
@@ -435,14 +543,21 @@ static __always_inline __u8 throttle_allows(const struct addr6 *src)
 static __always_inline __u32 switch_to_verified_idle(const __u64 raw_packet_len, struct statistics *stats_ptr, struct statistics *dst_stats_ptr, const struct flow_key *flow_key, const __u32 stat, const __u64 idle_ns)
 {
     bpf_map_delete_elem(&conntrack_map, flow_key);
+    // the source's share of the player map (see verified_per_source)
+    if (!verified_take_source(&flow_key->src))
+    {
+        goto drop;
+    }
     const struct player_entry fresh = {.packets = 1, .last_packets = 0, .idle_ns = idle_ns};
     if (bpf_map_update_elem(&player_connection_map, flow_key, &fresh, BPF_NOEXIST) < 0)
     {
+        verified_release_source(&flow_key->src);
         goto drop;
     }
     struct player_entry *entry = bpf_map_lookup_elem(&player_connection_map, flow_key);
     if (!entry)
     {
+        // deleted by its timer in between (which released the slot)
         goto drop;
     }
     if (bpf_timer_init(&entry->timer, &player_connection_map, CLOCK_MONOTONIC) < 0 ||
@@ -450,7 +565,10 @@ static __always_inline __u32 switch_to_verified_idle(const __u64 raw_packet_len,
         bpf_timer_start(&entry->timer, idle_ns, 0) < 0)
     {
         // never leak an entry that has no idle timer armed
-        bpf_map_delete_elem(&player_connection_map, flow_key);
+        if (bpf_map_delete_elem(&player_connection_map, flow_key) == 0)
+        {
+            verified_release_source(&flow_key->src);
+        }
         goto drop;
     }
     count_stats(stats_ptr, dst_stats_ptr, stat, 1);
