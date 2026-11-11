@@ -630,6 +630,14 @@ __s32 minecraft_filter(struct xdp_md *ctx)
         {
             return XDP_DROP;
         }
+        // loopback, multicast, v4-mapped and other ::/80 sources (and ::/80
+        // destinations) never appear on the wire: dropped for every
+        // destination, they would alias IPv4 state. Only duplicate address
+        // detection sends neighbour solicitations from ::
+        if (l.bogus)
+        {
+            return l.bogus == BOGUS_UNSPEC && is_ndp(ip, data_end, &l) ? XDP_PASS : XDP_DROP;
+        }
         return dst_has_targets(&l.dst) ? XDP_DROP : XDP_PASS;
     }
 

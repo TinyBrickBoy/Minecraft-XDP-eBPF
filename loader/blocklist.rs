@@ -234,7 +234,7 @@ fn rewrite(text: &str, now: u64, add: &[String], idle: &HashSet<Net>) -> Option<
 /// older versions hold bare IPv4 addresses, which read back as /32.
 mod net_keys {
     use super::{Net, parse_cidr};
-    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::collections::HashMap;
 
     pub fn serialize<S: Serializer>(map: &HashMap<Net, Vec<u64>>, s: S) -> Result<S::Ok, S::Error> {
@@ -244,13 +244,12 @@ mod net_keys {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<HashMap<Net, Vec<u64>>, D::Error> {
         let text = HashMap::<String, Vec<u64>>::deserialize(d)?;
-        text.into_iter()
-            .map(|(key, v)| {
-                parse_cidr(&key)
-                    .map(|net| (Net { addr: net.addr6().to_ip(), len: net.len }, v))
-                    .map_err(D::Error::custom)
-            })
-            .collect()
+        // entries that are no longer valid (e.g. `::/64` written by an older
+        // version) are dropped instead of discarding the whole history
+        Ok(text
+            .into_iter()
+            .filter_map(|(key, v)| parse_cidr(&key).ok().map(|net| (Net { addr: net.addr6().to_ip(), len: net.len }, v)))
+            .collect())
     }
 }
 
@@ -284,6 +283,12 @@ impl Auto {
             }
             self.counted.insert(*ip, ban.since_ns);
             if self.allow.iter().any(|a| a.overlaps(ip)) {
+                continue;
+            }
+            // e.g. `::/64` from a ban of `::1`: as a blocklist entry it
+            // would also block every IPv4 source
+            if ip.overlaps_v4_mapped() {
+                warn!("Auto blocklist: not escalating the ban of {ip}, it overlaps the IPv4 range ::ffff:0:0/96");
                 continue;
             }
             let times = self.history.bans.entry(*ip).or_default();
@@ -527,7 +532,7 @@ impl Worker {
         let mut add = Vec::new();
         if let Some(auto) = &mut self.auto {
             for (net, bans) in auto.record(&active, now) {
-                if already_blocked(&self.current, &net) || self.whitelist.contains(net.addr) {
+                if already_blocked(&self.current, &net) || self.whitelist.overlaps(&net) {
                     continue; // already blocked, or whitelisted
                 }
                 warn!("Auto blocklist: {net} banned {bans} times, blocklisted for {} s", auto.duration);
@@ -664,6 +669,12 @@ struct Whitelist {
 impl Whitelist {
     fn contains(&self, ip: IpAddr) -> bool {
         self.current.iter().any(|net| net.contains(ip))
+    }
+
+    /// True when any whitelisted address is inside `net` (or `net` inside
+    /// a whitelisted network).
+    fn overlaps(&self, net: &Net) -> bool {
+        self.current.iter().any(|w| w.overlaps(net))
     }
 
     /// Re-reads the file when it changed and applies the difference.
@@ -899,6 +910,38 @@ mod tests {
         // a neighbouring prefix and another v4 address are not exempt
         let other = net("2001:db8:1:3::/64");
         assert_eq!(auto.record(&[(other, ban(1)), (net("1.2.3.5/32"), ban(1))], 11).len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bans_overlapping_ipv4_never_escalate() {
+        let dir = std::env::temp_dir().join(format!("xdp-mapped-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut auto = Auto {
+            after_bans: 1,
+            window: 100,
+            duration: 50,
+            allow: Vec::new(),
+            state: dir.join("state.json"),
+            history: History::default(),
+            counted: HashMap::new(),
+        };
+        let ban = |since| Ban { until_ns: u64::MAX, since_ns: since, rate: 1, dropped: 1, reason: 2 };
+        // the kernel ban key of ::1 (or of 0:0:0:1::5 with a /32 source
+        // prefix) is ::, which becomes ::/64 (::/32)
+        let zero = ban_net(Addr6::default(), 64);
+        assert_eq!(zero.to_string(), "::/64");
+        let zero32 = ban_net(Addr6::default(), 32);
+        assert!(auto.record(&[(zero, ban(1)), (zero32, ban(1))], 10).is_empty());
+        assert!(auto.history.bans.is_empty());
+        let fine = net("2001:db8::/64");
+        assert_eq!(auto.record(&[(fine, ban(2))], 11), vec![(fine, 1)]);
+        // a history written by an older version keeps its valid entries
+        let h: History = serde_json::from_str(r#"{"bans":{"::/64":[1],"1.2.3.4":[2]}}"#).unwrap();
+        assert_eq!(h.bans.len(), 1);
+        assert_eq!(h.bans[&net("1.2.3.4")], vec![2]);
+        // and such a line in the blocklist file is ignored
+        assert!(parse_list("::/64   # auto until=1 (x) after 3 rate limit bans\n", "t").is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 

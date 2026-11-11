@@ -885,6 +885,64 @@ static void test_parse_v6(void)
     CHECK(run_parse(p, n, &l) == L3_OK && l.proto == 58);
 }
 
+static void set_v6_addr(__u8 *p, size_t off, const char *text)
+{
+    inet_pton(AF_INET6, text, p + off);
+}
+
+static void test_parse_v6_bogus_addresses(void)
+{
+    __u8 p[128];
+    struct l3 l;
+    const char *bad_src[] = {"::1", "::ffff:8.8.4.4", "::1:2:3", "::0.0.0.7", "ff02::1", "ff0e::5"};
+    for (size_t i = 0; i < sizeof(bad_src) / sizeof(bad_src[0]); i++)
+    {
+        size_t n = build_v6(p, 6, 20);
+        set_v6_addr(p, 8, bad_src[i]);
+        CHECK(run_parse(p, n, &l) == L3_BAD);
+        CHECK(l.bogus == BOGUS_ADDR);
+        // still fully parsed: the l4 header and hop limit are known
+        CHECK(l.proto == 6 && l.l4off == 40 && l.hoplimit == 64);
+    }
+
+    size_t n = build_v6(p, 58, 24);
+    set_v6_addr(p, 8, "::");
+    set_v6_addr(p, 24, "ff02::1:ff00:1");
+    CHECK(run_parse(p, n, &l) == L3_BAD);
+    CHECK(l.bogus == BOGUS_UNSPEC && l.proto == 58 && l.l4off == 40);
+
+    const char *bad_dst[] = {"::ffff:10.0.0.10", "::1", "::"};
+    for (size_t i = 0; i < sizeof(bad_dst) / sizeof(bad_dst[0]); i++)
+    {
+        n = build_v6(p, 17, 8);
+        set_v6_addr(p, 24, bad_dst[i]);
+        CHECK(run_parse(p, n, &l) == L3_BAD && l.bogus == BOGUS_ADDR);
+    }
+    // a destination of :: also from an unspecified source is just bogus
+    n = build_v6(p, 17, 8);
+    set_v6_addr(p, 8, "::");
+    set_v6_addr(p, 24, "::ffff:1.2.3.4");
+    CHECK(run_parse(p, n, &l) == L3_BAD && l.bogus == BOGUS_ADDR);
+
+    // just outside ::/80, link-local, unique local and global sources are fine
+    const char *good[] = {"0:0:0:0:1::", "fe80::1", "fd99::2", "2001:db8::1", "fe00::1"};
+    for (size_t i = 0; i < sizeof(good) / sizeof(good[0]); i++)
+    {
+        n = build_v6(p, 6, 20);
+        set_v6_addr(p, 8, good[i]);
+        CHECK(run_parse(p, n, &l) == L3_OK && l.bogus == BOGUS_NONE);
+    }
+    // multicast destinations are fine (neighbour discovery)
+    n = build_v6(p, 58, 24);
+    set_v6_addr(p, 24, "ff02::1");
+    CHECK(run_parse(p, n, &l) == L3_OK && l.bogus == BOGUS_NONE);
+
+    // IPv4 is never bogus, its hop limit is the ttl
+    n = build_v4(p, 6, 0, 20);
+    p[8] = 33;
+    CHECK(run_parse(p, n, &l) == L3_OK && l.bogus == BOGUS_NONE && l.hoplimit == 33);
+}
+
 int main(void)
 {
     test_varint_decodes_known_vectors();
@@ -911,6 +969,7 @@ int main(void)
     test_addr_helpers();
     test_parse_v4();
     test_parse_v6();
+    test_parse_v6_bogus_addresses();
 
     printf("%u checks, %u failures\n", checks_run, checks_failed);
     return checks_failed ? 1 : 0;

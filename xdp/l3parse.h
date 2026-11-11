@@ -19,7 +19,14 @@
 
 #define L3_OK 0
 #define L3_NOT_IP 1 // not IPv4/IPv6: not our business
-#define L3_BAD 2    // IP, but malformed or too many extension headers
+#define L3_BAD 2    // IP, but malformed or too many extension headers, or
+                    // IPv6 with addresses that never appear on the wire (bogus)
+
+// struct l3.bogus: IPv6 addresses that are never legitimate on the wire
+#define BOGUS_NONE 0
+#define BOGUS_UNSPEC 1 // source :: (only neighbour solicitations of duplicate address detection)
+#define BOGUS_ADDR 2   // any other source in ::/80 (::1, v4-mapped, ...) or ff00::/8,
+                       // or a destination in ::/80 (v4-mapped, ::1, ::)
 
 #define MAX_EXT_HDRS 4
 // extension headers end before this offset or the packet is L3_BAD; keeps
@@ -42,6 +49,8 @@ struct l3
     __u8 proto;   // l4 protocol after all extension headers
     __u8 frag;    // FRAG_*
     __u8 tos;     // IPv4 tos / IPv6 traffic class
+    __u8 hoplimit; // IPv4 ttl / IPv6 hop limit
+    __u8 bogus;   // BOGUS_* (IPv6 only, parse result L3_BAD when set)
 };
 
 static __always_inline int is_ext_hdr(const __u8 next)
@@ -75,9 +84,31 @@ static __always_inline int parse_l3_v4(const __u8 *ip, const void *data_end, str
     out->l4off = ihl;
     out->hdrlen = ihl;
     out->l3len = bpf_ntohs(tot);
+    out->hoplimit = ip[8];
     frag_off = bpf_ntohs(frag_off);
     out->frag = (frag_off & 0x1fff) ? FRAG_LATER : (frag_off & 0x2000) ? FRAG_FIRST : FRAG_NONE;
     return L3_OK;
+}
+
+// first 80 bits zero: ::, ::1, the v4-mapped ::ffff:0:0/96 and the
+// deprecated IPv4-compatible ::/96. IPv4 is stored v4-mapped, so such an IPv6
+// address would alias IPv4 state (bans, throttle, targets)
+static __always_inline __u8 addr_in_zero80(const struct addr6 *a)
+{
+    return a->w[0] == 0 && a->w[1] == 0 && (a->w[2] & bpf_htonl(0xffff0000)) == 0;
+}
+
+static __always_inline __u8 v6_bogus(const struct addr6 *src, const struct addr6 *dst)
+{
+    if (addr_in_zero80(dst) || (src->w[0] & bpf_htonl(0xff000000)) == bpf_htonl(0xff000000))
+    {
+        return BOGUS_ADDR;
+    }
+    if (addr_in_zero80(src))
+    {
+        return src->w[2] == 0 && src->w[3] == 0 ? BOGUS_UNSPEC : BOGUS_ADDR;
+    }
+    return BOGUS_NONE;
 }
 
 static __always_inline int parse_l3_v6(const __u8 *ip, const void *data_end, struct l3 *out)
@@ -94,6 +125,7 @@ static __always_inline int parse_l3_v6(const __u8 *ip, const void *data_end, str
     out->family = FAMILY_V6;
     out->tos = ((ip[0] & 0x0f) << 4) | (ip[1] >> 4);
     out->l3len = 40 + bpf_ntohs(plen);
+    out->hoplimit = ip[7];
     out->frag = FRAG_NONE;
 
     __u8 next = ip[6];
@@ -143,7 +175,10 @@ static __always_inline int parse_l3_v6(const __u8 *ip, const void *data_end, str
     out->proto = next;
     out->l4off = off;
     out->hdrlen = off;
-    return L3_OK;
+    // fully parsed (the caller may still look at the l4 header), but never
+    // legitimate: dropped by the XDP program whatever the destination
+    out->bogus = v6_bogus(&out->src, &out->dst);
+    return out->bogus ? L3_BAD : L3_OK;
 }
 
 // *out is always fully initialised (zeroed first), also on L3_BAD/L3_NOT_IP;

@@ -91,6 +91,17 @@ impl Net {
     pub fn overlaps(&self, other: &Net) -> bool {
         self.covers(other) || other.covers(self)
     }
+
+    /// True for an IPv6 network sharing addresses with ::ffff:0:0/96: the
+    /// kernel stores IPv4 v4-mapped, so in its tries and masks such a
+    /// network (`::/0`, `::/64`, `::ffff:0:0/100`, ...) also matches IPv4.
+    pub fn overlaps_v4_mapped(&self) -> bool {
+        let mapped = Net {
+            addr: IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0)),
+            len: 96,
+        };
+        self.addr.is_ipv6() && self.overlaps(&mapped)
+    }
 }
 
 /// A single host (/32, /128) shows as the bare address, like the IPv4-only
@@ -231,6 +242,23 @@ mod tests {
         assert!(!n("2001:db8:1:2::/64").overlaps(&n("2001:db8:1:3::/64")));
         assert!(!n("0.0.0.0/0").covers(&n("::/0")));
         assert!(!n("::/0").overlaps(&n("1.2.3.4/32")));
+    }
+
+    #[test]
+    fn v4_mapped_overlap() {
+        let n = |t: &str| {
+            let (a, l) = t.split_once('/').unwrap();
+            Net {
+                addr: a.parse().unwrap(),
+                len: l.parse().unwrap(),
+            }
+        };
+        for net in ["::/0", "::/8", "::/64", "::/80", "::ffff:0:0/96", "::ffff:1.2.3.0/120", "::ffff:0:0/100"] {
+            assert!(n(net).overlaps_v4_mapped(), "{net}");
+        }
+        for net in ["::/96", "::1/128", "::1:0:0/96", "2001:db8::/32", "0.0.0.0/0", "1.2.3.0/24"] {
+            assert!(!n(net).overlaps_v4_mapped(), "{net}");
+        }
     }
 
     #[test]

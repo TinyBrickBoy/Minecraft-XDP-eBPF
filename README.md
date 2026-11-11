@@ -53,7 +53,14 @@ This fork of [Outfluencer/Minecraft-XDP-eBPF](https://github.com/Outfluencer/Min
   entries and `exclude` entries that are never filtered.
 - **IPv6**: every feature works for IPv6 destinations and sources. Targets
   are written as `"[2001:db8::10]:25565"`, networks as `"2001:db8::/48"`;
-  v4-mapped input (`::ffff:a.b.c.d`) is rejected, write IPv4 as `a.b.c.d`.
+  v4-mapped input (`::ffff:a.b.c.d`) and IPv6 networks overlapping
+  `::ffff:0:0/96` (`::/0`, `::/64`, ...) are rejected, write IPv4 as
+  `a.b.c.d`; the kernel stores IPv4 v4-mapped, so such a network would also
+  match every IPv4 address (automatic bans are never escalated to one).
+  IPv6 packets from `::/80` (`::1`, v4-mapped, ...) or multicast sources and
+  to `::/80` destinations never appear on the wire and are dropped for every
+  destination; only neighbour solicitations from `::` (duplicate address
+  detection) pass.
   Throttle, rate limit, strikes, bans and the penalty box count IPv6
   sources per `[filter] ipv6_source_prefix` (default /64). IPv6 fragments
   to protected targets are dropped. Packets with more than four extension

@@ -845,7 +845,14 @@ pub fn parse_cidr(entry: &str) -> Result<crate::addr::Net> {
     if len > max {
         bail!("prefix length of '{entry}' must be <= {max}");
     }
-    Ok(crate::addr::Net { addr, len })
+    let net = crate::addr::Net { addr, len };
+    if net.overlaps_v4_mapped() {
+        bail!(
+            "'{entry}' overlaps ::ffff:0:0/96, where the filter keeps IPv4: it would also match IPv4 \
+             addresses; write IPv4 networks as a.b.c.d/len"
+        );
+    }
+    Ok(net)
 }
 
 impl AutodetectConfig {
@@ -1078,6 +1085,23 @@ mod tests {
         assert!(parse_exclude("[::ffff:1.2.3.4]:443/tcp").is_err());
         let err = parse_cidr("::ffff:1.2.3.4").unwrap_err().to_string();
         assert_eq!(err, "write IPv4 addresses as a.b.c.d, not ::ffff:a.b.c.d (in '::ffff:1.2.3.4')");
+    }
+
+    #[test]
+    fn v6_nets_overlapping_ipv4_are_rejected() {
+        for entry in ["::/0", "::/8", "::/64", "::/80"] {
+            let err = format!("{:#}", parse_cidr(entry).unwrap_err());
+            assert!(err.contains(&format!("'{entry}' overlaps ::ffff:0:0/96")), "{err}");
+        }
+        assert!(parse_cidr("::1").is_ok());
+        assert!(parse_cidr("2001:db8::/32").is_ok());
+        assert!(parse_cidr("0.0.0.0/0").is_ok());
+        let mut cfg = Config::default();
+        cfg.ratelimit.allow = vec!["::/0".into()];
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config::default();
+        cfg.blocklist.whitelist = vec!["::/64".into()];
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
