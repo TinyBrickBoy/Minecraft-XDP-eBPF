@@ -19,6 +19,7 @@ Clients exit 0 on the expected outcome, 1 otherwise:
   syn-dropped                 a TCP connect is NOT answered within 1 s (throttled)
   v6-ext-chain N  RakNet ping (raw IPv6) behind N extension headers is answered
   v6-fragment     RakNet ping (raw IPv6) as an atomic fragment is answered
+  v6-ext-echo N, v6-fragment-echo  the same to a udp echo service
 Server: udp-echo-server, http-server, https-server CERT KEY
 """
 import os
@@ -474,15 +475,19 @@ def _checksum(data):
     total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
     while total >> 16:
         total = (total & 0xFFFF) + (total >> 16)
-    return ~total & 0xFFFF
+    # a computed 0 is sent as 0xFFFF: 0 means "no checksum", which IPv6
+    # forbids for UDP (RFC 8200 8.1)
+    return (~total & 0xFFFF) or 0xFFFF
 
 
-def _v6_raknet_ping(host, port, ext_types):
-    """Sends a RakNet unconnected ping to host:port behind the given IPv6
-    extension headers (raw socket, header included) and returns True when a
-    pong comes back within 2 s."""
+V6_PING = b"\x01" + struct.pack(">q", 1) + MAGIC + struct.pack(">q", 2)
+
+
+def _v6_udp_exchange(host, port, ext_types, payload=V6_PING):
+    """Sends a datagram to host:port behind the given IPv6 extension headers
+    (raw socket, header included) and returns the answer received within
+    2 s, or None."""
     src = os.environ.get("E2E_BIND", "fd99:0::2")
-    payload = b"\x01" + struct.pack(">q", 1) + MAGIC + struct.pack(">q", 2)
     rx = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
     rx.bind((src, 0))
     rx.settimeout(2)
@@ -511,25 +516,46 @@ def _v6_raknet_ping(host, port, ext_types):
     raw = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_RAW)
     raw.sendto(ip6 + exts + udp, (host, 0))
     try:
-        data, _ = rx.recvfrom(2048)
-        return data[:1] == b"\x1c"  # unconnected pong
+        return rx.recvfrom(2048)[0]
     except socket.timeout:
-        return False
+        return None
     finally:
         raw.close()
         rx.close()
 
 
-def v6_ext_chain(host, port, count):
+def _v6_raknet_ping(host, port, ext_types):
+    """True when a RakNet unconnected pong comes back (see bedrock_ping)."""
+    reply = _v6_udp_exchange(host, port, ext_types)
+    return bool(reply) and reply[0] == 0x1C and reply[17:33] == MAGIC
+
+
+def _v6_echo(host, port, ext_types):
+    """True when a udp echo service sends the datagram back."""
+    return _v6_udp_exchange(host, port, ext_types) == V6_PING
+
+
+def _ext_chain(count):
     """count extension headers: one hop-by-hop first (it must come first),
     then destination options."""
     count = int(count)
-    kinds = ([NEXTHDR_HOP] if count else []) + [NEXTHDR_DEST] * max(count - 1, 0)
-    return _v6_raknet_ping(host, port, kinds)
+    return ([NEXTHDR_HOP] if count else []) + [NEXTHDR_DEST] * max(count - 1, 0)
+
+
+def v6_ext_chain(host, port, count):
+    return _v6_raknet_ping(host, port, _ext_chain(count))
 
 
 def v6_fragment(host, port):
     return _v6_raknet_ping(host, port, [NEXTHDR_FRAGMENT])
+
+
+def v6_ext_echo(host, port, count):
+    return _v6_echo(host, port, _ext_chain(count))
+
+
+def v6_fragment_echo(host, port):
+    return _v6_echo(host, port, [NEXTHDR_FRAGMENT])
 
 
 def main():
@@ -561,7 +587,8 @@ def main():
               "login-uuid": login_uuid, "login-uuid-rejected": login_uuid_rejected,
               "connect-spam": connect_spam, "syn-dropped": syn_dropped, "penalty-message": penalty_message,
               "no-penalty-message": no_penalty_message, "dns-answer": dns_answer,
-              "v6-ext-chain": v6_ext_chain, "v6-fragment": v6_fragment}[cmd]
+              "v6-ext-chain": v6_ext_chain, "v6-fragment": v6_fragment,
+              "v6-ext-echo": v6_ext_echo, "v6-fragment-echo": v6_fragment_echo}[cmd]
         try:
             ok = fn(host, port, *extra)
         except Exception as e:  # noqa: BLE001 - any failure is a test failure

@@ -64,6 +64,13 @@ ip route add 10.99.3.7/32 via 10.99.1.2
 ip -6 route add unreachable fd99:3::/64
 ip -n sv -6 addr add fd99:3::7/128 dev lo nodad
 ip -6 route add fd99:3::7/128 via fd99:1::2
+# statically protected servers: fd99:4::/64 is outside the autodetect
+# networks, so only [targets] protects them (the sv servers bind "::")
+ip -n sv -6 addr add fd99:4::2/128 dev lo nodad
+ip -6 route add fd99:4::2/128 via fd99:1::2
+# bound to the address: a "::" udp socket would answer from fd99:1::2 (the
+# outgoing interface's address), which the client does not accept
+ip netns exec sv $MC bedrock-server fd99:4::2 19140 &
 ip netns exec sv $MC udp-echo-server 10.99.3.7 40001 &
 ip netns exec sv $MC udp-echo-server 10.99.3.7 53 &   # "DNS server" (echoes the query id)
 ip netns exec sv $MC udp-echo-server fd99:3::7 40001 &
@@ -100,6 +107,8 @@ echo "== raw IPv6 helpers without the filter"
 check "v6 2 ext headers answered unfiltered"   cl $MC v6-ext-chain fd99:1::2 19132 2
 check "v6 5 ext headers answered unfiltered"   cl $MC v6-ext-chain fd99:1::2 19132 5
 check "v6 atomic fragment answered unfiltered" cl $MC v6-fragment fd99:1::2 19132
+check "v6 5 ext headers echoed unfiltered"     cl $MC v6-ext-echo fd99:3::7 40001 5
+check "v6 atomic fragment echoed unfiltered"   cl $MC v6-fragment-echo fd99:3::7 40001
 
 echo "== sessions established before the filter starts"
 cl $MC player 10.99.1.2 25565 45 & PLAYER=$!
@@ -116,6 +125,9 @@ start_port = 0
 end_port = 0
 adopt_grace_secs = 15
 online_names = false
+[targets]
+java = ["[fd99:4::2]:25565"]
+bedrock = ["[fd99:4::2]:19140"]
 [autodetect]
 enabled = true
 networks = ["10.99.1.0/24", "10.99.2.0/24", "fd99:1::/64", "fd99:2::/64"]
@@ -224,6 +236,12 @@ check "bedrock new session works"   cl $MC bedrock-session 10.99.1.2 19132 3
 check "v6 bedrock new session works" cl $MC bedrock-session fd99:1::2 19132 3
 check "bedrock garbage dropped"     cl $MC bedrock-garbage 10.99.1.2 19132
 check "v6 bedrock garbage dropped"  cl $MC bedrock-garbage fd99:1::2 19132
+check "v6 static targets configured" bash -c "grep -qF 'Target [fd99:4::2]:25565/tcp: java (static)' $T/loader.log && grep -qF 'Target [fd99:4::2]:19140/udp: bedrock (static)' $T/loader.log"
+check "v6 static targets not autodetected" bash -c "! grep -F '[fd99:4::2]' $T/loader.log | grep -q '(auto)'"
+check "v6 static java status works" cl $MC status fd99:4::2 25565
+check "v6 static java garbage dropped" cl $MC garbage fd99:4::2 25565
+check "v6 static bedrock ping works" cl $MC bedrock-ping fd99:4::2 19140
+check "v6 static bedrock garbage dropped" cl $MC bedrock-garbage fd99:4::2 19140
 check "old java player survived"    wait $PLAYER
 check "v6 old java player survived" wait $PLAYER6
 check "old bedrock session survived" wait $BEDROCK
@@ -234,14 +252,31 @@ check "v6 old http keep-alive survived" wait $KEEPALIVE6
 echo "== ipv6: extension headers and fragments to a protected target"
 check "v6 ping without ext headers"          cl $MC v6-ext-chain fd99:1::2 19132 0
 check "v6 2 ext headers to target pass"      cl $MC v6-ext-chain fd99:1::2 19132 2
+check "v6 4 ext headers (the limit) pass"    cl $MC v6-ext-chain fd99:1::2 19132 4
 check "v6 5 ext headers to target dropped"   bash -c "! ip netns exec cl $MC v6-ext-chain fd99:1::2 19132 5"
 check "v6 atomic fragment to target dropped" bash -c "! ip netns exec cl $MC v6-fragment fd99:1::2 19132"
+# an address without targets: unparseable chains and fragments pass
+check "v6 5 ext headers to unprotected pass"   cl $MC v6-ext-echo fd99:3::7 40001 5
+check "v6 atomic fragment to unprotected passes" cl $MC v6-fragment-echo fd99:3::7 40001
 
 echo "== ipv6: connection throttle per /64"
 # a burst from one /64 exceeds hit_count (10 per 3 s): another address of
-# the same /64 is throttled too, a source in another /64 still gets through
-cl env E2E_BIND=fd99:0:0:a::2 $MC connect-spam fd99:1::2 25565 15
-check "v6 same /64 throttled"     cl env E2E_BIND=fd99:0:0:a::3 $MC syn-dropped fd99:1::2 25565
+# the same /64 is throttled too, a source in another /64 still gets through.
+# The control (a bare connect, which does not make the /64 a verified
+# client for the penalty box) is hit 1, the burst hits 2-12: 9 connect at
+# once, 3 dropped ones cost 0.3 s each, so the 1 s syn-dropped check ends
+# about 2 s into the 3 s window. The throttle counts per source, whatever
+# the target: the check goes to the static target, whose drop counter
+# nothing else touches at that time (the burst's drops are counted at
+# fd99:1::2 and may still be on their way to the metrics)
+dropped_v6() { curl -s 127.0.0.1:1999/metrics | awk 'index($0, "minecraft_target_dropped_packets{") == 1 && /dst_ip="fd99:4::2"/ && /dst_port="25565"/ {s+=$2} END{print s+0}'; }
+check "v6 same /64 reachable before the burst" bash -c "! ip netns exec cl env E2E_BIND=fd99:0:0:a::3 $MC syn-dropped fd99:1::2 25565"
+cl env E2E_BIND=fd99:0:0:a::2 $MC connect-spam fd99:1::2 25565 11
+before=$(dropped_v6)
+check "v6 same /64 throttled"     cl env E2E_BIND=fd99:0:0:a::3 $MC syn-dropped fd99:4::2 25565
+sleep 1.5   # metrics poll every second
+after=$(dropped_v6)
+check "v6 throttle drops counted ($before -> $after)" test "$after" -gt "$before"
 check "v6 other /64 unaffected"   cl env E2E_BIND=fd99:0:0:b::2 $MC status fd99:1::2 25565
 
 echo "== online mode"
@@ -454,10 +489,17 @@ cl $B $MC udp-flood 10.99.1.2 40000 4000
 cl $B6 $MC udp-flood fd99:1::2 40000 4000; sleep 3
 check "2nd ban writes auto entry"     grep -q '^10.99.0.3 .*auto until=' $T/blocklist.txt
 check "v6 2nd ban writes auto entry for the /64" grep -q '^fd99:0:0:3::/64 .*auto until=' $T/blocklist.txt
+# the gauge follows the file (reload and metrics poll every second); the
+# dns-scan entries idle out 12 s after their last query, so the file is
+# the reference instead of a fixed number
+for i in $(seq 1 8); do
+    in_file=$(grep -c 'auto until=' $T/blocklist.txt); gauge=$(metric xdp_blocklist_auto_entries)
+    [ "${gauge:-0}" = "$in_file" ] && break; sleep 0.5
+done
+check "auto entries counted (${gauge:-0} of $in_file, both families)" bash -c "test '${gauge:-0}' = '$in_file' -a '$in_file' -ge 2 && grep -q '^fd99:.*auto until=' $T/blocklist.txt && grep -q '^10\.99\..*auto until=' $T/blocklist.txt"
 sleep 4
 check "still dropped after the ban"   cl $B $MC udp-no-echo 10.99.1.2 40000 5008
 check "v6 still dropped after the ban" cl $B6 $MC udp-no-echo fd99:1::2 40000 5008
-check "auto entries counted"          bash -c "test \"\$(curl -s 127.0.0.1:1999/metrics | awk '\$1==\"xdp_blocklist_auto_entries\"{print \$2}')\" -ge 2"
 check "logged"                        grep -q 'Auto blocklist: 10.99.0.3 banned 2 times' $T/loader.log
 check "v6 logged"                     grep -q 'Auto blocklist: fd99:0:0:3::/64 banned 2 times' $T/loader.log
 # the source stays silent now: removed after auto_idle_secs, long before auto_duration_secs
@@ -489,7 +531,33 @@ check "v6 bedrock session survived restart" wait $BEDROCK6
 sleep 13
 check "garbage dropped after restart" cl $MC garbage 10.99.1.2 25565
 check "v6 garbage dropped after restart" cl $MC garbage fd99:1::2 25565
+kill $LOADER; wait $LOADER 2>/dev/null
 
+echo "== IPv4-only config (as written for the versions before IPv6)"
+cat > $T/config4.toml <<CONF
+[filter]
+start_port = 0
+end_port = 0
+adopt_grace_secs = 0
+[targets]
+java = ["10.99.1.2:25565"]
+bedrock = ["10.99.1.2:19132"]
+[autodetect]
+enabled = false
+[xdp]
+mode = "skb"
+[metrics]
+enabled = true
+addr = "127.0.0.1:1999"
+poll_secs = 1
+CONF
+mark=$(wc -l < $T/loader.log)
+(cd $T && exec "$OLDPWD/$BIN" --config $T/config4.toml c0 >> $T/loader.log 2>&1) & LOADER=$!
+for i in $(seq 1 20); do tail -n +$((mark + 1)) $T/loader.log | grep -q 'BPF program attached to interface c0' && break; sleep 0.5; done
+check "IPv4-only config loads" bash -c "kill -0 $LOADER && tail -n +$((mark + 1)) $T/loader.log | grep -q 'BPF program attached to interface c0'"
+check "IPv4-only: java status works"     cl $MC status 10.99.1.2 25565
+check "IPv4-only: java garbage dropped"  cl $MC garbage 10.99.1.2 25565
+check "IPv4-only: bedrock ping works"    cl $MC bedrock-ping 10.99.1.2 19132
 kill $LOADER; wait $LOADER 2>/dev/null
 grep -E 'WARN|ERROR' $T/loader.log | sed 's/^/        /'
 [ $FAILS -gt 0 ] && cp $T/loader.log "${E2E_LOG:-/dev/null}" 2>/dev/null
