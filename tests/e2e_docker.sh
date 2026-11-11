@@ -608,6 +608,7 @@ sleep 0.5
 mark=$(wc -l < $T/loader.log)
 (cd $T && exec "$OLDPWD/$BIN" --config $T/config5.toml c0 >> $T/loader.log 2>&1) & LOADER=$!
 for i in $(seq 1 20); do tail -n +$((mark + 1)) $T/loader.log | grep -q 'Penalty box: throttled' && break; sleep 0.5; done
+check "v4-only penalty config loads" bash -c "kill -0 $LOADER && tail -n +$((mark + 1)) $T/loader.log | grep -q 'Penalty box: throttled'"
 check "v6 service bind failure logged" bash -c "tail -n +$((mark + 1)) $T/loader.log | grep -qF 'listen on [fd99::1]:25599'"
 check "notrack rule on a java port warned about" bash -c "tail -n +$((mark + 1)) $T/loader.log | grep -q 'notrack rule may hit java targets.*25566'"
 nft delete table inet e2e_raw
@@ -636,9 +637,9 @@ max_verified_per_ipv4 = 2
 player_idle_timeout_secs = 2
 [targets]
 java = ["10.99.1.2:25565", "[fd99:1::2]:25565"]
+bedrock = ["10.99.1.2:19132"]
 [autodetect]
 enabled = false
-bedrock = ["10.99.1.2:19132"]
 [penalty]
 enabled = false
 [blocklist]
@@ -661,6 +662,8 @@ CONF
 mark=$(wc -l < $T/loader.log)
 (cd $T && exec "$OLDPWD/$BIN" --config $T/config6.toml c0 >> $T/loader.log 2>&1) & LOADER=$!
 for i in $(seq 1 20); do tail -n +$((mark + 1)) $T/loader.log | grep -q 'BPF program attached to interface c0' && break; sleep 0.5; done
+# every check below would also pass without a filter
+check "aggregate tier config loads" bash -c "kill -0 $LOADER && tail -n +$((mark + 1)) $T/loader.log | grep -q 'BPF program attached to interface c0'"
 # 6 + 5 SYNs from two /64s: the /48 is over its 10 while each /64 is not
 cl env E2E_BIND=fd99:0:0:a::2 $MC connect-spam fd99:1::2 25565 6
 cl env E2E_BIND=fd99:0:0:b::2 $MC connect-spam fd99:1::2 25565 5
