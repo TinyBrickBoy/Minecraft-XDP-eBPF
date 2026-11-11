@@ -33,6 +33,9 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
     let hit_count: u32 = filter.hit_count;
     let ipv6_source_prefix: u32 = u32::from(filter.ipv6_source_prefix);
     // the coarser IPv6 tier of the handshake throttle (0 = off)
+    if let Some(warning) = filter.aggregate_warning() {
+        log::warn!("{warning}");
+    }
     let ipv6_aggregate_prefix: u32 = filter.aggregate_prefix().map_or(0, u32::from);
     let verified_per_ipv4: u32 = filter.max_verified_per_ipv4;
     let verified_per_ipv6_prefix: u32 = filter.max_verified_per_ipv6_prefix;

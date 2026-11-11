@@ -216,7 +216,7 @@ restart the loader. Use `--config <path>` to point at a different file.
 | `player_idle_timeout_secs` | int | 60 | Idle timeout for verified connections; an idle entry is removed in-kernel after one to two intervals, requiring a new handshake. |
 | `online_names` | bool   | true    | Enforce online-mode usernames (≤16 chars). |
 | `ipv6_source_prefix` | int | 64 | Prefix length per IPv6 source for throttling, rate limits and bans (32–128). IPv4 is always per address. |
-| `ipv6_aggregate_prefix` | int | 48 | Second, coarser IPv6 tier of the connection throttle (16–`ipv6_source_prefix`; equal turns it off). |
+| `ipv6_aggregate_prefix` | int | 48 | Second, coarser IPv6 tier of the connection throttle and the verified connection cap (16–128; a value not shorter than `ipv6_source_prefix` turns the tier off, with a warning when longer). |
 | `ipv6_aggregate_factor` | int | 8 | SYN budget of the aggregate tier as a multiple of `hit_count` (1–1024). |
 | `max_verified_per_ipv4` | int | 64 | Verified (java and bedrock) connections per IPv4 address; further handshakes of the address are dropped until one goes idle (`0` = no cap, max 1048576). |
 | `max_verified_per_ipv6_prefix` | int | 64 | The same per IPv6 `ipv6_source_prefix`. |

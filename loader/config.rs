@@ -40,8 +40,9 @@ ipv6_source_prefix = 64
 # its 65536 /64s must not multiply its budget. Each aggregate prefix may
 # open ipv6_aggregate_factor times hit_count new connections per window; a
 # source is throttled when either tier is over its limit. Rate limit,
-# strikes and bans stay per ipv6_source_prefix. The prefix is valid
-# 16..=ipv6_source_prefix (equal turns the tier off), the factor 1..=1024.
+# strikes and bans stay per ipv6_source_prefix. The prefix is valid 16..=128;
+# not shorter than ipv6_source_prefix turns the tier off (with a warning when
+# longer), the factor is valid 1..=1024.
 ipv6_aggregate_prefix = 48
 ipv6_aggregate_factor = 8
 
@@ -802,12 +803,9 @@ impl FilterConfig {
             );
         }
         check_range("[filter] ipv6_source_prefix", u64::from(self.ipv6_source_prefix), 32, 128)?;
-        check_range(
-            "[filter] ipv6_aggregate_prefix",
-            u64::from(self.ipv6_aggregate_prefix),
-            16,
-            u64::from(self.ipv6_source_prefix),
-        )?;
+        // not finer than ipv6_source_prefix: then the tier is off (with a
+        // warning at load, see aggregate_warning), never a failed start
+        check_range("[filter] ipv6_aggregate_prefix", u64::from(self.ipv6_aggregate_prefix), 16, 128)?;
         check_range("[filter] ipv6_aggregate_factor", u64::from(self.ipv6_aggregate_factor), 1, 1024)?;
         for (option, value) in [
             ("[filter] max_verified_per_ipv4", self.max_verified_per_ipv4),
@@ -838,6 +836,18 @@ impl FilterConfig {
     /// (equal to the source prefix: the tier would count the same keys).
     pub fn aggregate_prefix(&self) -> Option<u8> {
         (self.ipv6_aggregate_prefix < self.ipv6_source_prefix).then_some(self.ipv6_aggregate_prefix)
+    }
+
+    /// The warning to log when the aggregate tier is configured but off
+    /// because it is not coarser than the source prefix.
+    pub fn aggregate_warning(&self) -> Option<String> {
+        (self.ipv6_aggregate_prefix > self.ipv6_source_prefix).then(|| {
+            format!(
+                "[filter] ipv6_aggregate_prefix ({}) is longer than ipv6_source_prefix ({}): the IPv6 aggregate tier \
+                 (throttle and verified connection cap per aggregate prefix) is off",
+                self.ipv6_aggregate_prefix, self.ipv6_source_prefix
+            )
+        })
     }
 
     /// A per-source limit scaled for the aggregate tier.
@@ -1187,18 +1197,23 @@ mod tests {
         cfg.filter.ipv6_aggregate_prefix = 64;
         cfg.validate().unwrap();
         assert_eq!(cfg.filter.aggregate_prefix(), None);
-        for (prefix, factor) in [(15u8, 8u32), (65, 8), (48, 0), (48, 1025)] {
+        for (prefix, factor) in [(15u8, 8u32), (129, 8), (48, 0), (48, 1025)] {
             let mut cfg = Config::default();
             cfg.filter.ipv6_aggregate_prefix = prefix;
             cfg.filter.ipv6_aggregate_factor = factor;
             assert!(cfg.validate().is_err(), "{prefix} {factor}");
         }
-        // bounded by the source prefix
+        // longer than the source prefix: the tier is off with a warning,
+        // the config still loads (a failed start would leave no filter)
         let mut cfg = Config::default();
         cfg.filter.ipv6_source_prefix = 40;
-        assert!(cfg.validate().is_err());
+        cfg.validate().unwrap();
+        assert_eq!(cfg.filter.aggregate_prefix(), None);
+        assert!(cfg.filter.aggregate_warning().unwrap().contains("ipv6_aggregate_prefix (48) is longer than ipv6_source_prefix (40)"));
+        assert!(Config::default().filter.aggregate_warning().is_none());
         cfg.filter.ipv6_aggregate_prefix = 32;
         cfg.validate().unwrap();
+        assert_eq!(cfg.filter.aggregate_prefix(), Some(32));
         // IPv4-only configs load unchanged
         let v4: Config = toml::from_str("[filter]\nhit_count = 5").unwrap();
         v4.validate().unwrap();
@@ -1222,9 +1237,6 @@ mod tests {
     fn ipv6_source_prefix_validation() {
         let mut ok = Config::default();
         ok.filter.ipv6_source_prefix = 32;
-        // the aggregate tier must not be finer than the source prefix
-        assert!(ok.validate().is_err());
-        ok.filter.ipv6_aggregate_prefix = 32;
         assert!(ok.validate().is_ok());
         let mut cfg = Config::default();
         assert_eq!(cfg.filter.ipv6_source_prefix, 64);
