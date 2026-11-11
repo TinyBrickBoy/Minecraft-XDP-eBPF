@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use aya::Pod;
-use aya::maps::{HashMap, MapData};
+use aya::maps::{HashMap, MapData, MapError};
 use log::{info, warn};
 
 use crate::addr::Addr6;
@@ -161,6 +161,8 @@ impl Targets {
                 return Ok(());
             }
             if old_kind == kind && old_source == source {
+                // retries a protected_addrs update that failed earlier
+                self.sync_addr(&entries, key.ip());
                 return Ok(());
             }
         }
@@ -184,9 +186,15 @@ impl Targets {
     /// Keeps `protected_addrs` equal to the set of addresses with at least
     /// one protecting entry (Kind::None does not protect).
     fn sync_addr(&self, entries: &StdHashMap<DstKey, (Kind, Source)>, ip: Addr6) {
-        let used = entries.iter().any(|(k, &(kind, _))| k.ip() == ip && kind != Kind::None);
         let mut addrs = self.addrs.lock().unwrap();
-        let result = if used { addrs.insert(ip, 1, 0) } else { addrs.remove(&ip).or(Ok(())) };
+        let result = if protects(entries, ip) {
+            addrs.insert(ip, 1, 0)
+        } else {
+            match addrs.remove(&ip) {
+                Err(MapError::KeyNotFound) => Ok(()),
+                other => other,
+            }
+        };
         if let Err(e) = result {
             warn!("Failed to update protected address {ip}: {e}");
         }
@@ -247,6 +255,11 @@ impl Targets {
     }
 }
 
+/// Whether some entry protects `ip` (Kind::None does not).
+fn protects(entries: &StdHashMap<DstKey, (Kind, Source)>, ip: Addr6) -> bool {
+    entries.iter().any(|(k, &(kind, _))| k.ip() == ip && kind != Kind::None)
+}
+
 /// CLOCK_MONOTONIC in nanoseconds, the clock behind bpf_ktime_get_ns().
 pub fn monotonic_ns() -> u64 {
     let mut ts = libc::timespec {
@@ -276,6 +289,23 @@ mod tests {
         assert_eq!(key.addr(), v6);
         assert_eq!(key.to_string(), "[2001:db8::10]:19132/udp");
         assert_eq!(std::mem::size_of::<DstKey>(), 20);
+    }
+
+    #[test]
+    fn protects_follows_entries() {
+        let a = DstKey::new("10.0.0.1:25565".parse().unwrap(), PROTO_TCP);
+        let a2 = DstKey::new("10.0.0.1:25566".parse().unwrap(), PROTO_TCP);
+        let b = DstKey::new("10.0.0.2:25565".parse().unwrap(), PROTO_TCP);
+        let mut entries = StdHashMap::new();
+        assert!(!protects(&entries, a.ip()));
+        entries.insert(a, (Kind::Java, Source::Static));
+        assert!(protects(&entries, a.ip()));
+        assert!(!protects(&entries, b.ip()));
+        entries.insert(a2, (Kind::Bedrock, Source::Auto));
+        entries.remove(&a);
+        assert!(protects(&entries, a.ip()));
+        entries.insert(a2, (Kind::None, Source::Exclude));
+        assert!(!protects(&entries, a.ip()));
     }
 
     #[test]
