@@ -26,6 +26,9 @@ const NFT_FAMILY: &str = "inet";
 const NFT_LEGACY_FAMILY: &str = "ip";
 const PENALTY_MARK: u32 = 0x400_0000;
 const MAX_CONNECTIONS: usize = 64;
+/// `penalty_ready` bits (PENALTY_READY_* in xdp/penalty.h).
+const READY_V4: u64 = 1;
+const READY_V6: u64 = 2;
 
 /// Removes the redirect again when dropped.
 pub struct Redirect;
@@ -71,11 +74,47 @@ fn select_addrs(addrs: impl IntoIterator<Item = IpAddr>) -> (Option<Ipv4Addr>, O
     for addr in addrs {
         match addr {
             IpAddr::V4(a) => v4 = v4.or(Some(a)),
-            IpAddr::V6(a) if !is_link_local_v6(&a) => v6 = v6.or(Some(a)),
+            IpAddr::V6(a) if !is_link_local_v6(&a) && !a.is_loopback() => v6 = v6.or(Some(a)),
             IpAddr::V6(_) => {}
         }
     }
     (v4, v6)
+}
+
+/// The service addresses: those of `interface`; without an IPv6 address
+/// there, any global IPv6 address of the host (the redirect only needs a
+/// local address, not one on the interface).
+fn service_addrs(addrs: &[(String, IpAddr)], interface: &str) -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
+    let (v4, v6) = select_addrs(addrs.iter().filter(|(name, _)| name == interface).map(|(_, a)| *a));
+    (v4, v6.or_else(|| select_addrs(addrs.iter().map(|(_, a)| *a)).1))
+}
+
+/// Binds the service per family; a family that can not be bound is left
+/// out (its penalized sources are then throttled like without the penalty
+/// box), it never takes the other family down.
+fn bind_families(
+    listen4: Option<SocketAddrV4>,
+    listen6: Option<SocketAddrV6>,
+) -> (Vec<TcpListener>, Option<SocketAddrV4>, Option<SocketAddrV6>) {
+    let mut listeners = Vec::new();
+    let mut bind = |addr: SocketAddr| match TcpListener::bind(addr) {
+        Ok(listener) => {
+            listeners.push(listener);
+            true
+        }
+        Err(e) => {
+            warn!("Penalty box: can't listen on {addr} ({e}), off for {}", if addr.is_ipv4() { "IPv4" } else { "IPv6" });
+            false
+        }
+    };
+    let bound4 = listen4.filter(|a| bind(SocketAddr::V4(*a)));
+    let bound6 = listen6.filter(|a| bind(SocketAddr::V6(*a)));
+    (listeners, bound4, bound6)
+}
+
+/// The `penalty_ready` value for the bound families.
+fn ready_bits(v4: bool, v6: bool) -> u64 {
+    (if v4 { READY_V4 } else { 0 }) | (if v6 { READY_V6 } else { 0 })
 }
 
 /// Sets everything up when enabled. Any failure leaves the penalty box off
@@ -90,18 +129,21 @@ pub fn setup(
     if !p.enabled {
         return Ok(None);
     }
-    let (v4, v6) = interface_addrs(interface);
+    let (v4, v6) = service_addrs(&host_addrs(), interface);
     if v4.is_none() && v6.is_none() {
         bail!("no IPv4 or IPv6 address on {interface}");
     }
-    let listen4 = v4.map(|ip| SocketAddrV4::new(ip, p.port));
-    let listen6 = v6.map(|ip| SocketAddrV6::new(ip, p.port, 0, 0));
-    let listeners: Vec<TcpListener> = listen4
-        .map(SocketAddr::V4)
-        .into_iter()
-        .chain(listen6.map(SocketAddr::V6))
-        .map(|a| TcpListener::bind(a).with_context(|| format!("can't listen on {a}")))
-        .collect::<Result<_>>()?;
+    if v4.is_none() {
+        info!("Penalty box: no IPv4 address on {interface}, off for IPv4");
+    }
+    if v6.is_none() {
+        info!("Penalty box: no global IPv6 address on this host, off for IPv6");
+    }
+    let (listeners, listen4, listen6) =
+        bind_families(v4.map(|ip| SocketAddrV4::new(ip, p.port)), v6.map(|ip| SocketAddrV6::new(ip, p.port, 0, 0)));
+    if listeners.is_empty() {
+        bail!("can't listen on port {} for any family", p.port);
+    }
     for l in &listeners {
         l.set_nonblocking(true)?;
     }
@@ -129,7 +171,8 @@ pub fn setup(
 
     let mut ready: Array<MapData, u64> =
         Array::try_from(ebpf.take_map("penalty_ready").context("can't take map 'penalty_ready'")?)?;
-    ready.set(0, 1, 0)?;
+    // only the families with a listener and a redirect rule
+    ready.set(0, ready_bits(listen4.is_some(), listen6.is_some()), 0)?;
     info!(
         "Penalty box: throttled real clients see \"{}\" for {} s (service on {service})",
         p.message, p.seconds
@@ -173,11 +216,12 @@ pub fn setup(
     Ok(Some((redirect, handle)))
 }
 
-fn interface_addrs(interface: &str) -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
+/// Every address of the host with its interface name.
+fn host_addrs() -> Vec<(String, IpAddr)> {
     let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs allocates the list, freed below.
     if unsafe { libc::getifaddrs(&mut ifaddrs) } != 0 {
-        return (None, None);
+        return Vec::new();
     }
     let mut addrs = Vec::new();
     let mut current = ifaddrs;
@@ -186,16 +230,16 @@ fn interface_addrs(interface: &str) -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
         let entry = unsafe { &*current };
         // SAFETY: ifa_name is a valid C string.
         let name = unsafe { std::ffi::CStr::from_ptr(entry.ifa_name) }.to_string_lossy();
-        if name == interface && !entry.ifa_addr.is_null() {
+        if !entry.ifa_addr.is_null() {
             // SAFETY: non-null, family checked before each cast.
             match unsafe { (*entry.ifa_addr).sa_family } as i32 {
                 libc::AF_INET => {
                     let sin = unsafe { &*(entry.ifa_addr as *const libc::sockaddr_in) };
-                    addrs.push(IpAddr::V4(Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes())));
+                    addrs.push((name.to_string(), IpAddr::V4(Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes()))));
                 }
                 libc::AF_INET6 => {
                     let sin6 = unsafe { &*(entry.ifa_addr as *const libc::sockaddr_in6) };
-                    addrs.push(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)));
+                    addrs.push((name.to_string(), IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr))));
                 }
                 _ => {}
             }
@@ -204,7 +248,7 @@ fn interface_addrs(interface: &str) -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
     }
     // SAFETY: freed exactly once.
     unsafe { libc::freeifaddrs(ifaddrs) };
-    select_addrs(addrs)
+    addrs
 }
 
 fn write_varint(buf: &mut Vec<u8>, value: i32) {
@@ -334,6 +378,36 @@ mod tests {
         assert_eq!(v6, Some("2001:db8::1".parse().unwrap()));
         let only_ll: Vec<IpAddr> = vec!["fe80::1".parse().unwrap()];
         assert_eq!(select_addrs(only_ll), (None, None));
+    }
+
+    #[test]
+    fn ipv6_service_falls_back_to_any_global_host_address() {
+        let a = |name: &str, ip: &str| (name.to_string(), ip.parse::<IpAddr>().unwrap());
+        let host = vec![a("lo", "::1"), a("lo", "127.0.0.1"), a("eth0", "10.0.0.1"), a("eth0", "fe80::1"), a("dummy0", "2001:db8::7")];
+        assert_eq!(service_addrs(&host, "eth0"), (Some("10.0.0.1".parse().unwrap()), Some("2001:db8::7".parse().unwrap())));
+        let own = vec![a("eth0", "10.0.0.1"), a("eth0", "2001:db8::1"), a("dummy0", "2001:db8::7")];
+        assert_eq!(service_addrs(&own, "eth0").1, Some("2001:db8::1".parse().unwrap()));
+        let v4_only = vec![a("lo", "::1"), a("eth0", "10.0.0.1"), a("eth0", "fe80::1")];
+        assert_eq!(service_addrs(&v4_only, "eth0"), (Some("10.0.0.1".parse().unwrap()), None));
+    }
+
+    #[test]
+    fn families_are_bound_independently() {
+        // 2001:db8::1 is not an address of this host: the IPv6 bind fails,
+        // IPv4 stays on and only its ready bit is set
+        let (listeners, v4, v6) =
+            bind_families(Some("127.0.0.1:0".parse().unwrap()), Some("[2001:db8::1]:0".parse().unwrap()));
+        assert_eq!(listeners.len(), 1);
+        assert!(v4.is_some() && v6.is_none());
+        assert_eq!(ready_bits(v4.is_some(), v6.is_some()), READY_V4);
+        assert_eq!(redirect_rules(v4, v6).matches("dnat").count(), 1);
+        let (listeners, v4, v6) = bind_families(Some("192.0.2.1:0".parse().unwrap()), None);
+        assert!(listeners.is_empty() && v4.is_none() && v6.is_none());
+        assert_eq!(ready_bits(false, false), 0);
+        assert_eq!(ready_bits(true, true), READY_V4 | READY_V6);
+        assert_eq!(ready_bits(false, true), READY_V6);
+        let v6_only = redirect_rules(None, Some("[2001:db8::1]:25599".parse().unwrap()));
+        assert!(v6_only.contains("ipv6") && !v6_only.contains("ipv4"));
     }
 
     #[test]

@@ -75,7 +75,12 @@ This fork of [Outfluencer/Minecraft-XDP-eBPF](https://github.com/Outfluencer/Min
   banned /64 prefix for IPv6 (`2001:db8::/64`) and the plain address for
   IPv4. The penalty box uses an nftables `inet` table (`xdp_penalty`) with
   ip and ip6 dnat; a legacy `ip xdp_penalty` table of older versions is
-  removed automatically.
+  removed automatically. Each family is set up on its own: the service
+  listens on the interface's first IPv4 and first global IPv6 address (any
+  global IPv6 address of the host when the interface has none); a family
+  without an address or whose listener can not be bound stays without the
+  penalty box (its throttled clients are dropped as with `enabled = false`)
+  and gets no redirect rule, the other family keeps it.
 
 Tests: `cargo test` and `tests/e2e_docker.sh` (real traffic through the
 filter inside an isolated privileged container, see the script header).

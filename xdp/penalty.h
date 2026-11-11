@@ -38,8 +38,12 @@ struct
     __type(value, __u64);
 } penalty SEC(".maps");
 
-// [0] = 1 once the loader has the redirect and the service in place;
-// without them penalized sources would reach the backend unfiltered
+// [0] = PENALTY_READY_* bits of the families for which the loader has the
+// redirect and the service in place; without them penalized sources of that
+// family would reach the backend unfiltered. Must match loader/penalty.rs
+#define PENALTY_READY_V4 1
+#define PENALTY_READY_V6 2
+
 struct
 {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -48,7 +52,7 @@ struct
     __type(value, __u64);
 } penalty_ready SEC(".maps");
 
-static __always_inline __u8 penalty_enabled(void)
+static __always_inline __u8 penalty_enabled(const struct addr6 *src)
 {
     if (!PENALTY_NS)
     {
@@ -56,7 +60,8 @@ static __always_inline __u8 penalty_enabled(void)
     }
     __u32 zero = 0;
     const __u64 *ready = bpf_map_lookup_elem(&penalty_ready, &zero);
-    return ready && *ready;
+    const __u64 family = addr_is_v4(src) ? PENALTY_READY_V4 : PENALTY_READY_V6;
+    return ready && (*ready & family);
 }
 
 static __always_inline void note_verified_source(const struct addr6 *src)
@@ -72,7 +77,7 @@ static __always_inline void note_verified_source(const struct addr6 *src)
 
 static __always_inline __u8 penalized(const struct addr6 *src)
 {
-    if (!penalty_enabled())
+    if (!penalty_enabled(src))
     {
         return 0;
     }
@@ -84,7 +89,7 @@ static __always_inline __u8 penalized(const struct addr6 *src)
 // puts src in the penalty box if it is a known real client; returns 1 then
 static __always_inline __u8 try_penalize(const struct addr6 *src)
 {
-    if (!penalty_enabled())
+    if (!penalty_enabled(src))
     {
         return 0;
     }

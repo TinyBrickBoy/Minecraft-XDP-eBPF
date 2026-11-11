@@ -559,6 +559,39 @@ check "IPv4-only: java status works"     cl $MC status 10.99.1.2 25565
 check "IPv4-only: java garbage dropped"  cl $MC garbage 10.99.1.2 25565
 check "IPv4-only: bedrock ping works"    cl $MC bedrock-ping 10.99.1.2 19132
 kill $LOADER; wait $LOADER 2>/dev/null
+
+echo "== penalty box with only an IPv4 listener"
+# the IPv6 service address is taken: the penalty box stays on for IPv4 only,
+# and a penalized IPv6 source is throttled as if the penalty box were off
+python3 -c "import socket, time; s = socket.socket(socket.AF_INET6); s.bind(('fd99::1', 25599)); s.listen(); time.sleep(90)" & BLOCKER=$!
+cat > $T/config5.toml <<CONF
+[filter]
+start_port = 0
+end_port = 0
+adopt_grace_secs = 0
+hit_count_reset_secs = 10
+[targets]
+java = ["10.99.1.2:25565", "[fd99:1::2]:25565"]
+[autodetect]
+enabled = false
+[xdp]
+mode = "skb"
+CONF
+sleep 0.5
+mark=$(wc -l < $T/loader.log)
+(cd $T && exec "$OLDPWD/$BIN" --config $T/config5.toml c0 >> $T/loader.log 2>&1) & LOADER=$!
+for i in $(seq 1 20); do tail -n +$((mark + 1)) $T/loader.log | grep -q 'Penalty box: throttled' && break; sleep 0.5; done
+check "v6 service bind failure logged" bash -c "tail -n +$((mark + 1)) $T/loader.log | grep -qF 'listen on [fd99::1]:25599'"
+check "only the v4 redirect rule installed" bash -c "nft list table inet xdp_penalty | grep -q 'dnat ip to 10.99.0.1:25599' && ! nft list table inet xdp_penalty | grep -q 'ip6'"
+P9="env E2E_BIND=10.99.0.9"; P96="env E2E_BIND=fd99:0:0:9::2"
+check "v4-only penalty: real client ping"       cl $P9 $MC status 10.99.1.2 25565
+check "v4-only penalty: v6 real client ping"    cl $P96 $MC status fd99:1::2 25565
+cl $P9 $MC connect-spam 10.99.1.2 25565 15
+check "v4-only penalty: v4 still gets the please-wait message" cl $P9 $MC penalty-message 10.99.1.2 25565
+cl $P96 $MC connect-spam fd99:1::2 25565 15
+check "v4-only penalty: penalized v6 source does not reach the backend" cl $P96 $MC syn-dropped fd99:1::2 25565
+check "v4-only penalty: penalized v6 source gets no message either" cl $P96 $MC no-penalty-message fd99:1::2 25565
+kill $LOADER $BLOCKER; wait $LOADER $BLOCKER 2>/dev/null
 grep -E 'WARN|ERROR' $T/loader.log | sed 's/^/        /'
 [ $FAILS -gt 0 ] && cp $T/loader.log "${E2E_LOG:-/dev/null}" 2>/dev/null
 echo "== $FAILS failure(s)"
