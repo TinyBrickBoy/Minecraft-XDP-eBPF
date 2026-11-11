@@ -85,12 +85,13 @@ macro_rules! statistics {
                 }
             }
 
-            /// Like `Counters::publish`. An entry evicted from the LRU map
-            /// restarts at 0; saturating_sub keeps the counter monotonic.
-            fn publish(&self, labels: &[&str], total: &Statistics) {
+            /// Replaces all series with the current map entries (labels,
+            /// totals), see `republish`.
+            fn republish(&self, rows: &[(Vec<String>, Statistics)]) {
                 $(
-                    let counter = self.$field.with_label_values(labels);
-                    counter.inc_by(total.$field.saturating_sub(counter.get()));
+                    let field: Vec<(Vec<String>, u64)> =
+                        rows.iter().map(|(labels, total)| (labels.clone(), total.$field)).collect();
+                    republish(&self.$field, &field);
                 )+
             }
         }
@@ -177,6 +178,19 @@ static TARGET_INFO: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     )
     .unwrap()
 });
+
+/// Replaces every series of `vec` with `rows` (label values, map total):
+/// series of map entries that are gone (LRU eviction, e.g. an IPv6 flood
+/// over many addresses) disappear instead of piling up without bound. A
+/// series whose entry was evicted and comes back restarts at its new total,
+/// which Prometheus handles as a counter reset.
+fn republish(vec: &IntCounterVec, rows: &[(Vec<String>, u64)]) {
+    vec.reset();
+    for (labels, total) in rows {
+        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+        vec.with_label_values(&labels).inc_by(*total);
+    }
+}
 
 /// Starts the metrics machinery if enabled in the config: takes ownership of
 /// the stats map, spawns the polling thread and (when an address is
@@ -275,6 +289,7 @@ fn poll_loop(
 
 /// Sums and publishes every entry of the per destination ip:port map.
 fn publish_dst_stats(dst_stats: &PerCpuHashMap<MapData, DstKey, Statistics>) {
+    let mut rows = Vec::new();
     for entry in dst_stats.iter() {
         match entry {
             Ok((key, per_cpu)) => {
@@ -283,8 +298,7 @@ fn publish_dst_stats(dst_stats: &PerCpuHashMap<MapData, DstKey, Statistics>) {
                     total.add(cpu_stats);
                 }
                 let addr = key.addr();
-                let (ip, port) = (addr.ip().to_string(), addr.port().to_string());
-                DST_COUNTERS.publish(&[&ip, &port, key.proto_name()], &total);
+                rows.push((vec![addr.ip().to_string(), addr.port().to_string(), key.proto_name().to_string()], total));
             }
             Err(e) => {
                 // keys can vanish mid-iteration through LRU eviction
@@ -292,11 +306,13 @@ fn publish_dst_stats(dst_stats: &PerCpuHashMap<MapData, DstKey, Statistics>) {
             }
         }
     }
+    DST_COUNTERS.republish(&rows);
 }
 
 /// Sums and publishes the reflection statistics per victim and source port.
 fn publish_reflection(map: &ReflectionStatsMap) {
     let (packets, bytes) = &*REFLECTION;
+    let (mut packet_rows, mut byte_rows) = (Vec::new(), Vec::new());
     for entry in map.iter() {
         let Ok((key, per_cpu)) = entry else {
             continue; // evicted mid-iteration
@@ -306,13 +322,13 @@ fn publish_reflection(map: &ReflectionStatsMap) {
             total_packets += stats.packets;
             total_bytes += stats.bytes;
         }
-        let (ip, port) = (key.daddr().to_string(), key.sport().to_string());
-        let labels = [ip.as_str(), port.as_str(), reflection::service_name(key.sport())];
-        let counter = packets.with_label_values(&labels);
-        counter.inc_by(total_packets.saturating_sub(counter.get()));
-        let counter = bytes.with_label_values(&labels);
-        counter.inc_by(total_bytes.saturating_sub(counter.get()));
+        let labels =
+            vec![key.daddr().to_string(), key.sport().to_string(), reflection::service_name(key.sport()).to_string()];
+        packet_rows.push((labels.clone(), total_packets));
+        byte_rows.push((labels, total_bytes));
     }
+    republish(packets, &packet_rows);
+    republish(bytes, &byte_rows);
 }
 
 /// Publishes the blocklist and rate limit counters, current bans, and logs
@@ -334,14 +350,10 @@ fn publish_block(h: &blocklist::Handles) {
     }
     let (src_packets, src_bytes) = &*BLOCKED_SOURCES;
     let sources = h.sources.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    for (ip, s) in sources {
-        let (p, b) = (s.packets, s.bytes);
-        let ip = ip.to_string();
-        let c = src_packets.with_label_values(&[&ip]);
-        c.inc_by(p.saturating_sub(c.get()));
-        let c = src_bytes.with_label_values(&[&ip]);
-        c.inc_by(b.saturating_sub(c.get()));
-    }
+    let packet_rows: Vec<(Vec<String>, u64)> = sources.iter().map(|(ip, s)| (vec![ip.to_string()], s.packets)).collect();
+    let byte_rows: Vec<(Vec<String>, u64)> = sources.iter().map(|(ip, s)| (vec![ip.to_string()], s.bytes)).collect();
+    republish(src_packets, &packet_rows);
+    republish(src_bytes, &byte_rows);
     let (entries, active, per_ip) = &*BLOCK_GAUGES;
     entries.set(h.entries.load(std::sync::atomic::Ordering::Relaxed) as i64);
     AUTO_ENTRIES.set(h.auto_entries.load(std::sync::atomic::Ordering::Relaxed) as i64);
@@ -357,6 +369,7 @@ fn publish_block(h: &blocklist::Handles) {
 /// Sums and publishes the unused address drops per destination.
 fn publish_unused(map: &UnusedStatsMap) {
     let (packets, bytes) = &*UNUSED;
+    let (mut packet_rows, mut byte_rows) = (Vec::new(), Vec::new());
     for entry in map.iter() {
         let Ok((key, per_cpu)) = entry else {
             continue; // evicted mid-iteration
@@ -366,12 +379,11 @@ fn publish_unused(map: &UnusedStatsMap) {
             total_packets += stats.packets;
             total_bytes += stats.bytes;
         }
-        let ip = key.to_string();
-        let counter = packets.with_label_values(&[&ip]);
-        counter.inc_by(total_packets.saturating_sub(counter.get()));
-        let counter = bytes.with_label_values(&[&ip]);
-        counter.inc_by(total_bytes.saturating_sub(counter.get()));
+        packet_rows.push((vec![key.to_string()], total_packets));
+        byte_rows.push((vec![key.to_string()], total_bytes));
     }
+    republish(packets, &packet_rows);
+    republish(bytes, &byte_rows);
 }
 
 /// Republishes the current target list (removed targets disappear).
@@ -425,4 +437,46 @@ fn serve_http(addr: String) {
             let _ = request.respond(response);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prometheus::{Opts, Registry};
+
+    fn rows(entries: &[(&str, u64)]) -> Vec<(Vec<String>, u64)> {
+        entries.iter().map(|(ip, n)| (vec![ip.to_string()], *n)).collect()
+    }
+
+    fn series(registry: &Registry) -> Vec<(String, u64)> {
+        let mut out: Vec<(String, u64)> = registry
+            .gather()
+            .iter()
+            .flat_map(|family| family.get_metric().to_vec())
+            .map(|m| (m.get_label()[0].value().to_string(), m.get_counter().get_value() as u64))
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn label_series_follow_the_map_contents() {
+        let registry = Registry::new();
+        let vec = IntCounterVec::new(Opts::new("t_packets", "test"), &["src_ip"]).unwrap();
+        registry.register(Box::new(vec.clone())).unwrap();
+        republish(&vec, &rows(&[("2001:db8::1", 5), ("2001:db8::2", 7)]));
+        assert_eq!(series(&registry), vec![("2001:db8::1".into(), 5), ("2001:db8::2".into(), 7)]);
+        // ::1 evicted, ::2 grew, ::3 new: exactly the current entries remain
+        republish(&vec, &rows(&[("2001:db8::2", 9), ("2001:db8::3", 1)]));
+        assert_eq!(series(&registry), vec![("2001:db8::2".into(), 9), ("2001:db8::3".into(), 1)]);
+        // a flood over many addresses never leaves more series than entries
+        for round in 0..10u64 {
+            let flood: Vec<(Vec<String>, u64)> =
+                (0..100).map(|i| (vec![format!("2001:db8::{:x}", round * 1000 + i)], 1)).collect();
+            republish(&vec, &flood);
+        }
+        assert_eq!(series(&registry).len(), 100);
+        republish(&vec, &[]);
+        assert!(series(&registry).is_empty());
+    }
 }

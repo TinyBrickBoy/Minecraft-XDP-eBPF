@@ -33,7 +33,11 @@ This fork of [Outfluencer/Minecraft-XDP-eBPF](https://github.com/Outfluencer/Min
   new binary, installs atomically, restarts and rolls back on a failed
   health check.
 - **Per target metrics**: `minecraft_target_*{dst_ip,dst_port,proto}` and
-  `minecraft_target_protected{...,kind,source}`.
+  `minecraft_target_protected{...,kind,source}`. Every labelled series
+  (per destination, reflection, unused address and blocklisted source)
+  is rebuilt from the kernel map on every poll, so their number is bounded
+  by the map sizes: a series disappears when its entry is evicted, and
+  restarts (a counter reset) when it comes back.
 - **UDP reflection protection** (`[reflection]`) for whole networks: a tc
   egress program records requests of protected addresses to abused service
   ports (DNS, NTP, memcached, SSDP, ...); answers from those ports pass only
