@@ -36,6 +36,7 @@ static volatile __u8 ONLINE_NAMES = 1;
 #include "../varint.h"
 #include "../protocol.h"
 #include "../l3parse.h"
+#include "../raknet.h"
 
 /* ------------------------------------------------------------------------
  * Tiny test framework
@@ -943,6 +944,81 @@ static void test_parse_v6_bogus_addresses(void)
     CHECK(run_parse(p, n, &l) == L3_OK && l.bogus == BOGUS_NONE && l.hoplimit == 33);
 }
 
+static const __u8 RAKNET_MAGIC[16] = {0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe,
+                                      0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78};
+
+// open connection request 2 with a server address of `family` (4 or 6)
+static __u32 build_request_2(__u8 *p, __u8 family, __u16 mtu)
+{
+    __u32 n = 0;
+    p[n++] = RAKNET_OPEN_CONNECTION_REQUEST_2;
+    memcpy(p + n, RAKNET_MAGIC, 16);
+    n += 16;
+    p[n++] = family;
+    const __u32 alen = family == 6 ? RAKNET_ADDR6_LEN : RAKNET_ADDR4_LEN;
+    memset(p + n, 0x11, alen);
+    n += alen;
+    p[n++] = mtu >> 8;
+    p[n++] = mtu & 0xff;
+    memset(p + n, 0x22, 8); // guid
+    return n + 8;
+}
+
+static __u8 run_request_2(const __u8 *p, __u32 len, __u32 payload_len)
+{
+    __u8 *heap = heap_copy(p, len, 0);
+    const __u8 ok = raknet_magic_at(heap + 1, heap + len) && raknet_request_2_fields_valid(heap, payload_len, heap + len);
+    free(heap);
+    return ok;
+}
+
+static void test_raknet_request_2(void)
+{
+    __u8 p[128];
+    __u32 n = build_request_2(p, 4, 1400);
+    CHECK(n == RAKNET_REQUEST_2_MIN_LEN);
+    CHECK(run_request_2(p, n, n));
+    n = build_request_2(p, 6, 1200);
+    CHECK(n == 56);
+    CHECK(run_request_2(p, n, n));
+
+    // the mtu bounds
+    const __u16 good_mtu[] = {RAKNET_MTU_MIN, 576, 1492, RAKNET_MTU_MAX};
+    for (size_t i = 0; i < sizeof(good_mtu) / sizeof(good_mtu[0]); i++)
+    {
+        n = build_request_2(p, 4, good_mtu[i]);
+        CHECK(run_request_2(p, n, n));
+    }
+    const __u16 bad_mtu[] = {0, RAKNET_MTU_MIN - 1, RAKNET_MTU_MAX + 1, 9000, 0xffff};
+    for (size_t i = 0; i < sizeof(bad_mtu) / sizeof(bad_mtu[0]); i++)
+    {
+        n = build_request_2(p, 4, bad_mtu[i]);
+        CHECK(!run_request_2(p, n, n));
+        n = build_request_2(p, 6, bad_mtu[i]);
+        CHECK(!run_request_2(p, n, n));
+    }
+
+    // only address families 4 and 6
+    const __u8 bad_family[] = {0, 5, 7, 0xff};
+    for (size_t i = 0; i < sizeof(bad_family) / sizeof(bad_family[0]); i++)
+    {
+        n = build_request_2(p, 4, 1400);
+        p[RAKNET_REQUEST_2_ADDR_OFF] = bad_family[i];
+        CHECK(!run_request_2(p, n, n));
+    }
+
+    // too short for its family: the ipv6 form cut to the ipv4 length, the
+    // guid missing, the payload length shorter than the packet
+    n = build_request_2(p, 6, 1400);
+    CHECK(!run_request_2(p, RAKNET_REQUEST_2_MIN_LEN, RAKNET_REQUEST_2_MIN_LEN));
+    n = build_request_2(p, 4, 1400);
+    CHECK(!run_request_2(p, n - 1, n - 1));
+    CHECK(!run_request_2(p, n, n - 1));
+    // a wrong magic
+    p[5] ^= 1;
+    CHECK(!run_request_2(p, n, n));
+}
+
 int main(void)
 {
     test_varint_decodes_known_vectors();
@@ -970,6 +1046,7 @@ int main(void)
     test_parse_v4();
     test_parse_v6();
     test_parse_v6_bogus_addresses();
+    test_raknet_request_2();
 
     printf("%u checks, %u failures\n", checks_run, checks_failed);
     return checks_failed ? 1 : 0;

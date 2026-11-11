@@ -30,6 +30,7 @@
 #include "common.h"
 #include "config.h"
 #include "protocol.h"
+#include "raknet.h"
 #include "stats.h"
 
 #include "l3.h"
@@ -425,35 +426,21 @@ static __always_inline __u32 switch_to_verified(const __u64 raw_packet_len, stru
  * Bedrock (RakNet over UDP)
  * --------------------------------------------------------------------- */
 
-// RakNet offline message ids sent by clients
-#define RAKNET_UNCONNECTED_PING 0x01
-#define RAKNET_UNCONNECTED_PING_OPEN 0x02
-#define RAKNET_OPEN_CONNECTION_REQUEST_1 0x05
-#define RAKNET_OPEN_CONNECTION_REQUEST_2 0x07
-
-// minimum payload sizes: id + time + magic + guid for pings, id + magic +
-// protocol (+ mtu padding) for request 1, id + magic + address (ipv4 7 bytes,
-// ipv6 29 bytes) + mtu + guid for request 2 (the ipv4 form is the shorter one)
-#define RAKNET_PING_LEN 33
-#define RAKNET_REQUEST_1_MIN_LEN 18
-#define RAKNET_REQUEST_2_MIN_LEN 34
-
-/*
- * Checks the 16 byte RakNet offline message magic
- * 00 ff ff 00 fe fe fe fe fd fd fd fd 12 34 56 78 at p, compared as two
- * little endian u64 words.
- */
-static __always_inline __u8 raknet_magic_at(const __u8 *p, const void *data_end)
+// RakNet clients that sent open connection request 1 (ktime): request 2
+// only verifies a flow that did so within RAKNET_REQUEST_1_TTL_NS. Request 1
+// is throttled per source, so one host can no longer fill the player map
+// with forged request 2 packets of made up flows
+struct
 {
-    if ((const void *)(p + 16) > data_end)
-    {
-        return 0;
-    }
-    __u64 first, second;
-    __builtin_memcpy(&first, p, 8);
-    __builtin_memcpy(&second, p + 8, 8);
-    return first == 0xfefefefe00ffff00ULL && second == 0x78563412fdfdfdfdULL;
-}
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct flow_key);
+    __type(value, __u64);
+} raknet_request_1 SEC(".maps");
+
+// a client sends request 2 right after the reply to request 1 (retries
+// included within a few seconds)
+#define RAKNET_REQUEST_1_TTL_NS (10ULL * 1000000000ULL)
 
 // source ports of common UDP reflection/amplification services; a RakNet
 // client always sends from an ephemeral port
@@ -474,8 +461,9 @@ static __always_inline __u8 is_amplification_port(const __u16 port)
  * UDP packets for protected bedrock targets. Unverified flows may only send
  * the RakNet offline handshake (pings and the two open connection requests,
  * each with a valid magic); pings and request 1 are throttled per source ip
- * like java SYNs, and a valid request 2 promotes the flow to the player map,
- * after which its game traffic passes uninspected. Everything else from an
+ * like java SYNs, and a valid request 2 (address family 4/6, sane MTU) of a
+ * flow that sent request 1 shortly before, also throttled, promotes the
+ * flow to the player map, after which its game traffic passes uninspected. Everything else from an
  * unverified flow is dropped. Stateless parts of the RakNet stream are
  * deliberately not inspected: they differ between RakNet implementations.
  */
@@ -571,12 +559,23 @@ static __always_inline __s32 handle_udp(const void *data, const void *data_end, 
         }
         break;
     case RAKNET_OPEN_CONNECTION_REQUEST_2:
-        if (payload_len < RAKNET_REQUEST_2_MIN_LEN || !raknet_magic_at(payload + 1, data_end))
+    {
+        if (payload_len < RAKNET_REQUEST_2_MIN_LEN || !raknet_magic_at(payload + 1, data_end) ||
+            !raknet_request_2_fields_valid(payload, payload_len, data_end))
         {
             add_strike(&l->src);
             goto drop;
         }
+        // only the flow that just sent request 1, and only as often as the
+        // throttle allows new handshakes of its source
+        const __u64 *request_1 = bpf_map_lookup_elem(&raknet_request_1, &flow_key);
+        if (!request_1 || bpf_ktime_get_ns() - *request_1 > RAKNET_REQUEST_1_TTL_NS || !throttle_allows(&l->src))
+        {
+            goto drop;
+        }
+        bpf_map_delete_elem(&raknet_request_1, &flow_key);
         return switch_to_verified(raw_packet_len, stats_ptr, dst_stats_ptr, &flow_key, VERIFIED);
+    }
     default:
         // connected RakNet traffic (frame sets 0x80-0x8f, ACK 0xc0, NACK
         // 0xa0) of a session that existed before the target was protected
@@ -592,6 +591,11 @@ static __always_inline __s32 handle_udp(const void *data, const void *data_end, 
     if (!throttle_allows(&l->src))
     {
         goto drop;
+    }
+    if (id == RAKNET_OPEN_CONNECTION_REQUEST_1)
+    {
+        const __u64 now = bpf_ktime_get_ns();
+        bpf_map_update_elem(&raknet_request_1, &flow_key, &now, BPF_ANY);
     }
     count_stats(stats_ptr, dst_stats_ptr, STATE_SWITCH, 1);
     return XDP_PASS;

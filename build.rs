@@ -14,6 +14,7 @@ fn main() {
         "xdp/l3parse.h",
         "xdp/penalty.h",
         "xdp/protocol.h",
+        "xdp/raknet.h",
         "xdp/reflection.h",
         "xdp/stats.h",
         "xdp/unused.h",

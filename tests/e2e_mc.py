@@ -10,6 +10,7 @@ Clients exit 0 on the expected outcome, 1 otherwise:
   bedrock-ping    RakNet unconnected ping is answered with a pong
   bedrock-session SECS  RakNet open connection handshake, then frames
   bedrock-garbage a non-RakNet datagram is NOT answered (dropped)
+  bedrock-orphan-request-2  open connection request 2 without request 1 is NOT answered
   udp-echo [SPORT [SIZE]]     a datagram (from SPORT, SIZE bytes) is echoed
   udp-no-echo [SPORT [SIZE]]  ... is NOT echoed (dropped)
   http-get                    a plain http request is answered
@@ -260,6 +261,14 @@ def bedrock_session(host, port, secs):
             n += 1
             time.sleep(0.5)
     return True
+
+
+def bedrock_orphan_request_2(host, port):
+    """An open connection request 2 without request 1 before is NOT answered."""
+    with socket.socket(family(host), socket.SOCK_DGRAM) as s:
+        s.connect((host, port))
+        r = udp_exchange(s, b"\x07" + MAGIC + b"\x04" + bytes(6) + struct.pack(">H", 1400) + struct.pack(">Q", 7))
+        return r is None
 
 
 def bedrock_garbage(host, port):
@@ -581,7 +590,8 @@ def main():
     else:
         fn = {"status": status, "player": player, "garbage": garbage, "echo": echo,
               "bedrock-ping": bedrock_ping, "bedrock-session": bedrock_session,
-              "bedrock-garbage": bedrock_garbage, "udp-echo": udp_echo,
+              "bedrock-garbage": bedrock_garbage, "bedrock-orphan-request-2": bedrock_orphan_request_2,
+              "udp-echo": udp_echo,
               "udp-no-echo": udp_no_echo, "http-get": http_get, "https-get": https_get,
               "http-keepalive": http_keepalive, "tcp-junk": tcp_junk,
               "http-answered": http_answered, "udp-flood": udp_flood,

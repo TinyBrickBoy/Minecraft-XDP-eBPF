@@ -236,6 +236,8 @@ check "bedrock new session works"   cl $MC bedrock-session 10.99.1.2 19132 3
 check "v6 bedrock new session works" cl $MC bedrock-session fd99:1::2 19132 3
 check "bedrock garbage dropped"     cl $MC bedrock-garbage 10.99.1.2 19132
 check "v6 bedrock garbage dropped"  cl $MC bedrock-garbage fd99:1::2 19132
+check "bedrock request 2 without request 1 dropped"    cl $MC bedrock-orphan-request-2 10.99.1.2 19132
+check "v6 bedrock request 2 without request 1 dropped" cl $MC bedrock-orphan-request-2 fd99:1::2 19132
 check "v6 static targets configured" bash -c "grep -qF 'Target [fd99:4::2]:25565/tcp: java (static)' $T/loader.log && grep -qF 'Target [fd99:4::2]:19140/udp: bedrock (static)' $T/loader.log"
 check "v6 static targets not autodetected" bash -c "! grep -F '[fd99:4::2]' $T/loader.log | grep -q '(auto)'"
 check "v6 static java status works" cl $MC status fd99:4::2 25565
