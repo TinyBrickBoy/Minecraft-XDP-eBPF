@@ -72,19 +72,21 @@ This fork of [Outfluencer/Minecraft-XDP-eBPF](https://github.com/Outfluencer/Min
     every destination; only neighbour solicitations from `::` (duplicate
     address detection) pass.
   - Throttle, rate limit, strikes, bans and the penalty box count IPv6
-    sources per `[filter] ipv6_source_prefix` (default /64). Throttle, rate
-    limit, strikes and bans count IPv6 a second time per
-    `ipv6_aggregate_prefix` (default /48, a site's usual allocation) with
-    `ipv6_aggregate_factor` (default 8) times the per-source limits: a
-    source is throttled or banned when either tier is over its limit, so
-    rotating through the /64s of one /48 gains a factor of 8 instead of
-    65536, and a /48 over its SYN limit can not fill the throttle map with
-    /64 entries. IPv4 is counted per address, unchanged.
+    sources per `[filter] ipv6_source_prefix` (default /64). The connection
+    throttle (java SYNs and the bedrock handshake) counts IPv6 a second time
+    per `ipv6_aggregate_prefix` (default /48, a site's usual allocation)
+    with `ipv6_aggregate_factor` (default 8) times `hit_count`: a source is
+    throttled when either tier is over its limit, so rotating through the
+    /64s of one /48 gains a factor of 8 instead of 65536, and a /48 over its
+    budget can not fill the throttle map with /64 entries. Rate limit,
+    strikes and bans have no aggregate tier on purpose: strikes come from
+    single spoofable packets and a busy /48 carries many players, so a /48
+    ban would cut off verified players because of their neighbours. IPv4 is
+    counted per address, unchanged.
   - Bans show as the counted prefix: the `src_ip` label of
     `xdp_ratelimit_ban`, the log and automatic blocklist lines carry the
-    `ipv6_source_prefix` prefix (`2001:db8:1:2::/64` by default) or, for a
-    ban of the aggregate tier, the `ipv6_aggregate_prefix` prefix
-    (`2001:db8:1::/48`), and the plain address for IPv4. IPv4 `/32` and
+    `ipv6_source_prefix` prefix (`2001:db8:1:2::/64` by default) and the
+    plain address for IPv4. IPv4 `/32` and
     IPv6 `/128` entries are shown as plain addresses everywhere (logs,
     auto-blocklist file, state file, metric labels); real prefixes keep
     their length. DNS scan detection blocklists IPv6 scanners per exact
@@ -206,8 +208,8 @@ restart the loader. Use `--config <path>` to point at a different file.
 | `player_idle_timeout_secs` | int | 60 | Idle timeout for verified connections; an idle entry is removed in-kernel after one to two intervals, requiring a new handshake. |
 | `online_names` | bool   | true    | Enforce online-mode usernames (≤16 chars). |
 | `ipv6_source_prefix` | int | 64 | Prefix length per IPv6 source for throttling, rate limits and bans (32–128). IPv4 is always per address. |
-| `ipv6_aggregate_prefix` | int | 48 | Second, coarser IPv6 tier for throttle, rate limit, strikes and bans (16–`ipv6_source_prefix`; equal turns it off). |
-| `ipv6_aggregate_factor` | int | 8 | Limits of the aggregate tier as a multiple of `hit_count`, `[ratelimit] pps` and `strikes` (1–1024). |
+| `ipv6_aggregate_prefix` | int | 48 | Second, coarser IPv6 tier of the connection throttle (16–`ipv6_source_prefix`; equal turns it off). |
+| `ipv6_aggregate_factor` | int | 8 | SYN budget of the aggregate tier as a multiple of `hit_count` (1–1024). |
 
 **`[xdp]`** — how the program attaches and the capacity of its in-kernel tables
 (the maps are preallocated, so higher limits cost kernel memory up front):

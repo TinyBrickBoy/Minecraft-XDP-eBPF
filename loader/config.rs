@@ -35,14 +35,13 @@ hit_count_reset_secs = 3
 # Valid 32..=128. IPv4 is always counted per address.
 ipv6_source_prefix = 64
 
-# Second, coarser IPv6 tier for the throttle, rate limit, strikes and bans:
-# a site usually gets a whole /48, so rotating through its 65536 /64s must
-# not multiply its limits. Each aggregate prefix may use ipv6_aggregate_factor
-# times the per-source limits (hit_count, [ratelimit] pps and strikes); a
-# source is throttled or banned when either tier is over its limit, a ban of
-# the aggregate tier shows as the aggregate prefix (2001:db8:1::/48). The
-# prefix is valid 16..=ipv6_source_prefix (equal turns the tier off), the
-# factor 1..=1024.
+# Second, coarser IPv6 tier of the connection throttle (java SYNs and the
+# bedrock handshake): a site usually gets a whole /48, so rotating through
+# its 65536 /64s must not multiply its budget. Each aggregate prefix may
+# open ipv6_aggregate_factor times hit_count new connections per window; a
+# source is throttled when either tier is over its limit. Rate limit,
+# strikes and bans stay per ipv6_source_prefix. The prefix is valid
+# 16..=ipv6_source_prefix (equal turns the tier off), the factor 1..=1024.
 ipv6_aggregate_prefix = 48
 ipv6_aggregate_factor = 8
 
@@ -308,7 +307,7 @@ pub struct FilterConfig {
     /// Coarser IPv6 tier (see [`FilterConfig::aggregate_prefix`]). Maps to
     /// `IPV6_AGGREGATE_PREFIX`.
     pub ipv6_aggregate_prefix: u8,
-    /// Limits of the aggregate tier as a multiple of the per-source limits.
+    /// SYN budget of the aggregate tier as a multiple of `hit_count`.
     pub ipv6_aggregate_factor: u32,
     /// Idle timeout for verified connections in seconds; an entry is removed
     /// in-kernel after one to two intervals without packets. Maps to
@@ -1155,7 +1154,7 @@ mod tests {
         let parsed: Config = toml::from_str("[filter]\nipv6_aggregate_prefix = 56\nipv6_aggregate_factor = 4").unwrap();
         parsed.validate().unwrap();
         assert_eq!(parsed.filter.aggregate_prefix(), Some(56));
-        assert_eq!(parsed.filter.aggregate_limit(3000), 12_000);
+        assert_eq!(parsed.filter.aggregate_limit(10), 40);
         // equal to the source prefix: the tier is off
         let mut cfg = Config::default();
         cfg.filter.ipv6_aggregate_prefix = 64;

@@ -171,16 +171,6 @@ struct
     __type(value, struct rate_window);
 } ratelimit_windows SEC(".maps");
 
-// the same per IPv6 aggregate prefix (src_aggregate); every *_agg map is
-// separate because the keys of both tiers can be equal
-struct
-{
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 65536);
-    __type(key, struct addr6); // aggregate prefix
-    __type(value, struct rate_window);
-} ratelimit_windows_agg SEC(".maps");
-
 // an automatic ban; must match `Ban` in loader/blocklist.rs
 struct ban
 {
@@ -204,26 +194,9 @@ struct
 {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
-    __type(key, struct addr6); // aggregate prefix
-    __type(value, struct rate_window);
-} strike_windows_agg SEC(".maps");
-
-struct
-{
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 65536);
     __type(key, struct addr6); // source prefix (src_prefix)
     __type(value, struct ban);
 } ratelimit_bans SEC(".maps");
-
-// bans of whole IPv6 aggregate prefixes (read by the loader as /48 etc.)
-struct
-{
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 65536);
-    __type(key, struct addr6); // aggregate prefix
-    __type(value, struct ban);
-} ratelimit_bans_agg SEC(".maps");
 
 // global counters; must match `BlockStats` in loader/blocklist.rs
 struct block_stats
@@ -422,17 +395,14 @@ static __always_inline __u8 blocked_source(const struct l3 *l, const __u64 bytes
         return 0;
     }
 
-    // bans and the rate limit count per source prefix (IPv6: IPV6_SOURCE_PREFIX,
-    // and a second time per aggregate prefix, see src_aggregate)
+    // bans and the rate limit count per source prefix (IPv6:
+    // IPV6_SOURCE_PREFIX). Deliberately no aggregate (/48) tier here: its
+    // windows would be filled by neighbours (spoofable strikes, busy sites)
+    // and ban every verified player of the /48; the aggregate tier only
+    // throttles new handshakes
     const struct addr6 pfx = src_prefix(&l->src);
-    struct addr6 agg;
-    const __u8 has_agg = src_aggregate(&l->src, &agg);
     const __u64 now = bpf_ktime_get_ns();
     struct ban *ban = active_ban(&ratelimit_bans, &pfx, now);
-    if (!ban && has_agg)
-    {
-        ban = active_ban(&ratelimit_bans_agg, &agg, now);
-    }
     if (ban)
     {
         if (ban_exempt(&l->src, &l->dst))
@@ -449,8 +419,7 @@ static __always_inline __u8 blocked_source(const struct l3 *l, const __u64 bytes
         return RATELIMIT_MODE == RATELIMIT_ENFORCE;
     }
 
-    if (rate_exceeded(l, &ratelimit_windows, &ratelimit_bans, &pfx, RATELIMIT_PPS, now) ||
-        (has_agg && rate_exceeded(l, &ratelimit_windows_agg, &ratelimit_bans_agg, &agg, AGG_RATELIMIT_PPS, now)))
+    if (rate_exceeded(l, &ratelimit_windows, &ratelimit_bans, &pfx, RATELIMIT_PPS, now))
     {
         return RATELIMIT_MODE == RATELIMIT_ENFORCE;
     }
@@ -503,12 +472,9 @@ static __always_inline void add_strike(const struct l3 *l)
     }
     const struct addr6 pfx = src_prefix(src);
     const __u64 now = bpf_ktime_get_ns();
+    // per source prefix only: strikes come from single spoofable packets, an
+    // aggregate tier would let 41 forged packets ban a whole /48
     add_strike_in(l, &strike_windows, &ratelimit_bans, &pfx, STRIKE_LIMIT, now);
-    struct addr6 agg;
-    if (src_aggregate(src, &agg))
-    {
-        add_strike_in(l, &strike_windows_agg, &ratelimit_bans_agg, &agg, AGG_STRIKE_LIMIT, now);
-    }
 }
 
 /*

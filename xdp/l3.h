@@ -56,9 +56,9 @@ static __always_inline struct addr6 src_prefix(const struct addr6 *src)
     return addr_mask(*src, IPV6_SOURCE_PREFIX);
 }
 
-// the coarser IPv6 tier of throttle, rate limit, strikes and bans
-// (IPV6_AGGREGATE_PREFIX, default /48): one site owns a whole /48, so
-// rotating through its /64s must not multiply its limits. Returns 0 (no
+// the coarser IPv6 tier of the handshake throttle (IPV6_AGGREGATE_PREFIX,
+// default /48): one site owns a whole /48, so rotating through its /64s
+// must not multiply its SYN budget. Returns 0 (no
 // tier) for IPv4 and while the tier is off
 static __always_inline __u8 src_aggregate(const struct addr6 *src, struct addr6 *out)
 {

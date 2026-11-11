@@ -613,7 +613,7 @@ check "v4-only penalty: penalized v6 source gets no message either" cl $P96 $MC 
 kill $LOADER $BLOCKER; wait $LOADER $BLOCKER 2>/dev/null
 
 echo "== ipv6 aggregate tier (/48)"
-# ipv6_aggregate_factor = 1: a /48 gets the limits of one /64. All IPv6
+# ipv6_aggregate_factor = 1: a /48 gets the SYN budget of one /64. All IPv6
 # clients are in fd99::/48, each extra source in its own /64
 cat > $T/config6.toml <<CONF
 [filter]
@@ -653,17 +653,18 @@ cl env E2E_BIND=fd99:0:0:a::2 $MC connect-spam fd99:1::2 25565 6
 cl env E2E_BIND=fd99:0:0:b::2 $MC connect-spam fd99:1::2 25565 5
 check "/48 throttled: an unused /64 of the /48 is dropped" cl env E2E_BIND=fd99:0:0:3::2 $MC syn-dropped fd99:1::2 25565
 check "/48 throttle leaves IPv4 alone" cl env E2E_BIND=10.99.0.3 $MC status 10.99.1.2 25565
-# 15 + 15 violations from two /64s: each /64 stays below 20, the /48 does not
+# 15 + 15 violations from two /64s: each /64 stays below 20. Strikes and
+# bans have no /48 tier (forged strikes from many /64s must not ban a whole
+# /48 and its verified players)
 SCAN=""; for i in $(seq 1 15); do
     cl env E2E_BIND=fd99:0:0:5::2 $MC udp-echo fd99:3::$((i+40)) 40000 >/dev/null 2>&1 & SCAN="$SCAN $!"
     cl env E2E_BIND=fd99:0:0:6::2 $MC udp-echo fd99:3::$((i+60)) 40000 >/dev/null 2>&1 & SCAN="$SCAN $!"
 done
 wait $SCAN
-for i in $(seq 1 10); do grep -q 'banned fd99::/48 ' $T/loader.log && break; sleep 0.5; done
-check "/48 ban for violations spread over /64s logged" grep -q 'banned fd99::/48 .*violations' $T/loader.log
-check "no /64 of the scan banned on its own" bash -c "! tail -n +$((mark + 1)) $T/loader.log | grep -qE 'banned fd99:0:0:[56]::/64'"
-check "/48 ban drops another /64 of it" cl env E2E_BIND=fd99:0:0:7::2 $MC udp-no-echo fd99:1::2 40000 5030
-check "/48 ban leaves IPv4 alone" cl env E2E_BIND=10.99.0.7 $MC udp-echo 10.99.1.2 40000 5031
+sleep 2
+check "violations spread over /64s ban no /48" bash -c "! tail -n +$((mark + 1)) $T/loader.log | grep -qE 'banned fd99::/48|banned fd99:0:0:[56]::/64'"
+check "another /64 of the /48 still reaches the network" cl env E2E_BIND=fd99:0:0:7::2 $MC udp-echo fd99:1::2 40000 5030
+check "the scanning /64s themselves still pass" cl env E2E_BIND=fd99:0:0:5::2 $MC udp-echo fd99:1::2 40000 5031
 kill $LOADER; wait $LOADER 2>/dev/null
 grep -E 'WARN|ERROR' $T/loader.log | sed 's/^/        /'
 [ $FAILS -gt 0 ] && cp $T/loader.log "${E2E_LOG:-/dev/null}" 2>/dev/null
