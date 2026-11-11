@@ -2,7 +2,7 @@
 
 This project offers a high-performance XDP-based firewall utilizing eBPF, specifically designed for Minecraft Java Edition servers.  
 It effectively mitigates L7 DDoS attacks by filtering malicious packets at the kernel level (before they reach the network stack).  
-Currently, the filter is available for IPv4 and supports Minecraft versions 1.8 - 26.3    
+The filter protects IPv4 and IPv6 and supports Minecraft versions 1.8 - 26.3    
 The default filtered port is 25565.
 
 💬 Questions, feedback or help needed? Join the Discord: https://discord.gg/JnBJPgV4GW
@@ -51,6 +51,24 @@ This fork of [Outfluencer/Minecraft-XDP-eBPF](https://github.com/Outfluencer/Min
   `xdp_ratelimit_*`).
 - **Manual overrides** (`[targets]`): always protected `java`/`bedrock`
   entries and `exclude` entries that are never filtered.
+- **IPv6**: every feature works for IPv6 destinations and sources. Targets
+  are written as `"[2001:db8::10]:25565"`, networks as `"2001:db8::/48"`;
+  v4-mapped input (`::ffff:a.b.c.d`) is rejected, write IPv4 as `a.b.c.d`.
+  Throttle, rate limit, strikes, bans and the penalty box count IPv6
+  sources per `[filter] ipv6_source_prefix` (default /64). IPv6 fragments
+  to protected targets are dropped. Packets with more than four extension
+  headers or a truncated header chain cannot be matched to a port: they are
+  dropped when the destination address has any protected target (any port)
+  or a static java port range is configured, and pass to other
+  destinations. Neighbour discovery (ICMPv6 133-137) is never dropped. DNS
+  scan detection blocklists IPv6 scanners per exact address. IPv4 `/32`
+  and IPv6 `/128` entries are shown as plain addresses everywhere (logs,
+  auto-blocklist file, state file, `source` label of `xdp_ratelimit_ban`);
+  real prefixes keep their length. The `source` label of a ban is the
+  banned /64 prefix for IPv6 (`2001:db8::/64`) and the plain address for
+  IPv4. The penalty box uses an nftables `inet` table (`xdp_penalty`) with
+  ip and ip6 dnat; a legacy `ip xdp_penalty` table of older versions is
+  removed automatically.
 
 Tests: `cargo test` and `tests/e2e_docker.sh` (real traffic through the
 filter inside an isolated privileged container, see the script header).
@@ -132,6 +150,7 @@ restart the loader. Use `--config <path>` to point at a different file.
 | `hit_count_reset_secs` | int | 3   | Throttle window length in seconds; each IP's SYN counter resets in-kernel once its window expires. |
 | `player_idle_timeout_secs` | int | 60 | Idle timeout for verified connections; an idle entry is removed in-kernel after one to two intervals, requiring a new handshake. |
 | `online_names` | bool   | true    | Enforce online-mode usernames (≤16 chars). |
+| `ipv6_source_prefix` | int | 64 | Prefix length per IPv6 source for throttling, rate limits and bans (32–128). IPv4 is always per address. |
 
 **`[xdp]`** — how the program attaches and the capacity of its in-kernel tables
 (the maps are preallocated, so higher limits cost kernel memory up front):
