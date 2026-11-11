@@ -11,6 +11,7 @@ Clients exit 0 on the expected outcome, 1 otherwise:
   bedrock-session SECS  RakNet open connection handshake, then frames
   bedrock-garbage a non-RakNet datagram is NOT answered (dropped)
   bedrock-orphan-request-2  open connection request 2 without request 1 is NOT answered
+  bedrock-household  two consoles behind one address both get request 2 answered
   udp-echo [SPORT [SIZE]]     a datagram (from SPORT, SIZE bytes) is echoed
   udp-no-echo [SPORT [SIZE]]  ... is NOT echoed (dropped)
   http-get                    a plain http request is answered
@@ -261,6 +262,29 @@ def bedrock_session(host, port, secs):
             n += 1
             time.sleep(0.5)
     return True
+
+
+def bedrock_household(host, port):
+    """Two consoles behind one address join at once, each with 3 pings and 3
+    request 1 (MTU retries) before request 2: both get request 2 answered."""
+    bind = os.environ.get("E2E_BIND", any_addr(host))
+    socks = []
+    for _ in range(2):
+        s = socket.socket(family(host), socket.SOCK_DGRAM)
+        s.bind((bind, 0))
+        s.connect((host, port))
+        socks.append(s)
+    ok = []
+    for s in socks:
+        for _ in range(3):
+            udp_exchange(s, b"\x01" + struct.pack(">Q", 1) + MAGIC + struct.pack(">Q", 7), 0.5)
+        for _ in range(3):
+            udp_exchange(s, b"\x05" + MAGIC + b"\x0b" + bytes(600), 0.5)
+        r = udp_exchange(s, b"\x07" + MAGIC + b"\x04" + bytes(6) + struct.pack(">H", 1400) + struct.pack(">Q", 7))
+        ok.append(bool(r) and r[0] == 0x08)
+        s.close()
+    print(ok)
+    return all(ok)
 
 
 def bedrock_orphan_request_2(host, port):
@@ -591,6 +615,7 @@ def main():
         fn = {"status": status, "player": player, "garbage": garbage, "echo": echo,
               "bedrock-ping": bedrock_ping, "bedrock-session": bedrock_session,
               "bedrock-garbage": bedrock_garbage, "bedrock-orphan-request-2": bedrock_orphan_request_2,
+              "bedrock-household": bedrock_household,
               "udp-echo": udp_echo,
               "udp-no-echo": udp_no_echo, "http-get": http_get, "https-get": https_get,
               "http-keepalive": http_keepalive, "tcp-junk": tcp_junk,

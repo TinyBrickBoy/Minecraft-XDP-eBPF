@@ -636,6 +636,7 @@ ipv6_aggregate_factor = 1
 java = ["10.99.1.2:25565", "[fd99:1::2]:25565"]
 [autodetect]
 enabled = false
+bedrock = ["10.99.1.2:19132"]
 [penalty]
 enabled = false
 [blocklist]
@@ -663,6 +664,9 @@ cl env E2E_BIND=fd99:0:0:a::2 $MC connect-spam fd99:1::2 25565 6
 cl env E2E_BIND=fd99:0:0:b::2 $MC connect-spam fd99:1::2 25565 5
 check "/48 throttled: an unused /64 of the /48 is dropped" cl env E2E_BIND=fd99:0:0:3::2 $MC syn-dropped fd99:1::2 25565
 check "/48 throttle leaves IPv4 alone" cl env E2E_BIND=10.99.0.3 $MC status 10.99.1.2 25565
+# 14 handshake packets from one address (hit_count 10): request 2 takes no
+# throttle hit of its own, so the second console still gets in
+check "two bedrock consoles behind one address join" cl env E2E_BIND=10.99.0.8 $MC bedrock-household 10.99.1.2 19132
 # 15 + 15 violations from two /64s: each /64 stays below 20. Strikes and
 # bans have no /48 tier (forged strikes from many /64s must not ban a whole
 # /48 and its verified players)

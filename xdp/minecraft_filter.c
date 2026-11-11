@@ -506,8 +506,8 @@ static __always_inline __u8 is_amplification_port(const __u16 port)
  * the RakNet offline handshake (pings and the two open connection requests,
  * each with a valid magic); pings and request 1 are throttled per source ip
  * like java SYNs, and a valid request 2 (address family 4/6, sane MTU) of a
- * flow that sent request 1 shortly before, also throttled, promotes the
- * flow to the player map, after which its game traffic passes uninspected. Everything else from an
+ * flow whose request 1 passed shortly before promotes the flow to the
+ * player map, after which its game traffic passes uninspected. Everything else from an
  * unverified flow is dropped. Stateless parts of the RakNet stream are
  * deliberately not inspected: they differ between RakNet implementations.
  */
@@ -610,14 +610,16 @@ static __always_inline __s32 handle_udp(const void *data, const void *data_end, 
             add_strike(l);
             goto drop;
         }
-        // only the flow that just sent request 1, and only as often as the
-        // throttle allows new handshakes of its source
+        // only the flow that just sent request 1. Request 1 already passed
+        // the throttle, so request 2 takes no second hit (consoles behind
+        // one NAT address would run out); deleting the entry makes one
+        // request 1 good for at most one verified flow
         const __u64 *request_1 = bpf_map_lookup_elem(&raknet_request_1, &flow_key);
-        if (!request_1 || bpf_ktime_get_ns() - *request_1 > RAKNET_REQUEST_1_TTL_NS || !throttle_allows(&l->src))
+        if (!request_1 || bpf_ktime_get_ns() - *request_1 > RAKNET_REQUEST_1_TTL_NS ||
+            bpf_map_delete_elem(&raknet_request_1, &flow_key) < 0)
         {
             goto drop;
         }
-        bpf_map_delete_elem(&raknet_request_1, &flow_key);
         return switch_to_verified(raw_packet_len, stats_ptr, dst_stats_ptr, &flow_key, VERIFIED);
     }
     default:

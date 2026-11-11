@@ -24,8 +24,9 @@ This fork of [Outfluencer/Minecraft-XDP-eBPF](https://github.com/Outfluencer/Min
 - **Bedrock (RakNet)**: unverified flows may only send valid offline
   handshake messages (magic checked, throttled per source ip); a valid open
   connection request 2 (address family 4 or 6, MTU 400-1500) verifies the
-  flow, but only within 10 s after the same flow sent request 1, and it
-  counts against the per source throttle like pings and request 1. Amplification source ports and
+  flow, but only within 10 s after a request 1 of the same flow passed the
+  per source throttle, and each passed request 1 verifies at most one flow
+  (request 2 takes no second throttle hit). Amplification source ports and
   fragments are dropped.
 - **No kicks on restart/update**: established connections are adopted during
   `adopt_grace_secs` after the loader starts and after a target is added.
