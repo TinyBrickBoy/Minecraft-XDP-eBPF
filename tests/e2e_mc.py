@@ -192,7 +192,8 @@ def status(host, port):
 
 
 def player(host, port, secs):
-    with socket.create_connection((host, port), timeout=3) as s:
+    bind = os.environ.get("E2E_BIND")
+    with socket.create_connection((host, port), timeout=3, source_address=(bind, 0) if bind else None) as s:
         login = packet(b"\x00" + varint(6) + b"Tester" + bytes(16))
         s.sendall(handshake(host, port, 2) + login)
         end = time.time() + secs

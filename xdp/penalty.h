@@ -52,6 +52,29 @@ struct
     __type(value, __u64);
 } penalty_ready SEC(".maps");
 
+// connections opened by a SYN of a penalized source (ktime of the SYN). Only
+// their packets pass untracked: any other flow of a penalized source (e.g.
+// one prepared before the penalty, which has no redirect and would reach
+// the real backend) is filtered as usual
+struct
+{
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct flow_key);
+    __type(value, __u64);
+} penalty_flows SEC(".maps");
+
+static __always_inline void penalty_flow_open(const struct flow_key *flow)
+{
+    const __u64 now = bpf_ktime_get_ns();
+    bpf_map_update_elem(&penalty_flows, flow, &now, BPF_ANY);
+}
+
+static __always_inline __u8 penalty_flow(const struct flow_key *flow)
+{
+    return bpf_map_lookup_elem(&penalty_flows, flow) != NULL;
+}
+
 static __always_inline __u8 penalty_enabled(const struct addr6 *src)
 {
     if (!PENALTY_NS)
@@ -108,7 +131,10 @@ static __always_inline __u8 try_penalize(const struct addr6 *src)
 /*
  * tc ingress: marks packets of penalized sources to java targets, so the
  * netfilter rule of the loader redirects their new connections to the
- * penalty service. Never drops or changes anything else.
+ * penalty service, and drops marked packets of connections it did not
+ * redirect. Verified and still inspected connections of the source are
+ * left alone (the XDP program vouches for them); SYNs are always marked.
+ * Never drops or changes anything else.
  */
 SEC("classifier")
 __s32 penalty_mark(struct __sk_buff *skb)
@@ -127,10 +153,16 @@ __s32 penalty_mark(struct __sk_buff *skb)
         return TC_ACT_UNSPEC;
     }
     __u8 grace = 0;
-    if (lookup_target(&l.dst, tcp->dest, IPPROTO_TCP, &grace) == KIND_JAVA)
+    if (lookup_target(&l.dst, tcp->dest, IPPROTO_TCP, &grace) != KIND_JAVA)
     {
-        skb->mark |= PENALTY_MARK;
+        return TC_ACT_UNSPEC;
     }
+    const struct flow_key flow = gen_flow_key(&l.src, &l.dst, tcp->source, tcp->dest);
+    if (!tcp->syn && (bpf_map_lookup_elem(&player_connection_map, &flow) || bpf_map_lookup_elem(&conntrack_map, &flow)))
+    {
+        return TC_ACT_UNSPEC;
+    }
+    skb->mark |= PENALTY_MARK;
     return TC_ACT_UNSPEC;
 }
 

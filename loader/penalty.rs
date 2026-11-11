@@ -60,6 +60,17 @@ fn redirect_rules(v4: Option<SocketAddrV4>, v6: Option<SocketAddrV6>) -> String 
             "\t\tmeta nfproto ipv6 meta mark & {PENALTY_MARK:#x} == {PENALTY_MARK:#x} meta l4proto tcp dnat ip6 to {listen}\n"
         );
     }
+    // marked packets of connections that were not redirected (e.g. one
+    // established before the penalty) never reach the backend. `ct status
+    // != dnat` would compare the whole status word, hence the bit test
+    rules += "\t}\n\tchain unredirected {\n\t\ttype filter hook prerouting priority -90; policy accept;\n";
+    for (family, ready) in [("ipv4", v4.is_some()), ("ipv6", v6.is_some())] {
+        if ready {
+            rules += &format!(
+                "\t\tmeta nfproto {family} meta mark & {PENALTY_MARK:#x} == {PENALTY_MARK:#x} ct status & dnat == 0 drop\n"
+            );
+        }
+    }
     rules += "\t}\n}\n";
     rules
 }
@@ -363,8 +374,12 @@ mod tests {
         assert!(rules.starts_with("table inet xdp_penalty {"));
         assert!(rules.contains("meta nfproto ipv4 meta mark & 0x4000000 == 0x4000000 meta l4proto tcp dnat ip to 10.0.0.1:25599"));
         assert!(rules.contains("meta nfproto ipv6 meta mark & 0x4000000 == 0x4000000 meta l4proto tcp dnat ip6 to [2001:db8::1]:25599"));
+        assert!(rules.contains("meta nfproto ipv4 meta mark & 0x4000000 == 0x4000000 ct status & dnat == 0 drop"));
+        assert!(rules.contains("meta nfproto ipv6 meta mark & 0x4000000 == 0x4000000 ct status & dnat == 0 drop"));
+        assert!(rules.contains("type filter hook prerouting priority -90;"));
         let v4_only = redirect_rules(Some("10.0.0.1:25599".parse().unwrap()), None);
         assert!(!v4_only.contains("ipv6"));
+        assert_eq!(v4_only.matches(" drop").count(), 1);
     }
 
     #[test]
@@ -400,7 +415,7 @@ mod tests {
         assert_eq!(listeners.len(), 1);
         assert!(v4.is_some() && v6.is_none());
         assert_eq!(ready_bits(v4.is_some(), v6.is_some()), READY_V4);
-        assert_eq!(redirect_rules(v4, v6).matches("dnat").count(), 1);
+        assert_eq!(redirect_rules(v4, v6).matches("dnat ip").count(), 1);
         let (listeners, v4, v6) = bind_families(Some("192.0.2.1:0".parse().unwrap()), None);
         assert!(listeners.is_empty() && v4.is_none() && v6.is_none());
         assert_eq!(ready_bits(false, false), 0);

@@ -761,9 +761,11 @@ __s32 minecraft_filter(struct xdp_md *ctx)
             goto drop;
         }
 
-        // a client in the penalty box is redirected to the penalty service
+        // a client in the penalty box is redirected to the penalty service;
+        // only the flows opened here pass untracked later on
         if (penalized(&l.src))
         {
+            penalty_flow_open(&flow_key);
             return XDP_PASS;
         }
 
@@ -773,6 +775,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
             // message) instead of a silent drop; spoofed floods are dropped
             if (try_penalize(&l.src))
             {
+                penalty_flow_open(&flow_key);
                 return XDP_PASS;
             }
             goto drop;
@@ -805,8 +808,8 @@ __s32 minecraft_filter(struct xdp_md *ctx)
     struct initial_state *initial_state = bpf_map_lookup_elem(&conntrack_map, &flow_key);
     if (!initial_state)
     {
-        // a connection to the penalty service
-        if (penalized(&l.src))
+        // a connection to the penalty service, opened by a penalized SYN
+        if (penalized(&l.src) && penalty_flow(&flow_key))
         {
             return XDP_PASS;
         }

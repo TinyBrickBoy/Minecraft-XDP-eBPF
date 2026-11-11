@@ -80,7 +80,11 @@ This fork of [Outfluencer/Minecraft-XDP-eBPF](https://github.com/Outfluencer/Min
   global IPv6 address of the host when the interface has none); a family
   without an address or whose listener can not be bound stays without the
   penalty box (its throttled clients are dropped as with `enabled = false`)
-  and gets no redirect rule, the other family keeps it.
+  and gets no redirect rule, the other family keeps it. Only connections
+  opened by a SYN of a penalized source pass untracked (they are redirected
+  to the service); its other flows are filtered as usual, its verified
+  connections keep running, and the `unredirected` chain drops marked
+  packets of connections that were not redirected.
 
 Tests: `cargo test` and `tests/e2e_docker.sh` (real traffic through the
 filter inside an isolated privileged container, see the script header).

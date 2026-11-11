@@ -440,12 +440,20 @@ P7="env E2E_BIND=10.99.0.7"; P8="env E2E_BIND=10.99.0.8"
 P76="env E2E_BIND=fd99:0:0:7::2"; P86="env E2E_BIND=fd99:0:0:8::2"
 check "redirect rules installed"      bash -c "nft list table inet xdp_penalty | grep -q 'dnat ip to 10.99.0.1:25599'"
 check "v6 redirect rules installed"   bash -c "nft list table inet xdp_penalty | grep -qF 'dnat ip6 to [fd99::1]:25599'"
+check "unredirected marked flows dropped" bash -c "nft list table inet xdp_penalty | grep -q 'ipv4 .*ct status ! dnat drop' && nft list table inet xdp_penalty | grep -q 'ipv6 .*ct status ! dnat drop'"
 check "real client: server list ping" cl $P7 $MC status 10.99.1.2 25565
 check "v6 real client: server list ping" cl $P76 $MC status fd99:1::2 25565
+# a game connection of the client, verified before the penalty, keeps
+# running while its source is in the penalty box
+cl $P7 $MC player 10.99.1.2 25565 6 & PEN_PLAYER=$!
+cl $P76 $MC player fd99:1::2 25565 6 & PEN_PLAYER6=$!
+sleep 1
 cl $P7 $MC connect-spam 10.99.1.2 25565 15
 check "throttled real client gets the please-wait message" cl $P7 $MC penalty-message 10.99.1.2 25565
 cl $P76 $MC connect-spam fd99:1::2 25565 15
 check "v6 throttled real client gets the please-wait message" cl $P76 $MC penalty-message fd99:1::2 25565
+check "verified connection of a penalized client survives"    wait $PEN_PLAYER
+check "v6 verified connection of a penalized client survives" wait $PEN_PLAYER6
 cl $P8 $MC connect-spam 10.99.1.2 25565 15
 check "unknown (spoofable) source is just dropped"         cl $P8 $MC no-penalty-message 10.99.1.2 25565
 cl $P86 $MC connect-spam fd99:1::2 25565 15
