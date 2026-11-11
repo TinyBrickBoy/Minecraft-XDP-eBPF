@@ -25,9 +25,17 @@
 #define CONFIG_H
 static volatile __u8 ONLINE_NAMES = 1;
 
+#include <arpa/inet.h>
+#ifndef bpf_htons
+#define bpf_htons(x) htons(x)
+#define bpf_ntohs(x) ntohs(x)
+#define bpf_htonl(x) htonl(x)
+#define bpf_ntohl(x) ntohl(x)
+#endif
 #include "../common.h"
 #include "../varint.h"
 #include "../protocol.h"
+#include "../l3parse.h"
 
 /* ------------------------------------------------------------------------
  * Tiny test framework
@@ -716,6 +724,141 @@ static void test_login_rejects_length_mismatch(void)
 
 /* --------------------------------------------------------------------- */
 
+/* ------------------------------------------------------------------------
+ * L3 parser and address helpers
+ * --------------------------------------------------------------------- */
+
+static int run_parse(const __u8 *pkt, size_t len, struct l3 *out)
+{
+    __u8 *copy = malloc(len ? len : 1);
+    memcpy(copy, pkt, len);
+    const int ret = parse_l3(copy, copy + len, out);
+    free(copy);
+    return ret;
+}
+
+static size_t build_v4(__u8 *p, __u8 proto, __u16 frag_off, size_t payload)
+{
+    memset(p, 0, 20 + payload);
+    p[0] = 0x45;
+    const __u16 tot = htons(20 + payload);
+    memcpy(p + 2, &tot, 2);
+    const __u16 fo = htons(frag_off);
+    memcpy(p + 6, &fo, 2);
+    p[9] = proto;
+    p[12] = 1; p[13] = 2; p[14] = 3; p[15] = 4;
+    p[16] = 5; p[17] = 6; p[18] = 7; p[19] = 8;
+    return 20 + payload;
+}
+
+static size_t build_v6(__u8 *p, __u8 next, size_t payload)
+{
+    memset(p, 0, 40 + payload);
+    p[0] = 0x60;
+    const __u16 plen = htons(payload);
+    memcpy(p + 4, &plen, 2);
+    p[6] = next;
+    p[7] = 64;
+    p[8] = 0x20; p[9] = 0x01; p[10] = 0x0d; p[11] = 0xb8; p[23] = 0x01;  // src 2001:db8::1
+    p[24] = 0x20; p[25] = 0x01; p[26] = 0x0d; p[27] = 0xb8; p[39] = 0x02; // dst 2001:db8::2
+    return 40 + payload;
+}
+
+static void test_addr_helpers(void)
+{
+    const struct addr6 v4 = addr_from_v4(htonl(0x01020304));
+    CHECK(addr_is_v4(&v4));
+    CHECK(addr_v4(&v4) == htonl(0x01020304));
+    CHECK(v4.w[0] == 0 && v4.w[1] == 0 && v4.w[2] == htonl(0xffff));
+
+    struct addr6 v6 = {{htonl(0x20010db8), htonl(0x00010002), htonl(0xaaaabbbb), htonl(0xccccdddd)}};
+    CHECK(!addr_is_v4(&v6));
+    const struct addr6 m64 = addr_mask(v6, 64);
+    CHECK(m64.w[0] == htonl(0x20010db8) && m64.w[1] == htonl(0x00010002) && m64.w[2] == 0 && m64.w[3] == 0);
+    const struct addr6 m56 = addr_mask(v6, 56);
+    CHECK(m56.w[1] == htonl(0x00010000) && m56.w[2] == 0);
+    const struct addr6 m128 = addr_mask(v6, 128);
+    CHECK(addr_eq(&m128, &v6));
+    const struct addr6 m0 = addr_mask(v6, 0);
+    CHECK(m0.w[0] == 0 && m0.w[3] == 0);
+
+    const struct flow_key k = gen_flow_key(&v4, &v6, htons(1), htons(2));
+    CHECK(sizeof(k) == 36);
+    CHECK(addr_eq(&k.src, &v4) && addr_eq(&k.dst, &v6) && k.src_port == htons(1) && k.dst_port == htons(2));
+}
+
+static void test_parse_v4(void)
+{
+    __u8 p[128];
+    struct l3 l;
+    size_t n = build_v4(p, 6, 0, 20);
+    CHECK(run_parse(p, n, &l) == L3_OK);
+    CHECK(l.family == FAMILY_V4 && l.proto == 6 && l.l4off == 20 && l.l3len == 40 && l.hdrlen == 20);
+    CHECK(l.frag == FRAG_NONE);
+    CHECK(addr_is_v4(&l.src) && addr_v4(&l.src) == htonl(0x01020304));
+
+    n = build_v4(p, 17, 0x2000, 8); // MF, offset 0
+    CHECK(run_parse(p, n, &l) == L3_OK && l.frag == FRAG_FIRST);
+    n = build_v4(p, 17, 0x0001, 8); // offset 8 bytes
+    CHECK(run_parse(p, n, &l) == L3_OK && l.frag == FRAG_LATER);
+
+    n = build_v4(p, 6, 0, 0);
+    p[0] = 0x44; // ihl 4 < 5
+    CHECK(run_parse(p, n, &l) == L3_BAD);
+    CHECK(run_parse(p, 19, &l) == L3_BAD); // truncated header
+    p[0] = 0x00;
+    CHECK(run_parse(p, n, &l) == L3_NOT_IP);
+}
+
+static void test_parse_v6(void)
+{
+    __u8 p[256];
+    struct l3 l;
+    size_t n = build_v6(p, 6, 20);
+    CHECK(run_parse(p, n, &l) == L3_OK);
+    CHECK(l.family == FAMILY_V6 && l.proto == 6 && l.l4off == 40 && l.l3len == 60 && l.hdrlen == 40);
+    CHECK(!addr_is_v4(&l.src) && l.src.w[0] == htonl(0x20010db8) && l.dst.w[3] == htonl(2));
+    CHECK(l.frag == FRAG_NONE);
+
+    // hop-by-hop (8 bytes) then destination options (16 bytes) then udp
+    n = build_v6(p, 0, 8 + 16 + 8);
+    p[40] = 60; p[41] = 0;
+    p[48] = 17; p[49] = 1;
+    CHECK(run_parse(p, n, &l) == L3_OK && l.proto == 17 && l.l4off == 64 && l.hdrlen == 64);
+
+    // fragment header, offset 0 with M flag -> first fragment
+    n = build_v6(p, 44, 8 + 8);
+    p[40] = 17; p[42] = 0x00; p[43] = 0x01;
+    CHECK(run_parse(p, n, &l) == L3_OK && l.frag == FRAG_FIRST && l.proto == 17 && l.l4off == 48);
+    // offset 8 bytes -> later fragment
+    p[42] = 0x00; p[43] = 0x08;
+    CHECK(run_parse(p, n, &l) == L3_OK && l.frag == FRAG_LATER);
+    // atomic fragment (offset 0, no M) is still a fragment header -> first
+    p[43] = 0x00;
+    CHECK(run_parse(p, n, &l) == L3_OK && l.frag == FRAG_FIRST);
+
+    // five hop-by-hop headers: over the limit
+    n = build_v6(p, 0, 5 * 8 + 8);
+    for (int i = 0; i < 5; i++)
+    {
+        p[40 + i * 8] = i == 4 ? 17 : 0;
+    }
+    CHECK(run_parse(p, n, &l) == L3_BAD);
+
+    // truncated extension header: family and addresses are still known
+    n = build_v6(p, 0, 4);
+    CHECK(run_parse(p, n, &l) == L3_BAD);
+    CHECK(l.family == FAMILY_V6 && l.dst.w[3] == htonl(2));
+    // truncated fixed header: family known, addresses zero
+    CHECK(run_parse(p, 39, &l) == L3_BAD);
+    CHECK(l.family == FAMILY_V6 && l.dst.w[0] == 0 && l.dst.w[3] == 0);
+
+    // icmpv6 passes the parser with proto 58
+    n = build_v6(p, 58, 8);
+    p[40] = 135;
+    CHECK(run_parse(p, n, &l) == L3_OK && l.proto == 58);
+}
+
 int main(void)
 {
     test_varint_decodes_known_vectors();
@@ -739,6 +882,9 @@ int main(void)
     test_login_1_19_key_block();
     test_login_uuid_eras();
     test_login_rejects_length_mismatch();
+    test_addr_helpers();
+    test_parse_v4();
+    test_parse_v6();
 
     printf("%u checks, %u failures\n", checks_run, checks_failed);
     return checks_failed ? 1 : 0;

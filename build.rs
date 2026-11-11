@@ -11,6 +11,7 @@ fn main() {
         "xdp/common.h",
         "xdp/config.h",
         "xdp/l3.h",
+        "xdp/l3parse.h",
         "xdp/penalty.h",
         "xdp/protocol.h",
         "xdp/reflection.h",
