@@ -11,8 +11,10 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# Minecraft XDP filter configuration.
 # Every option is listed with its default value.
 
 [filter]
-# Inclusive TCP destination port range to protect.
-# Use the same value for both to protect a single port.
+# Static inclusive TCP destination port range protected as minecraft java on
+# every destination address. Use the same value for both to protect a single
+# port, or 0 for both to only protect the targets from [targets] and
+# [autodetect].
 start_port = 25565
 end_port = 25565
 
@@ -39,6 +41,158 @@ player_idle_timeout_secs = 60
 # false -> allow the protocol maximum (offline / cracked servers).
 online_names = true
 
+# Online mode check: when a java server is seen asking clients for
+# encryption (it runs in online mode), logins with an offline-mode uuid
+# (cracked launchers, most bots) are rejected before they reach it. The
+# server counts as online mode for online_mode_cache_secs after the last
+# time it was seen; needs [autodetect] sniff_interfaces.
+online_mode_check = true
+online_mode_cache_secs = 300
+
+# Grace window in seconds after the loader starts and after a target becomes
+# protected: connections established before are adopted instead of dropped,
+# so restarts and newly protected servers do not kick players. 0 disables
+# adoption. Must be between 0 and 3600.
+adopt_grace_secs = 120
+
+[targets]
+# Destinations protected regardless of auto detection, as "ip:port".
+java = []
+bedrock = []
+
+# Destinations that are never protected, as "ip:port/tcp" or "ip:port/udp".
+# Overrides the static range and auto detection.
+exclude = []
+
+[autodetect]
+# Find minecraft servers automatically and protect them live: listening
+# sockets of this host and servers that answer through sniff_interfaces are
+# probed with a real java status ping / RakNet ping, and only servers that
+# answer correctly are protected.
+enabled = false
+
+# Only servers inside these networks are considered, e.g. ["85.93.5.0/24"].
+networks = []
+
+# Interfaces on which server replies (TCP SYN-ACKs, RakNet pongs) of remote
+# servers are observed, e.g. a tunnel interface like "wg-bgp".
+sniff_interfaces = []
+
+# Ports below min_port and the ports in exclude_ports are never probed.
+min_port = 1024
+exclude_ports = [1433, 1521, 2049, 3306, 3389, 5432, 5672, 6379, 9000, 9090, 9200, 11211, 15672, 27017]
+
+# Seconds between re-probes of known servers.
+probe_interval_secs = 300
+
+# Timeout of a single probe in milliseconds.
+probe_timeout_ms = 2000
+
+# A protected server that did not answer for this many seconds is removed.
+remove_after_secs = 21600
+
+# A port that is no minecraft server is probed again after this many seconds.
+retry_negative_secs = 21600
+
+# File that keeps the detected servers across restarts.
+state_file = "targets.json"
+
+[reflection]
+# UDP reflection/amplification protection for whole networks: answers from
+# the service ports below (DNS, NTP, memcached, SSDP, ...) only pass when
+# they answer a request a protected address sent out through this interface.
+# "off", "monitor" (only count what would be dropped) or "enforce". Start
+# with "monitor" and check the xdp_reflection_* metrics before enforcing.
+mode = "off"
+
+# Protected networks, e.g. ["85.93.5.0/24"].
+networks = []
+
+# UDP source ports whose answers are checked.
+ports = [19, 53, 69, 111, 123, 137, 161, 389, 427, 520, 1900, 3283, 3702, 5353, 5683, 10001, 11211, 37810]
+
+# Also drop non-first UDP fragments to protected addresses: large amplified
+# answers arrive fragmented, legitimate UDP traffic practically never does.
+drop_fragments = true
+
+# Seconds a recorded request accepts answers. Must be between 1 and 300.
+reply_window_secs = 30
+
+[penalty]
+# Penalty box: a java client that ran into the connection throttle (and
+# recently completed a real status ping or login, so it is no spoofed flood)
+# is redirected for `seconds` to a small service that shows `message` in
+# the server list and as the disconnect reason of a join attempt.
+enabled = true
+seconds = 10
+port = 25599
+message = "Too many connection attempts - please wait 10 seconds, then you can reconnect."
+verified_window_secs = 600
+
+[blocklist]
+# Sources that are always dropped, checked before everything else: one
+# address or prefix per line in `file` (re-read live when it changes, `#`
+# starts a comment) plus `entries`.
+enabled = true
+file = "blocklist.txt"
+entries = []
+reload_secs = 5
+
+# Sources banned by the rate limit `auto_after_bans` times within
+# `auto_window_secs` are appended to `file` for `auto_duration_secs`, with an
+# "auto until=<unix time>" comment; expired automatic lines are removed again,
+# manual lines are never touched. Needs [ratelimit] mode = enforce.
+auto = true
+auto_after_bans = 3
+auto_window_secs = 86400
+auto_duration_secs = 21600
+auto_state_file = "auto-blocklist.json"
+
+# An automatic entry is also removed once its source sent nothing for this
+# many seconds (0 keeps it until auto_duration_secs).
+auto_idle_secs = 300
+
+# DNS scanners: a source sending a DNS query to a protected address (the
+# [ratelimit] networks) where no DNS server answers is blocklisted for
+# auto_duration_secs. Whether an address runs a DNS server is probed once and
+# trusted for dns_recheck_secs, so it is re-probed only when queries keep
+# coming.
+dns_scan = true
+dns_recheck_secs = 300
+
+# Whitelist: sources (addresses or prefixes) that are never blocklisted,
+# banned or counted as violations; they get past the blocklist even when
+# listed there. One per line in `whitelist_file` (reloaded live, like `file`)
+# and/or in `whitelist`. The minecraft checks still apply.
+whitelist_file = "whitelist.txt"
+whitelist = []
+
+[ratelimit]
+# Automatic bans: a source sending more than `pps` packets per second to
+# `networks` is banned (all its traffic dropped) for `ban_secs`. Sources in
+# `allow` (own proxies, CDNs) are never banned. Players send 20-200 packets/s.
+# "off", "monitor" (only count and log would-be bans) or "enforce".
+mode = "off"
+networks = []
+pps = 3000
+ban_secs = 900
+allow = []
+
+# Violations (packets to unused addresses, invalid handshakes, forged TCP
+# flags, invalid RakNet messages) per source: more than `strikes` within
+# `strike_window_secs` ban the source like the packet rate. 0 disables.
+strikes = 30
+strike_window_secs = 60
+
+[unused]
+# Drop traffic to addresses of these networks that the kernel has no route
+# for (e.g. not yet assigned customer addresses behind an unreachable
+# route) at the driver, instead of letting the stack drop them and answer
+# with ICMP errors. Decided per packet by the kernel routing table, so a
+# newly routed address is reachable at once. At most 8 networks.
+enabled = false
+networks = []
+
 [xdp]
 # How the filter attaches to the network interface.
 # "auto"   -> native driver mode if the NIC supports XDP, with automatic
@@ -48,6 +202,13 @@ online_names = true
 # "skb"    -> force generic (skb) mode: works on any interface but is
 #             slower; use it when the driver misbehaves in native mode.
 mode = "auto"
+
+# Further interfaces the same filter is attached to (always generic mode),
+# e.g. the GRE tunnel of an upstream DDoS protection that delivers the
+# traffic of the protected network. Interfaces without a link layer header
+# (GRE, IPIP) are handled. A missing interface is skipped; the filter
+# restarts itself once it appears.
+extra_interfaces = []
 
 # Sizes of the in-kernel connection tables below. The maps are preallocated,
 # so higher limits cost kernel memory up front, not per connection.
@@ -95,6 +256,13 @@ file_max_mb = 100
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub filter: FilterConfig,
+    pub targets: TargetsConfig,
+    pub autodetect: AutodetectConfig,
+    pub penalty: PenaltyConfig,
+    pub reflection: ReflectionConfig,
+    pub blocklist: BlocklistConfig,
+    pub ratelimit: RatelimitConfig,
+    pub unused: UnusedConfig,
     pub xdp: XdpConfig,
     pub metrics: MetricsConfig,
     pub logging: LoggingConfig,
@@ -122,6 +290,11 @@ pub struct FilterConfig {
     pub player_idle_timeout_secs: u64,
     /// Enforce online-mode (<= 16 char) usernames. Maps to `ONLINE_NAMES`.
     pub online_names: bool,
+    /// Seconds during which established flows of newly protected targets
+    /// (and of every target right after start) are adopted.
+    pub adopt_grace_secs: u64,
+    pub online_mode_check: bool,
+    pub online_mode_cache_secs: u64,
 }
 
 impl Default for FilterConfig {
@@ -133,7 +306,262 @@ impl Default for FilterConfig {
             hit_count_reset_secs: 3,
             player_idle_timeout_secs: 60,
             online_names: true,
+            adopt_grace_secs: 120,
+            online_mode_check: true,
+            online_mode_cache_secs: 300,
         }
+    }
+}
+
+/// `[targets]` — manually protected and excluded destinations.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TargetsConfig {
+    /// "ip:port" destinations always protected as java.
+    pub java: Vec<String>,
+    /// "ip:port" destinations always protected as bedrock.
+    pub bedrock: Vec<String>,
+    /// "ip:port/tcp|udp" destinations that are never protected.
+    pub exclude: Vec<String>,
+}
+
+/// `[autodetect]` — live detection of minecraft servers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutodetectConfig {
+    pub enabled: bool,
+    /// CIDRs whose servers are considered.
+    pub networks: Vec<String>,
+    /// Interfaces on which replies of remote servers are observed.
+    pub sniff_interfaces: Vec<String>,
+    pub min_port: u16,
+    pub exclude_ports: Vec<u16>,
+    pub probe_interval_secs: u64,
+    pub probe_timeout_ms: u64,
+    pub remove_after_secs: u64,
+    pub retry_negative_secs: u64,
+    pub state_file: String,
+}
+
+impl Default for AutodetectConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            networks: Vec::new(),
+            sniff_interfaces: Vec::new(),
+            min_port: 1024,
+            exclude_ports: vec![
+                1433, 1521, 2049, 3306, 3389, 5432, 5672, 6379, 9000, 9090, 9200, 11211, 15672,
+                27017,
+            ],
+            probe_interval_secs: 300,
+            probe_timeout_ms: 2000,
+            remove_after_secs: 21600,
+            retry_negative_secs: 21600,
+            state_file: "targets.json".into(),
+        }
+    }
+}
+
+/// `[reflection]` — UDP reflection protection for whole networks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReflectionConfig {
+    pub mode: ProtectionMode,
+    pub networks: Vec<String>,
+    pub ports: Vec<u16>,
+    pub drop_fragments: bool,
+    pub reply_window_secs: u64,
+}
+
+impl Default for ReflectionConfig {
+    fn default() -> Self {
+        Self {
+            mode: ProtectionMode::Off,
+            networks: Vec::new(),
+            ports: vec![19, 53, 69, 111, 123, 137, 161, 389, 427, 520, 1900, 3283, 3702, 5353, 5683, 10001, 11211, 37810],
+            drop_fragments: true,
+            reply_window_secs: 30,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProtectionMode {
+    Off,
+    Monitor,
+    Enforce,
+}
+
+impl ReflectionConfig {
+    fn validate(&self) -> Result<()> {
+        for network in &self.networks {
+            parse_cidr(network).context("[reflection] networks")?;
+        }
+        if self.mode != ProtectionMode::Off && self.networks.is_empty() {
+            bail!("[reflection] networks must not be empty when the protection is on");
+        }
+        check_range("[reflection] reply_window_secs", self.reply_window_secs, 1, 300)
+    }
+}
+
+/// `[penalty]` — "please wait" message for throttled java clients.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PenaltyConfig {
+    pub enabled: bool,
+    pub seconds: u64,
+    pub port: u16,
+    pub message: String,
+    pub verified_window_secs: u64,
+}
+
+impl Default for PenaltyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            seconds: 10,
+            port: 25599,
+            message: "Too many connection attempts - please wait 10 seconds, then you can reconnect.".into(),
+            verified_window_secs: 600,
+        }
+    }
+}
+
+impl PenaltyConfig {
+    fn validate(&self) -> Result<()> {
+        check_range("[penalty] seconds", self.seconds, 1, 3_600)?;
+        check_range("[penalty] verified_window_secs", self.verified_window_secs, 10, 86_400)?;
+        if self.message.len() > 256 {
+            bail!("[penalty] message is limited to 256 bytes");
+        }
+        Ok(())
+    }
+}
+
+/// `[blocklist]` — always dropped sources.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BlocklistConfig {
+    pub enabled: bool,
+    pub file: String,
+    pub entries: Vec<String>,
+    pub reload_secs: u64,
+    pub auto: bool,
+    pub auto_after_bans: u64,
+    pub auto_window_secs: u64,
+    pub auto_duration_secs: u64,
+    pub auto_state_file: String,
+    pub auto_idle_secs: u64,
+    pub dns_scan: bool,
+    pub dns_recheck_secs: u64,
+    pub whitelist_file: String,
+    pub whitelist: Vec<String>,
+}
+
+impl Default for BlocklistConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            file: "blocklist.txt".into(),
+            entries: Vec::new(),
+            reload_secs: 5,
+            auto: true,
+            auto_after_bans: 3,
+            auto_window_secs: 86_400,
+            auto_duration_secs: 21_600,
+            auto_state_file: "auto-blocklist.json".into(),
+            auto_idle_secs: 300,
+            dns_scan: true,
+            dns_recheck_secs: 300,
+            whitelist_file: "whitelist.txt".into(),
+            whitelist: Vec::new(),
+        }
+    }
+}
+
+impl BlocklistConfig {
+    fn validate(&self) -> Result<()> {
+        for entry in &self.entries {
+            parse_cidr(entry).context("[blocklist] entries")?;
+        }
+        for entry in &self.whitelist {
+            parse_cidr(entry).context("[blocklist] whitelist")?;
+        }
+        check_range("[blocklist] reload_secs", self.reload_secs, 1, 3_600)?;
+        check_range("[blocklist] auto_after_bans", self.auto_after_bans, 1, 100)?;
+        check_range("[blocklist] auto_window_secs", self.auto_window_secs, 10, 30 * 86_400)?;
+        check_range("[blocklist] auto_duration_secs", self.auto_duration_secs, 10, 365 * 86_400)?;
+        check_range("[blocklist] dns_recheck_secs", self.dns_recheck_secs, 5, 86_400)?;
+        if self.auto_idle_secs != 0 {
+            check_range("[blocklist] auto_idle_secs", self.auto_idle_secs, 10, 30 * 86_400)?;
+        }
+        Ok(())
+    }
+}
+
+/// `[ratelimit]` — automatic bans of sources sending too many packets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RatelimitConfig {
+    pub mode: ProtectionMode,
+    pub networks: Vec<String>,
+    pub pps: u64,
+    pub ban_secs: u64,
+    pub allow: Vec<String>,
+    pub strikes: u64,
+    pub strike_window_secs: u64,
+}
+
+impl Default for RatelimitConfig {
+    fn default() -> Self {
+        Self {
+            mode: ProtectionMode::Off,
+            networks: Vec::new(),
+            pps: 3000,
+            ban_secs: 900,
+            allow: Vec::new(),
+            strikes: 30,
+            strike_window_secs: 60,
+        }
+    }
+}
+
+impl RatelimitConfig {
+    fn validate(&self) -> Result<()> {
+        for network in self.networks.iter().chain(&self.allow) {
+            parse_cidr(network).context("[ratelimit] networks/allow")?;
+        }
+        if self.mode != ProtectionMode::Off && self.networks.is_empty() {
+            bail!("[ratelimit] networks must not be empty when the rate limit is on");
+        }
+        check_range("[ratelimit] pps", self.pps, 50, 10_000_000)?;
+        check_range("[ratelimit] ban_secs", self.ban_secs, 5, 86_400)?;
+        check_range("[ratelimit] strike_window_secs", self.strike_window_secs, 1, 3_600)
+    }
+}
+
+/// `[unused]` — drop traffic to unrouted addresses of whole networks.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UnusedConfig {
+    pub enabled: bool,
+    pub networks: Vec<String>,
+}
+
+impl UnusedConfig {
+    fn validate(&self) -> Result<()> {
+        for network in &self.networks {
+            parse_cidr(network).context("[unused] networks")?;
+        }
+        if self.networks.len() > 8 {
+            bail!("[unused] supports at most 8 networks");
+        }
+        if self.enabled && self.networks.is_empty() {
+            bail!("[unused] networks must not be empty when enabled");
+        }
+        Ok(())
     }
 }
 
@@ -154,6 +582,8 @@ pub struct XdpConfig {
     /// Capacity of `connection_throttle`: source IPs with an active throttle
     /// window.
     pub max_throttled_ips: u32,
+    /// Further interfaces, attached in skb mode.
+    pub extra_interfaces: Vec<String>,
 }
 
 impl Default for XdpConfig {
@@ -163,6 +593,7 @@ impl Default for XdpConfig {
             max_pending_connections: 16384,
             max_player_connections: 65535,
             max_throttled_ips: 65535,
+            extra_interfaces: Vec::new(),
         }
     }
 }
@@ -285,6 +716,13 @@ impl Config {
     /// Reject values the eBPF program or loader cannot represent sensibly.
     fn validate(&self) -> Result<()> {
         self.filter.validate()?;
+        self.targets.validate()?;
+        self.autodetect.validate()?;
+        self.penalty.validate()?;
+        self.reflection.validate()?;
+        self.blocklist.validate()?;
+        self.ratelimit.validate()?;
+        self.unused.validate()?;
         self.xdp.validate()?;
         self.metrics.validate()?;
         self.logging.validate()
@@ -301,8 +739,8 @@ fn check_range(option: &str, value: u64, min: u64, max: u64) -> Result<()> {
 
 impl FilterConfig {
     fn validate(&self) -> Result<()> {
-        if self.start_port == 0 {
-            bail!("[filter] start_port must be >= 1");
+        if self.start_port == 0 && self.end_port != 0 {
+            bail!("[filter] start_port must be >= 1 (or 0 for both to disable the static range)");
         }
         if self.start_port > self.end_port {
             bail!(
@@ -322,12 +760,81 @@ impl FilterConfig {
             self.player_idle_timeout_secs,
             1,
             86_400,
-        )
+        )?;
+        check_range("[filter] online_mode_cache_secs", self.online_mode_cache_secs, 10, 86_400)?;
+        check_range("[filter] adopt_grace_secs", self.adopt_grace_secs, 0, 3_600)
+    }
+}
+
+impl TargetsConfig {
+    fn validate(&self) -> Result<()> {
+        for entry in self.java.iter().chain(&self.bedrock) {
+            parse_socket_addr(entry).with_context(|| format!("[targets] invalid entry '{entry}'"))?;
+        }
+        for entry in &self.exclude {
+            parse_exclude(entry).with_context(|| format!("[targets] invalid exclude '{entry}'"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Parses "ip:port" (IPv4 only, the filter does not inspect IPv6).
+pub fn parse_socket_addr(entry: &str) -> Result<std::net::SocketAddrV4> {
+    entry
+        .parse()
+        .with_context(|| format!("expected \"ipv4:port\", got '{entry}'"))
+}
+
+/// Parses "ip:port/tcp" or "ip:port/udp" into the address and its IP protocol.
+pub fn parse_exclude(entry: &str) -> Result<(std::net::SocketAddrV4, u8)> {
+    let (addr, proto) = entry
+        .rsplit_once('/')
+        .with_context(|| format!("expected \"ipv4:port/tcp\" or \"ipv4:port/udp\", got '{entry}'"))?;
+    let proto = match proto {
+        "tcp" => libc::IPPROTO_TCP as u8,
+        "udp" => libc::IPPROTO_UDP as u8,
+        other => bail!("unknown protocol '{other}', expected tcp or udp"),
+    };
+    Ok((parse_socket_addr(addr)?, proto))
+}
+
+/// Parses "a.b.c.d/len" into (network address, prefix length).
+pub fn parse_cidr(entry: &str) -> Result<(std::net::Ipv4Addr, u8)> {
+    let (addr, len) = entry.split_once('/').unwrap_or((entry, "32"));
+    let addr: std::net::Ipv4Addr = addr
+        .parse()
+        .with_context(|| format!("invalid network address in '{entry}'"))?;
+    let len: u8 = len
+        .parse()
+        .with_context(|| format!("invalid prefix length in '{entry}'"))?;
+    if len > 32 {
+        bail!("prefix length of '{entry}' must be <= 32");
+    }
+    Ok((addr, len))
+}
+
+impl AutodetectConfig {
+    fn validate(&self) -> Result<()> {
+        for network in &self.networks {
+            parse_cidr(network).context("[autodetect] networks")?;
+        }
+        if self.enabled && self.networks.is_empty() {
+            bail!("[autodetect] networks must not be empty when auto detection is enabled");
+        }
+        check_range("[autodetect] probe_interval_secs", self.probe_interval_secs, 10, 86_400)?;
+        check_range("[autodetect] probe_timeout_ms", self.probe_timeout_ms, 100, 30_000)?;
+        check_range("[autodetect] remove_after_secs", self.remove_after_secs, 60, 30 * 86_400)?;
+        check_range("[autodetect] retry_negative_secs", self.retry_negative_secs, 10, 30 * 86_400)
     }
 }
 
 impl XdpConfig {
     fn validate(&self) -> Result<()> {
+        for name in &self.extra_interfaces {
+            if name.is_empty() || name.len() > 15 || name.contains(['/', ' ']) {
+                bail!("[xdp] extra_interfaces: invalid interface name '{name}'");
+            }
+        }
         const MAX_ENTRIES: u64 = 1 << 20;
         check_range(
             "[xdp] max_pending_connections",
@@ -402,6 +909,61 @@ mod tests {
     #[test]
     fn rejects_zero_start_port() {
         let cfg: Config = toml::from_str("[filter]\nstart_port = 0").unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_disabled_static_range() {
+        let cfg: Config = toml::from_str("[filter]\nstart_port = 0\nend_port = 0").unwrap();
+        cfg.validate().expect("0/0 disables the static range");
+    }
+
+    #[test]
+    fn parses_targets_and_excludes() {
+        let cfg: Config = toml::from_str(
+            "[targets]\njava = [\"85.93.5.1:25569\"]\nexclude = [\"85.93.5.55:443/tcp\"]",
+        )
+        .unwrap();
+        cfg.validate().expect("valid targets");
+        assert!(parse_exclude("1.2.3.4:5/icmp").is_err());
+        assert!(parse_socket_addr("1.2.3.4").is_err());
+        assert_eq!(parse_cidr("85.93.5.0/24").unwrap().1, 24);
+    }
+
+    #[test]
+    fn reflection_requires_networks() {
+        let cfg: Config = toml::from_str("[reflection]\nmode = \"monitor\"").unwrap();
+        assert!(cfg.validate().is_err());
+        let cfg: Config =
+            toml::from_str("[reflection]\nmode = \"enforce\"\nnetworks = [\"85.93.5.0/24\"]").unwrap();
+        cfg.validate().expect("valid reflection config");
+    }
+
+    #[test]
+    fn ratelimit_validation() {
+        let cfg: Config = toml::from_str("[ratelimit]\nmode = \"enforce\"").unwrap();
+        assert!(cfg.validate().is_err()); // no networks
+        let cfg: Config = toml::from_str(
+            "[ratelimit]\nmode = \"enforce\"\nnetworks = [\"85.93.5.0/24\"]\nallow = [\"1.2.3.4\"]",
+        )
+        .unwrap();
+        cfg.validate().expect("valid rate limit");
+        let cfg: Config = toml::from_str("[blocklist]\nentries = [\"nope\"]").unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn unused_requires_networks() {
+        let cfg: Config = toml::from_str("[unused]\nenabled = true").unwrap();
+        assert!(cfg.validate().is_err());
+        let cfg: Config =
+            toml::from_str("[unused]\nenabled = true\nnetworks = [\"85.93.5.0/24\"]").unwrap();
+        cfg.validate().expect("valid unused config");
+    }
+
+    #[test]
+    fn autodetect_requires_networks() {
+        let cfg: Config = toml::from_str("[autodetect]\nenabled = true").unwrap();
         assert!(cfg.validate().is_err());
     }
 

@@ -16,6 +16,8 @@ enum stats_mask {
     TCP_BYPASS      = 1u << 5,
     INCOMING_BYTES  = 1u << 6,
     DROPPED_BYTES   = 1u << 7,
+    ADOPTED         = 1u << 8,
+    OFFLINE_REJECTED = 1u << 9,
 };
 
 // one per-cpu slot of stats_map; must match `Statistics` in loader/metrics.rs
@@ -29,26 +31,25 @@ struct statistics
     __u64 tcp_bypass;
     __u64 incoming_bytes;
     __u64 dropped_bytes;
+    __u64 adopted;
+    __u64 offline_rejected;
 };
-_Static_assert(sizeof(struct statistics) == 64, "statistics size mismatch!");
+_Static_assert(sizeof(struct statistics) == 80, "statistics size mismatch!");
 
-/*
- * Adds `amount` to every counter selected by `bitmask`.
- *
- * stats_ptr is NULL whenever PROMETHEUS is 0 (the filter only looks it up
- * when enabled), so the PROMETHEUS check below also guards the dereference.
- * Since PROMETHEUS lives in .rodata, the verifier knows its value at load
- * time and removes either the early return or the entire body as dead code;
- * with constant bitmasks the compiler reduces each call to the few
- * increments that are actually selected.
- */
-static __always_inline void count_stats(struct statistics *stats_ptr, const __u32 bitmask, const __u64 amount)
+// key of dst_stats_map and protected_targets: one entry per destination
+// ip:port and l4 protocol, address and port in network byte order; must match
+// `DstKey` in loader/targets.rs
+struct dst_key
 {
-    if (!PROMETHEUS)
-    {
-        return;
-    }
+    __u32 daddr;
+    __u16 dport;
+    __u8 proto; // IPPROTO_TCP or IPPROTO_UDP
+    __u8 pad;
+};
+_Static_assert(sizeof(struct dst_key) == 8, "dst_key size mismatch!");
 
+static __always_inline void add_stats(struct statistics *stats_ptr, const __u32 bitmask, const __u64 amount)
+{
     if (bitmask & INCOMING_BYTES)
     {
         stats_ptr->incoming_bytes += amount;
@@ -87,6 +88,42 @@ static __always_inline void count_stats(struct statistics *stats_ptr, const __u3
     if (bitmask & TCP_BYPASS)
     {
         stats_ptr->tcp_bypass += amount;
+    }
+
+    if (bitmask & ADOPTED)
+    {
+        stats_ptr->adopted += amount;
+    }
+
+    if (bitmask & OFFLINE_REJECTED)
+    {
+        stats_ptr->offline_rejected += amount;
+    }
+}
+
+/*
+ * Adds `amount` to every counter selected by `bitmask`, both in the global
+ * totals and in the per destination ip:port entry.
+ *
+ * stats_ptr is NULL whenever PROMETHEUS is 0 (the filter only looks it up
+ * when enabled), so the PROMETHEUS check below also guards the dereference.
+ * Since PROMETHEUS lives in .rodata, the verifier knows its value at load
+ * time and removes either the early return or the entire body as dead code;
+ * with constant bitmasks the compiler reduces each call to the few
+ * increments that are actually selected. dst_stats_ptr can be NULL even with
+ * PROMETHEUS enabled (dst_stats_map full and insert raced), so it is checked.
+ */
+static __always_inline void count_stats(struct statistics *stats_ptr, struct statistics *dst_stats_ptr, const __u32 bitmask, const __u64 amount)
+{
+    if (!PROMETHEUS)
+    {
+        return;
+    }
+
+    add_stats(stats_ptr, bitmask, amount);
+    if (dst_stats_ptr)
+    {
+        add_stats(dst_stats_ptr, bitmask, amount);
     }
 }
 

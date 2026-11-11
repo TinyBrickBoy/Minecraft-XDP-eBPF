@@ -1,17 +1,29 @@
+mod blocklist;
 mod config;
+mod detect;
 mod ebpf;
+mod interfaces;
 mod logging;
 mod metrics;
+mod penalty;
+mod players;
+mod reflection;
 mod shutdown;
+mod targets;
+mod unused;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use aya::maps::HashMap;
 use log::{error, info};
 
 use config::Config;
 use shutdown::Shutdown;
+use targets::{DstKey, Kind, Source, Targets};
 
 const USAGE: &str = "\
 Usage: xdp-loader [OPTIONS] <INTERFACE>
@@ -22,6 +34,7 @@ Arguments:
 Options:
   -c, --config <FILE>  Path to the TOML configuration file, created with
                        defaults if missing [default: config.toml]
+      --check-config   Validate the configuration file and exit
       --license        Print license information
   -h, --help           Print help
   -V, --version        Print version";
@@ -34,6 +47,8 @@ struct Args {
     config: String,
     /// Print license information instead of running.
     license: bool,
+    /// Only validate the configuration file.
+    check_config: bool,
 }
 
 /// Hand-rolled argument parsing (a CLI library would double the binary size
@@ -43,6 +58,7 @@ fn parse_args() -> Args {
         interface: None,
         config: "config.toml".into(),
         license: false,
+        check_config: false,
     };
 
     let mut argv = std::env::args().skip(1);
@@ -61,6 +77,7 @@ fn parse_args() -> Args {
                 std::process::exit(0);
             }
             "--license" => args.license = true,
+            "--check-config" => args.check_config = true,
             "-c" | "--config" => match argv.next() {
                 Some(value) => args.config = value,
                 None => invalid(format!("missing value for '{arg} <FILE>'")),
@@ -74,7 +91,7 @@ fn parse_args() -> Args {
         }
     }
 
-    if args.interface.is_none() && !args.license {
+    if args.interface.is_none() && !args.license && !args.check_config {
         invalid("missing required argument <INTERFACE>".into());
     }
     args
@@ -97,6 +114,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    if args.check_config {
+        println!("config '{}' is valid", args.config);
+        return;
+    }
 
     logging::init(&config.logging).expect("Failed to setup logger");
     info!(
@@ -134,14 +155,131 @@ fn run(args: &Args, config: &Config, shutdown: &Arc<Shutdown>) -> Result<()> {
     // keep the handle alive until the end of this function: dropping it
     // detaches the XDP program
     let mut ebpf = ebpf::load_and_attach(interface, config)?;
-    let stats_thread = metrics::start(&mut ebpf, config, shutdown)?;
+
+    let map = ebpf
+        .take_map("protected_targets")
+        .context("can't take map 'protected_targets'")?;
+    let targets = Arc::new(Targets::new(
+        HashMap::try_from(map)?,
+        config.filter.adopt_grace_secs,
+    ));
+    apply_config_targets(config, &targets)?;
+
+    // like detection, a failing reflection setup must not take the filter down
+    let reflection_stats = match reflection::setup(&mut ebpf, interface, config, shutdown) {
+        Ok(stats) => stats,
+        Err(e) => {
+            error!("UDP reflection protection disabled: {e:#}");
+            None
+        }
+    };
+
+    let unused_stats = unused::setup(&mut ebpf, config)?;
+    // keeps the redirect rules alive until the end of run()
+    let penalty = match penalty::setup(&mut ebpf, interface, config, shutdown) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Penalty box disabled: {e:#}");
+            None
+        }
+    };
+    let (_penalty_redirect, penalty_thread) = match penalty {
+        Some((redirect, thread)) => (Some(redirect), Some(thread)),
+        None => (None, None),
+    };
+    let (block_handles, block_thread) = match blocklist::setup(&mut ebpf, interface, config, shutdown) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("Blocklist/rate limit setup failed: {e:#}");
+            (None, None)
+        }
+    };
+
+    // the same filter on further interfaces (upstream tunnels), once every
+    // program it needs is loaded
+    let mut watched = vec![(interface.to_owned(), interfaces::index(interface))];
+    watched.extend(interfaces::attach_extra(&mut ebpf, &config.xdp.extra_interfaces));
+
+    let mut threads = Vec::new();
+    let extra = metrics::Extra {
+        reflection: reflection_stats,
+        unused: unused_stats,
+        blocklist: block_handles,
+    };
+    threads.extend(block_thread);
+    threads.extend(penalty_thread);
+    if let Some(handle) = metrics::start(&mut ebpf, config, targets.clone(), extra, shutdown)? {
+        threads.push(handle);
+    }
+    if config.autodetect.enabled {
+        // the filter keeps running without detection rather than not at all
+        match detect::start(config, targets, shutdown) {
+            Ok(handles) => threads.extend(handles),
+            Err(e) => error!("Auto detection disabled: {e:#}"),
+        }
+    }
+
+    // a NIC that is re-created (hotplug, queue changes by the hypervisor) comes
+    // back under the same name with a new index and without our program:
+    // exit with an error so the service manager restarts us onto the new one.
+    // The same for an extra interface that appears, disappears or changes.
+    let interface_lost = Arc::new(AtomicBool::new(false));
+    threads.push(watch_interfaces(watched, shutdown.clone(), interface_lost.clone())?);
 
     shutdown.wait();
 
-    if let Some(handle) = stats_thread {
+    for handle in threads {
+        let name = handle.thread().name().unwrap_or("?").to_owned();
         handle
             .join()
-            .map_err(|e| anyhow::anyhow!("track-stats thread panicked: {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("{name} thread panicked: {e:?}"))?;
+    }
+    if interface_lost.load(Ordering::SeqCst) {
+        anyhow::bail!("an interface of the filter changed");
+    }
+    Ok(())
+}
+
+/// Triggers shutdown (and sets `lost`) once one of `watched` (name, index
+/// at attach time, 0 = missing) disappears, appears or gets another index.
+fn watch_interfaces(
+    watched: Vec<(String, u32)>,
+    shutdown: Arc<Shutdown>,
+    lost: Arc<AtomicBool>,
+) -> Result<std::thread::JoinHandle<()>> {
+    Ok(std::thread::Builder::new()
+        .name("watch-interface".into())
+        .spawn(move || {
+            while shutdown.sleep(Duration::from_secs(2)) {
+                for (interface, index) in &watched {
+                    let current = interfaces::index(interface);
+                    if current != *index {
+                        error!(
+                            "Interface {interface} changed (index {index} -> {current}), the filter has to be re-attached; exiting for a restart"
+                        );
+                        lost.store(true, Ordering::SeqCst);
+                        shutdown.trigger();
+                        return;
+                    }
+                }
+            }
+        })?)
+}
+
+/// Writes the [targets] entries of the config into the kernel map.
+fn apply_config_targets(config: &Config, targets: &Targets) -> Result<()> {
+    for (entries, kind) in [
+        (&config.targets.java, Kind::Java),
+        (&config.targets.bedrock, Kind::Bedrock),
+    ] {
+        for entry in entries {
+            let addr = config::parse_socket_addr(entry)?;
+            targets.set(DstKey::new(addr, kind.proto()), kind, Source::Static)?;
+        }
+    }
+    for entry in &config.targets.exclude {
+        let (addr, proto) = config::parse_exclude(entry)?;
+        targets.set(DstKey::new(addr, proto), Kind::None, Source::Exclude)?;
     }
     Ok(())
 }

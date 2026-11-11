@@ -22,6 +22,9 @@ chrono = "0.4"
 file-rotate = "0.8"
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.1.2"
+# CLOCK_MONOTONIC reads (bpf_ktime) and the AF_PACKET sniffer of autodetect
+libc = "0.2"
+serde_json = "1"
 
 [profile.release]
 # the packet hot path lives in the kernel; the loader itself is not

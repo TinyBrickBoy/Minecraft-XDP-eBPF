@@ -7,10 +7,15 @@ fn main() {
     // also watch the generated .o and recompile on every build
     for source in [
         "xdp/minecraft_filter.c",
+        "xdp/blocklist.h",
         "xdp/common.h",
         "xdp/config.h",
+        "xdp/l3.h",
+        "xdp/penalty.h",
         "xdp/protocol.h",
+        "xdp/reflection.h",
         "xdp/stats.h",
+        "xdp/unused.h",
         "xdp/varint.h",
     ] {
         println!("cargo:rerun-if-changed={source}");

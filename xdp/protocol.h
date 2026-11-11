@@ -165,9 +165,22 @@ static __always_inline __u8 inspect_ping_request(const __u8 *cursor, const __u8 
     return cursor == payload_end;
 }
 
-// returns 1 if the payload is exactly one valid login request packet
-static __always_inline __u8 inspect_login_packet(const __u8 *cursor, const __u8 *payload_end, const void *data_end, const __s32 protocol_version)
+// reads a uuid and reports its version (high nibble of byte 6): 3 is an
+// offline-mode uuid derived from the name, 4 a Mojang account
+#define READ_UUID_VERSION_OR_RETURN(version, ptr, pend, dend) \
+    do                                                        \
+    {                                                         \
+        CHECK_BOUNDS_OR_RETURN(ptr, UUID_LEN, pend, dend);    \
+        *(version) = (ptr)[6] >> 4;                           \
+        (ptr) += UUID_LEN;                                    \
+    } while (0)
+
+// returns 1 if the payload is exactly one valid login request packet;
+// *uuid_version is the version of the uuid the client sent (0 when none)
+static __always_inline __u8 inspect_login_packet(const __u8 *cursor, const __u8 *payload_end, const void *data_end, const __s32 protocol_version,
+                                                 __u8 *uuid_version)
 {
+    *uuid_version = 0;
     struct varint_value varint;
 
     // packet length
@@ -212,7 +225,7 @@ static __always_inline __u8 inspect_login_packet(const __u8 *cursor, const __u8 
     {
         if (protocol_version >= 764)
         {
-            SKIP_OR_RETURN(cursor, UUID_LEN, payload_end, data_end);
+            READ_UUID_VERSION_OR_RETURN(uuid_version, cursor, payload_end, data_end);
         }
         else
         {
@@ -220,7 +233,7 @@ static __always_inline __u8 inspect_login_packet(const __u8 *cursor, const __u8 
             READ_VAL_OR_RETURN(has_uuid, cursor, payload_end, data_end);
             if (has_uuid)
             {
-                SKIP_OR_RETURN(cursor, UUID_LEN, payload_end, data_end);
+                READ_UUID_VERSION_OR_RETURN(uuid_version, cursor, payload_end, data_end);
             }
         }
     }

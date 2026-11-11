@@ -18,8 +18,21 @@
  */
 volatile const __u8 PROMETHEUS = 0;           // collect statistics in stats_map
 volatile const __u8 ONLINE_NAMES = 0;         // enforce online-mode usernames (max 16 chars)
-volatile const __u32 START_PORT = 0;          // first TCP port of the filtered range (inclusive)
-volatile const __u32 END_PORT = 0;            // last TCP port of the filtered range (inclusive)
+volatile const __u32 START_PORT = 0;          // first TCP port of the static java range (inclusive), 0 disables it
+volatile const __u32 END_PORT = 0;            // last TCP port of the static java range (inclusive)
+volatile const __u64 STATIC_GRACE_UNTIL_NS = 0; // ktime until which the static range adopts established flows
+volatile const __u8 UNUSED_DROP = 0;
+volatile const __u8 BLOCKLIST_ACTIVE = 0;     // drop sources in the blocklist map
+volatile const __u8 RATELIMIT_MODE = 0;       // enum ratelimit_mode
+volatile const __u64 RATELIMIT_PPS = 0;       // packets per second per source before a ban
+volatile const __u64 RATELIMIT_BAN_NS = 0;    // length of an automatic ban
+volatile const __u64 STRIKE_LIMIT = 0;        // violations per source per window before a ban, 0 disables
+volatile const __u64 STRIKE_WINDOW_NS = 0;    // strike counting window
+volatile const __u64 PENALTY_NS = 0;          // penalty box length for throttled real clients, 0 disables
+volatile const __u64 PENALTY_VERIFIED_NS = 0; // a source counts as a real client this long after a ping/login
+volatile const __u8 DNS_SCAN = 0;             // note DNS queries to protected addresses for the loader
+volatile const __u64 DNS_RECHECK_NS = 0;      // how long a "DNS server / no DNS server" verdict is trusted          // drop traffic to unrouted addresses of unused_networks
+volatile const __u8 L3_INTERFACES = 0;      // 1 when interfaces without link layer header are attached (see l3.h)
 volatile const __u32 HIT_COUNT = 0;           // max SYNs per source ip per window, 0 disables the throttle
 volatile const __u64 HIT_COUNT_RESET_NS = 0;  // throttle window length in nanoseconds
 volatile const __u64 PLAYER_IDLE_NS = 0;      // idle check interval for verified connections in nanoseconds;

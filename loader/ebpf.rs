@@ -33,12 +33,45 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
     let hit_count: u32 = filter.hit_count;
     let hit_count_reset_ns: u64 = filter.hit_count_reset_secs * 1_000_000_000;
     let player_idle_ns: u64 = filter.player_idle_timeout_secs * 1_000_000_000;
+    // established flows to the static range are adopted for a while after
+    // start, so a restart does not kick the connected players
+    let unused_drop: u8 = config.unused.enabled as u8;
+    let blocklist_active: u8 = config.blocklist.enabled as u8;
+    let ratelimit_mode: u8 = match config.ratelimit.mode {
+        crate::config::ProtectionMode::Off => 0,
+        crate::config::ProtectionMode::Monitor => 1,
+        crate::config::ProtectionMode::Enforce => 2,
+    };
+    let ratelimit_pps: u64 = config.ratelimit.pps;
+    let ratelimit_ban_ns: u64 = config.ratelimit.ban_secs * 1_000_000_000;
+    let strike_limit: u64 = config.ratelimit.strikes;
+    let penalty_ns: u64 = if config.penalty.enabled { config.penalty.seconds * 1_000_000_000 } else { 0 };
+    let penalty_verified_ns: u64 = config.penalty.verified_window_secs * 1_000_000_000;
+    let dns_scan: u8 = (config.blocklist.enabled && config.blocklist.dns_scan && !config.ratelimit.networks.is_empty()) as u8;
+    let dns_recheck_ns: u64 = config.blocklist.dns_recheck_secs * 1_000_000_000;
+    let strike_window_ns: u64 = config.ratelimit.strike_window_secs * 1_000_000_000;
+    let l3_interfaces: u8 = (crate::interfaces::is_l3(interface) || !config.xdp.extra_interfaces.is_empty()) as u8;
+    let static_grace_until_ns: u64 =
+        crate::targets::monotonic_ns() + filter.adopt_grace_secs * 1_000_000_000;
 
     let mut ebpf = EbpfLoader::new()
         .override_global("PROMETHEUS", &prometheus, true)
+        .override_global("L3_INTERFACES", &l3_interfaces, true)
         .override_global("ONLINE_NAMES", &online_names, true)
         .override_global("START_PORT", &start_port, true)
         .override_global("END_PORT", &end_port, true)
+        .override_global("STATIC_GRACE_UNTIL_NS", &static_grace_until_ns, true)
+        .override_global("UNUSED_DROP", &unused_drop, true)
+        .override_global("BLOCKLIST_ACTIVE", &blocklist_active, true)
+        .override_global("RATELIMIT_MODE", &ratelimit_mode, true)
+        .override_global("RATELIMIT_PPS", &ratelimit_pps, true)
+        .override_global("RATELIMIT_BAN_NS", &ratelimit_ban_ns, true)
+        .override_global("STRIKE_LIMIT", &strike_limit, true)
+        .override_global("STRIKE_WINDOW_NS", &strike_window_ns, true)
+        .override_global("DNS_SCAN", &dns_scan, true)
+        .override_global("PENALTY_NS", &penalty_ns, true)
+        .override_global("PENALTY_VERIFIED_NS", &penalty_verified_ns, true)
+        .override_global("DNS_RECHECK_NS", &dns_recheck_ns, true)
         .override_global("HIT_COUNT", &hit_count, true)
         .override_global("HIT_COUNT_RESET_NS", &hit_count_reset_ns, true)
         .override_global("PLAYER_IDLE_NS", &player_idle_ns, true)
@@ -57,6 +90,11 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
         .context("program 'minecraft_filter' not found")?
         .try_into()?;
     program.load()?;
+    crate::interfaces::register(&mut ebpf, interface)?;
+    let program: &mut Xdp = ebpf
+        .program_mut("minecraft_filter")
+        .context("program 'minecraft_filter' not found")?
+        .try_into()?;
 
     // Auto does its own driver -> skb fallback instead of leaving the choice
     // to the kernel, so the mode that is actually active can be logged.

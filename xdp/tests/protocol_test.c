@@ -164,7 +164,8 @@ static __u8 run_ping(const __u8 *pkt, __u32 len)
 static __u8 run_login(const __u8 *pkt, __u32 len, __s32 protocol)
 {
     __u8 *heap = heap_copy(pkt, len, 0);
-    const __u8 ok = inspect_login_packet(heap, heap + len, heap + len, protocol);
+    __u8 uuid_version;
+    const __u8 ok = inspect_login_packet(heap, heap + len, heap + len, protocol, &uuid_version);
     free(heap);
     return ok;
 }
