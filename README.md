@@ -199,6 +199,13 @@ Then just run the executable in sudo mode or via root
 
 **Note:** This project uses a persistent XDP loader. The userspace program must stay running to keep the filter attached; all map state (throttle windows, verified connections) is managed in-kernel via `bpf_timer`. Stopping the loader will unload the firewall. Requires Linux kernel 5.15 or newer.
 
+**Kernel 5.15:** not verified for this version. A test boot of Ubuntu's
+5.15.0-97 kernel (qemu) rejects the XDP program as built with clang 19
+(`invalid access to packet` in the java login parser, protocol.h), and the
+same happens with the last release before IPv6 support, so this is not new
+in this version; the verifier gate (`tests/verifier_docker.sh`) runs on the
+build host's kernel only. Use a newer kernel until this is fixed.
+
 ## Configuration
 
 Runtime behavior is controlled by a `config.toml` file next to the binary.
