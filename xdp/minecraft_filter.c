@@ -273,6 +273,16 @@ static __always_inline __u8 dst_has_targets(const struct addr6 *daddr)
 #include "penalty.h"
 
 /*
+ * True when daddr is inside a network of any network wide protection
+ * (rate limit, unused addresses, reflection): packets whose header chain
+ * can not be parsed never pass into them.
+ */
+static __always_inline __u8 dst_protected(const struct addr6 *daddr)
+{
+    return in_ratelimit_networks(daddr) || unused_in_networks(daddr) || reflection_protects(daddr);
+}
+
+/*
  * Looks up the global and the per destination statistics slots. Returns 0
  * only if the global slot is missing, which can not happen (per-cpu array
  * index 0 always exists).
@@ -663,8 +673,10 @@ __s32 minecraft_filter(struct xdp_md *ctx)
         // header shorter than 20 bytes passed; both are garbage). Malformed or
         // overlong IPv6 extension header chains can not be matched against
         // targets without their l4 header; they only pass when the
-        // destination address protects nothing at all
-        if (l.family != FAMILY_V6)
+        // destination is in no protected network and has no target, and
+        // the source is not blocked. A truncated fixed header (no
+        // addresses) is discarded by the kernel anyway
+        if (l.family != FAMILY_V6 || l.l3len == 0)
         {
             return XDP_DROP;
         }
@@ -676,7 +688,11 @@ __s32 minecraft_filter(struct xdp_md *ctx)
         {
             return l.bogus == BOGUS_UNSPEC && is_ndp(ip, data_end, &l) ? XDP_PASS : XDP_DROP;
         }
-        return dst_has_targets(&l.dst) ? XDP_DROP : XDP_PASS;
+        if (dst_has_targets(&l.dst) || blocked_source(&l, (__u64)(data_end - data)) || dst_protected(&l.dst))
+        {
+            return XDP_DROP;
+        }
+        return XDP_PASS;
     }
 
     // neighbour discovery is never dropped, by no feature

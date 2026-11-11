@@ -76,8 +76,10 @@ This fork of [Outfluencer/Minecraft-XDP-eBPF](https://github.com/Outfluencer/Min
   to protected targets are dropped. Packets with more than four extension
   headers or a truncated header chain cannot be matched to a port: they are
   dropped when the destination address has any protected target (any port)
-  or a static java port range is configured, and pass to other
-  destinations. Neighbour discovery (ICMPv6 133-137) is never dropped. DNS
+  or a static java port range is configured, when the destination is inside
+  any `[ratelimit]`, `[unused]` or `[reflection]` network, and when the
+  source is blocklisted or banned; only otherwise they pass. A truncated
+  fixed IPv6 header is always dropped (the kernel discards it too). Neighbour discovery (ICMPv6 133-137) is never dropped. DNS
   scan detection blocklists IPv6 scanners per exact address. IPv4 `/32`
   and IPv6 `/128` entries are shown as plain addresses everywhere (logs,
   auto-blocklist file, state file, `source` label of `xdp_ratelimit_ban`);

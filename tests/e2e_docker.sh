@@ -109,6 +109,7 @@ check "v6 5 ext headers answered unfiltered"   cl $MC v6-ext-chain fd99:1::2 191
 check "v6 atomic fragment answered unfiltered" cl $MC v6-fragment fd99:1::2 19132
 check "v6 5 ext headers echoed unfiltered"     cl $MC v6-ext-echo fd99:3::7 40001 5
 check "v6 atomic fragment echoed unfiltered"   cl $MC v6-fragment-echo fd99:3::7 40001
+check "v6 5 ext headers to the router echoed unfiltered" cl $MC v6-ext-echo fd99::1 40100 5
 
 echo "== sessions established before the filter starts"
 cl $MC player 10.99.1.2 25565 45 & PLAYER=$!
@@ -257,8 +258,11 @@ check "v6 2 ext headers to target pass"      cl $MC v6-ext-chain fd99:1::2 19132
 check "v6 4 ext headers (the limit) pass"    cl $MC v6-ext-chain fd99:1::2 19132 4
 check "v6 5 ext headers to target dropped"   bash -c "! ip netns exec cl $MC v6-ext-chain fd99:1::2 19132 5"
 check "v6 atomic fragment to target dropped" bash -c "! ip netns exec cl $MC v6-fragment fd99:1::2 19132"
-# an address without targets: unparseable chains and fragments pass
-check "v6 5 ext headers to unprotected pass"   cl $MC v6-ext-echo fd99:3::7 40001 5
+# an address without targets outside the protected networks: unparseable
+# chains pass; inside a protected network (rate limit, unused, reflection)
+# they are dropped. Fragments are parseable, they pass to non-targets
+check "v6 5 ext headers to unprotected pass"   cl $MC v6-ext-echo fd99::1 40100 5
+check "v6 5 ext headers into a protected network dropped" bash -c "! ip netns exec cl $MC v6-ext-echo fd99:3::7 40001 5"
 check "v6 atomic fragment to unprotected passes" cl $MC v6-fragment-echo fd99:3::7 40001
 
 echo "== ipv6: connection throttle per /64"
@@ -356,6 +360,7 @@ check "v6 unblocked source works"     cl $B6 $MC udp-echo fd99:1::2 40000 5002
 printf '10.99.0.3   # e2e\nfd99:0:0:3::2   # e2e\n' > $T/blocklist.txt; sleep 3
 check "blocklisted source dropped"    cl $B $MC udp-no-echo 10.99.1.2 40000 5002
 check "v6 blocklisted source dropped" cl $B6 $MC udp-no-echo fd99:1::2 40000 5002
+check "v6 blocklisted source behind 5 ext headers dropped" bash -c "! ip netns exec cl $B6 $MC v6-ext-echo fd99::1 40100 5"
 check "other source still works"      cl $MC udp-echo 10.99.1.2 40000 5003
 check "v6 other source still works"   cl $MC udp-echo fd99:1::2 40000 5003
 check "blocklist hits per source"     bash -c "curl -s 127.0.0.1:1999/metrics | grep -q 'xdp_blocklist_source_packets{src_ip=\"10.99.0.3\"}'"
