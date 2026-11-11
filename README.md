@@ -79,8 +79,11 @@ This fork of [Outfluencer/Minecraft-XDP-eBPF](https://github.com/Outfluencer/Min
   or a static java port range is configured, when the destination is inside
   any `[ratelimit]`, `[unused]` or `[reflection]` network, and when the
   source is blocklisted or banned; only otherwise they pass. A truncated
-  fixed IPv6 header is always dropped (the kernel discards it too). Neighbour discovery (ICMPv6 133-137) is never dropped. DNS
-  scan detection blocklists IPv6 scanners per exact address. IPv4 `/32`
+  fixed IPv6 header is always dropped (the kernel discards it too).
+  Neighbour discovery (ICMPv6 133-137) is never dropped when it is what
+  RFC 4861 allows on the wire: hop limit 255, no extension headers, at most
+  1280 bytes; anything else with those types is filtered like other
+  traffic. DNS scan detection blocklists IPv6 scanners per exact address. IPv4 `/32`
   and IPv6 `/128` entries are shown as plain addresses everywhere (logs,
   auto-blocklist file, state file, `source` label of `xdp_ratelimit_ban`);
   real prefixes keep their length. The `source` label of a ban is the

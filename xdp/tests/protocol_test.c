@@ -1019,6 +1019,81 @@ static void test_raknet_request_2(void)
     CHECK(!run_request_2(p, n, n));
 }
 
+// parses p and runs is_ndp on an exact-size copy
+static __u8 run_is_ndp(const __u8 *p, size_t len)
+{
+    __u8 *copy = malloc(len);
+    memcpy(copy, p, len);
+    struct l3 l;
+    const int ret = parse_l3(copy, copy + len, &l);
+    const __u8 ndp = (ret == L3_OK || (ret == L3_BAD && l.bogus == BOGUS_UNSPEC)) && is_ndp(copy, copy + len, &l);
+    free(copy);
+    return ndp;
+}
+
+static void test_is_ndp(void)
+{
+    __u8 p[2048];
+    // neighbour solicitation, hop limit 255
+    size_t n = build_v6(p, 58, 24);
+    p[7] = 255;
+    p[40] = 135;
+    CHECK(run_is_ndp(p, n));
+    for (int type = 133; type <= 137; type++)
+    {
+        p[40] = type;
+        CHECK(run_is_ndp(p, n));
+    }
+    p[40] = 128; // echo request
+    CHECK(!run_is_ndp(p, n));
+    p[40] = 138;
+    CHECK(!run_is_ndp(p, n));
+
+    // duplicate address detection: from ::
+    p[40] = 135;
+    memset(p + 8, 0, 16);
+    CHECK(run_is_ndp(p, n));
+
+    // hop limit below 255: not from the link, or forwarded
+    n = build_v6(p, 58, 24);
+    p[40] = 135;
+    p[7] = 254;
+    CHECK(!run_is_ndp(p, n));
+    p[7] = 64;
+    CHECK(!run_is_ndp(p, n));
+
+    // the size cap: 1280 bytes still pass, one more does not
+    n = build_v6(p, 58, NDP_MAX_LEN - 40);
+    p[7] = 255;
+    p[40] = 136;
+    CHECK(n == NDP_MAX_LEN && run_is_ndp(p, n));
+    n = build_v6(p, 58, NDP_MAX_LEN - 40 + 1);
+    p[7] = 255;
+    p[40] = 136;
+    CHECK(!run_is_ndp(p, n));
+
+    // behind an extension header (hop-by-hop, destination options, fragment)
+    const __u8 ext[] = {0, 60, 44};
+    for (size_t i = 0; i < sizeof(ext); i++)
+    {
+        n = build_v6(p, ext[i], 8 + 24);
+        p[7] = 255;
+        p[40] = 58;
+        p[48] = 135;
+        CHECK(!run_is_ndp(p, n));
+    }
+
+    // not icmpv6, or IPv4
+    n = build_v6(p, 17, 24);
+    p[7] = 255;
+    p[40] = 135;
+    CHECK(!run_is_ndp(p, n));
+    n = build_v4(p, 58, 0, 24);
+    p[8] = 255;
+    p[20] = 135;
+    CHECK(!run_is_ndp(p, n));
+}
+
 int main(void)
 {
     test_varint_decodes_known_vectors();
@@ -1047,6 +1122,7 @@ int main(void)
     test_parse_v6();
     test_parse_v6_bogus_addresses();
     test_raknet_request_2();
+    test_is_ndp();
 
     printf("%u checks, %u failures\n", checks_run, checks_failed);
     return checks_failed ? 1 : 0;

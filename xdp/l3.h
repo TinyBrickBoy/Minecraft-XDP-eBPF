@@ -70,22 +70,4 @@ static __always_inline __u8 src_aggregate(const struct addr6 *src, struct addr6 
     return 1;
 }
 
-// ICMPv6 router solicitation/advertisement, neighbour solicitation/
-// advertisement and redirect: never dropped, or the host loses its neighbours.
-// NDP is never fragmented (RFC 6980), and a fragment has no icmp header to
-// read the type from
-static __always_inline __u8 is_ndp(const void *ip, const void *data_end, const struct l3 *l)
-{
-    if (l->family != FAMILY_V6 || l->proto != 58 || l->frag != FRAG_NONE)
-    {
-        return 0;
-    }
-    const __u8 *icmp = l4_ptr(ip, l);
-    if ((const void *)(icmp + 1) > data_end)
-    {
-        return 0;
-    }
-    return icmp[0] >= 133 && icmp[0] <= 137;
-}
-
 #endif

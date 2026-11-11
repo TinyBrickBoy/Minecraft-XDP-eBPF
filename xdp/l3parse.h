@@ -207,4 +207,29 @@ static __always_inline const void *l4_ptr(const void *ip, const struct l3 *l)
     return (const __u8 *)ip + (l->l4off & 1023);
 }
 
+/*
+ * ICMPv6 router solicitation/advertisement, neighbour solicitation/
+ * advertisement and redirect: never dropped, or the host loses its
+ * neighbours. Only what RFC 4861 allows on the wire is exempt: hop limit
+ * 255 (proves the sender is on the link), no extension headers (NDP is
+ * never fragmented, RFC 6980, and needs no other header) and at most
+ * NDP_MAX_LEN bytes; anything else is filtered like other traffic.
+ */
+#define NDP_MAX_LEN 1280
+
+static __always_inline __u8 is_ndp(const void *ip, const void *data_end, const struct l3 *l)
+{
+    if (l->family != FAMILY_V6 || l->proto != 58 || l->frag != FRAG_NONE || l->hoplimit != 255 || l->l4off != 40 ||
+        l->l3len > NDP_MAX_LEN)
+    {
+        return 0;
+    }
+    const __u8 *icmp = l4_ptr(ip, l);
+    if ((const void *)(icmp + 1) > data_end)
+    {
+        return 0;
+    }
+    return icmp[0] >= 133 && icmp[0] <= 137;
+}
+
 #endif
