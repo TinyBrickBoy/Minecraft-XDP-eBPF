@@ -36,9 +36,11 @@ pub fn register(ebpf: &mut Ebpf, name: &str) -> Result<()> {
 
 /// Attaches the filter to the extra interfaces, after all programs of the
 /// main interface are loaded. Returns every extra interface with its index
-/// at that time (0 = missing), for the interface watchdog.
-pub fn attach_extra(ebpf: &mut Ebpf, names: &[String]) -> Vec<(String, u32)> {
+/// at that time (0 = missing), for the interface watchdog, and the
+/// interfaces that run the XDP program without the penalty marker.
+pub fn attach_extra(ebpf: &mut Ebpf, names: &[String]) -> (Vec<(String, u32)>, Vec<String>) {
     let mut watched = Vec::new();
+    let mut unmarked = Vec::new();
     for name in names {
         let index = index(name);
         watched.push((name.clone(), index));
@@ -46,14 +48,18 @@ pub fn attach_extra(ebpf: &mut Ebpf, names: &[String]) -> Vec<(String, u32)> {
             warn!("Interface {name} does not exist yet, the filter restarts once it appears");
             continue;
         }
-        if let Err(e) = attach_one(ebpf, name) {
-            warn!("Interface {name}: {e:#}");
+        match attach_one(ebpf, name) {
+            Ok(failed) if failed.contains(&"penalty_mark") => unmarked.push(name.clone()),
+            Ok(_) => {}
+            Err(e) => warn!("Interface {name}: {e:#}"),
         }
     }
-    watched
+    (watched, unmarked)
 }
 
-fn attach_one(ebpf: &mut Ebpf, name: &str) -> Result<()> {
+/// Returns the tc programs (in use on the main interface) that could not
+/// be attached.
+fn attach_one(ebpf: &mut Ebpf, name: &str) -> Result<Vec<&'static str>> {
     register(ebpf, name)?;
     let xdp: &mut Xdp = ebpf
         .program_mut("minecraft_filter")
@@ -63,6 +69,7 @@ fn attach_one(ebpf: &mut Ebpf, name: &str) -> Result<()> {
 
     // the tc programs that are in use on the main interface
     let mut attached = vec!["xdp"];
+    let mut failed = Vec::new();
     for (program, direction) in [
         ("penalty_mark", TcAttachType::Ingress),
         ("reflection_egress", TcAttachType::Egress),
@@ -75,7 +82,10 @@ fn attach_one(ebpf: &mut Ebpf, name: &str) -> Result<()> {
         }
         match classifier.attach(name, direction) {
             Ok(_) => attached.push(program),
-            Err(e) => warn!("Interface {name}: can't attach {program}: {e}"),
+            Err(e) => {
+                warn!("Interface {name}: can't attach {program}: {e}");
+                failed.push(program);
+            }
         }
     }
     info!(
@@ -83,5 +93,5 @@ fn attach_one(ebpf: &mut Ebpf, name: &str) -> Result<()> {
         attached.join(", "),
         if is_l3(name) { ", no link layer header" } else { "" }
     );
-    Ok(())
+    Ok(failed)
 }

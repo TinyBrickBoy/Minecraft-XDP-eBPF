@@ -452,6 +452,7 @@ P76="env E2E_BIND=fd99:0:0:7::2"; P86="env E2E_BIND=fd99:0:0:8::2"
 check "redirect rules installed"      bash -c "nft list table inet xdp_penalty | grep -q 'dnat ip to 10.99.0.1:25599'"
 check "v6 redirect rules installed"   bash -c "nft list table inet xdp_penalty | grep -qF 'dnat ip6 to [fd99::1]:25599'"
 check "unredirected marked flows dropped" bash -c "nft list table inet xdp_penalty | grep -q 'ipv4 .*ct status ! dnat drop' && nft list table inet xdp_penalty | grep -q 'ipv6 .*ct status ! dnat drop'"
+check "untracked marked packets dropped" bash -c "nft list table inet xdp_penalty | grep -q 'ipv4 .*ct state invalid,untracked drop' && nft list table inet xdp_penalty | grep -q 'ipv6 .*ct state invalid,untracked drop'"
 check "real client: server list ping" cl $P7 $MC status 10.99.1.2 25565
 check "v6 real client: server list ping" cl $P76 $MC status fd99:1::2 25565
 # a game connection of the client, verified before the penalty, keeps
@@ -590,17 +591,26 @@ end_port = 0
 adopt_grace_secs = 0
 hit_count_reset_secs = 10
 [targets]
-java = ["10.99.1.2:25565", "[fd99:1::2]:25565"]
+java = ["10.99.1.2:25565", "[fd99:1::2]:25565", "10.99.1.2:25566"]
 [autodetect]
 enabled = false
 [xdp]
 mode = "skb"
 CONF
+# a notrack rule for a java port (penalized connections through it can not
+# be redirected): the loader warns about it
+nft -f - <<NFT
+table inet e2e_raw {
+    chain pre { type filter hook prerouting priority -300; policy accept; tcp dport 25566 notrack; }
+}
+NFT
 sleep 0.5
 mark=$(wc -l < $T/loader.log)
 (cd $T && exec "$OLDPWD/$BIN" --config $T/config5.toml c0 >> $T/loader.log 2>&1) & LOADER=$!
 for i in $(seq 1 20); do tail -n +$((mark + 1)) $T/loader.log | grep -q 'Penalty box: throttled' && break; sleep 0.5; done
 check "v6 service bind failure logged" bash -c "tail -n +$((mark + 1)) $T/loader.log | grep -qF 'listen on [fd99::1]:25599'"
+check "notrack rule on a java port warned about" bash -c "tail -n +$((mark + 1)) $T/loader.log | grep -q 'notrack rule may hit java targets.*25566'"
+nft delete table inet e2e_raw
 check "only the v4 redirect rule installed" bash -c "nft list table inet xdp_penalty | grep -q 'dnat ip to 10.99.0.1:25599' && ! nft list table inet xdp_penalty | grep -q 'ip6'"
 P9="env E2E_BIND=10.99.0.9"; P96="env E2E_BIND=fd99:0:0:9::2"
 check "v4-only penalty: real client ping"       cl $P9 $MC status 10.99.1.2 25565

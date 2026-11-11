@@ -33,6 +33,61 @@ const READY_V6: u64 = 2;
 /// Removes the redirect again when dropped.
 pub struct Redirect;
 
+/// The families the penalty box is set up for; written to `penalty_ready`
+/// only once the tc marker runs on every interface of the filter.
+pub struct Ready {
+    map: Array<MapData, u64>,
+    bits: u64,
+}
+
+impl Ready {
+    /// Switches the penalty box on, unless `penalty_mark` could not be
+    /// attached to one of the interfaces the XDP program runs on: the XDP
+    /// program would pass penalized sources there that nothing redirects.
+    pub fn activate(mut self, failed: &[String]) {
+        let bits = ready_after_attach(self.bits, failed);
+        if bits == 0 && self.bits != 0 {
+            warn!(
+                "Penalty box off: its tc marker is missing on {}, penalized clients would reach the servers unfiltered there",
+                failed.join(", ")
+            );
+        }
+        if let Err(e) = self.map.set(0, bits, 0) {
+            warn!("Penalty box off: can't set penalty_ready: {e}");
+        }
+    }
+}
+
+/// `penalty_ready` once the marker was attached everywhere but `failed`.
+fn ready_after_attach(bits: u64, failed: &[String]) -> u64 {
+    if failed.is_empty() { bits } else { 0 }
+}
+
+/// Lines of `nft list ruleset` with notrack rules that may hit protected
+/// java ports: their packets have no conntrack entry, so a penalized SYN is
+/// neither redirected nor matched by `ct status`; the penalty box drops such
+/// marked packets, which makes those connections fail.
+fn notrack_lines(ruleset: &str, ports: &[u16]) -> Vec<String> {
+    ruleset
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("notrack"))
+        .filter(|line| !line.contains("dport") || ports.iter().any(|p| line.contains(&p.to_string())))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Ports of the static java range and the configured java targets.
+fn java_ports(config: &Config) -> Vec<u16> {
+    let mut ports: Vec<u16> = if config.filter.start_port != 0 {
+        (config.filter.start_port..=config.filter.end_port).take(1024).collect()
+    } else {
+        Vec::new()
+    };
+    ports.extend(config.targets.java.iter().filter_map(|t| crate::config::parse_socket_addr(t).ok()).map(|a| a.port()));
+    ports
+}
+
 impl Drop for Redirect {
     fn drop(&mut self) {
         delete_tables();
@@ -62,10 +117,15 @@ fn redirect_rules(v4: Option<SocketAddrV4>, v6: Option<SocketAddrV6>) -> String 
     }
     // marked packets of connections that were not redirected (e.g. one
     // established before the penalty) never reach the backend. `ct status
-    // != dnat` would compare the whole status word, hence the bit test
+    // != dnat` would compare the whole status word, hence the bit test;
+    // packets without a usable conntrack entry (notrack, invalid) match no
+    // ct status at all and are dropped by their own rule
     rules += "\t}\n\tchain unredirected {\n\t\ttype filter hook prerouting priority -90; policy accept;\n";
     for (family, ready) in [("ipv4", v4.is_some()), ("ipv6", v6.is_some())] {
         if ready {
+            rules += &format!(
+                "\t\tmeta nfproto {family} meta mark & {PENALTY_MARK:#x} == {PENALTY_MARK:#x} ct state invalid,untracked drop\n"
+            );
             rules += &format!(
                 "\t\tmeta nfproto {family} meta mark & {PENALTY_MARK:#x} == {PENALTY_MARK:#x} ct status & dnat == 0 drop\n"
             );
@@ -135,7 +195,7 @@ pub fn setup(
     interface: &str,
     config: &Config,
     shutdown: &Arc<Shutdown>,
-) -> Result<Option<(Redirect, JoinHandle<()>)>> {
+) -> Result<Option<(Redirect, JoinHandle<()>, Ready)>> {
     let p = &config.penalty;
     if !p.enabled {
         return Ok(None);
@@ -179,11 +239,18 @@ pub fn setup(
         bail!("nft rejected the redirect rules");
     }
     let redirect = Redirect;
+    if let Ok(out) = Command::new("nft").args(["list", "ruleset"]).stderr(Stdio::null()).output() {
+        for line in notrack_lines(&String::from_utf8_lossy(&out.stdout), &java_ports(config)) {
+            warn!("Penalty box: notrack rule may hit java targets, penalized connections through it fail: {line}");
+        }
+    }
 
-    let mut ready: Array<MapData, u64> =
-        Array::try_from(ebpf.take_map("penalty_ready").context("can't take map 'penalty_ready'")?)?;
-    // only the families with a listener and a redirect rule
-    ready.set(0, ready_bits(listen4.is_some(), listen6.is_some()), 0)?;
+    // only the families with a listener and a redirect rule; written once
+    // the marker runs on every interface (see Ready::activate)
+    let ready = Ready {
+        map: Array::try_from(ebpf.take_map("penalty_ready").context("can't take map 'penalty_ready'")?)?,
+        bits: ready_bits(listen4.is_some(), listen6.is_some()),
+    };
     info!(
         "Penalty box: throttled real clients see \"{}\" for {} s (service on {service})",
         p.message, p.seconds
@@ -224,7 +291,7 @@ pub fn setup(
             }
         }
     })?;
-    Ok(Some((redirect, handle)))
+    Ok(Some((redirect, handle, ready)))
 }
 
 /// Every address of the host with its interface name.
@@ -377,9 +444,11 @@ mod tests {
         assert!(rules.contains("meta nfproto ipv4 meta mark & 0x4000000 == 0x4000000 ct status & dnat == 0 drop"));
         assert!(rules.contains("meta nfproto ipv6 meta mark & 0x4000000 == 0x4000000 ct status & dnat == 0 drop"));
         assert!(rules.contains("type filter hook prerouting priority -90;"));
+        assert!(rules.contains("meta nfproto ipv4 meta mark & 0x4000000 == 0x4000000 ct state invalid,untracked drop"));
+        assert!(rules.contains("meta nfproto ipv6 meta mark & 0x4000000 == 0x4000000 ct state invalid,untracked drop"));
         let v4_only = redirect_rules(Some("10.0.0.1:25599".parse().unwrap()), None);
         assert!(!v4_only.contains("ipv6"));
-        assert_eq!(v4_only.matches(" drop").count(), 1);
+        assert_eq!(v4_only.matches(" drop").count(), 2);
     }
 
     #[test]
@@ -423,6 +492,24 @@ mod tests {
         assert_eq!(ready_bits(false, true), READY_V6);
         let v6_only = redirect_rules(None, Some("[2001:db8::1]:25599".parse().unwrap()));
         assert!(v6_only.contains("ipv6") && !v6_only.contains("ipv4"));
+    }
+
+    #[test]
+    fn readiness_needs_the_marker_everywhere() {
+        assert_eq!(ready_after_attach(READY_V4 | READY_V6, &[]), READY_V4 | READY_V6);
+        assert_eq!(ready_after_attach(READY_V4 | READY_V6, &["gre-t".to_string()]), 0);
+        assert_eq!(ready_after_attach(READY_V6, &[]), READY_V6);
+    }
+
+    #[test]
+    fn notrack_rules_on_java_ports_are_found() {
+        let ruleset = "table inet raw {\n\tchain pre {\n\t\ttcp dport 25565 notrack\n\t\tudp dport 53 notrack\n\t\tip saddr 10.0.0.0/8 notrack\n\t\ttcp dport 443 accept\n\t}\n}\n";
+        let found = notrack_lines(ruleset, &[25565]);
+        assert_eq!(found, vec!["tcp dport 25565 notrack".to_string(), "ip saddr 10.0.0.0/8 notrack".to_string()]);
+        assert!(notrack_lines("table inet t {\n}\n", &[25565]).is_empty());
+        let mut cfg = Config::default();
+        cfg.targets.java = vec!["10.0.0.1:25570".into()];
+        assert_eq!(java_ports(&cfg), vec![25565, 25570]);
     }
 
     #[test]
