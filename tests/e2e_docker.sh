@@ -375,7 +375,7 @@ check "answers to the server's own traffic not banned" cl env E2E_BIND=10.99.0.9
 check "v6 answers to the server's own traffic not banned" cl env E2E_BIND=fd99:0:0:9::2 $MC udp-echo fd99:1::2 40000 5007
 sleep 3
 bans=$(metric xdp_ratelimit_bans)
-check "ban counted and logged ($bans)" bash -c "test '${bans:-0}' -ge 2 && grep -q 'Rate limit: banned 10.99.0.3/32' $T/loader.log"
+check "ban counted and logged ($bans)" bash -c "test '${bans:-0}' -ge 2 && grep -q 'Rate limit: banned 10.99.0.3' $T/loader.log"
 check "v6 ban per /64 logged"         grep -q 'Rate limit: banned fd99:0:0:3::/64' $T/loader.log
 sleep 3
 check "ban expires"                   cl $B $MC udp-echo 10.99.1.2 40000 5007
@@ -395,7 +395,7 @@ cl $S5 $MC udp-no-echo 10.99.1.2 40000 5012 & BAN4=$!   # at once, see rate limi
 cl $S56 $MC udp-no-echo fd99:1::2 40000 5012 & BAN6=$!
 check "scanner banned (violations)"   wait $BAN4
 check "v6 scanner banned (violations)" wait $BAN6
-check "logged as violations"          grep -q 'banned 10.99.0.5/32 .*violations' $T/loader.log
+check "logged as violations"          grep -q 'banned 10.99.0.5 .*violations' $T/loader.log
 check "v6 logged as violations"       grep -q 'banned fd99:0:0:5::/64 .*violations' $T/loader.log
 check "banned source still reaches the router itself" cl $S5 $MC udp-echo 10.99.0.1 40100 5013
 check "v6 banned source still reaches the router itself" cl $S56 $MC udp-echo fd99::1 40100 5013
@@ -452,17 +452,17 @@ echo "== automatic blocklist"
 check "1st ban not yet blocklisted"   bash -c "! grep -q 'auto until=.*rate limit bans' $T/blocklist.txt"
 cl $B $MC udp-flood 10.99.1.2 40000 4000
 cl $B6 $MC udp-flood fd99:1::2 40000 4000; sleep 3
-check "2nd ban writes auto entry"     grep -q '^10.99.0.3/32 .*auto until=' $T/blocklist.txt
+check "2nd ban writes auto entry"     grep -q '^10.99.0.3 .*auto until=' $T/blocklist.txt
 check "v6 2nd ban writes auto entry for the /64" grep -q '^fd99:0:0:3::/64 .*auto until=' $T/blocklist.txt
 sleep 4
 check "still dropped after the ban"   cl $B $MC udp-no-echo 10.99.1.2 40000 5008
 check "v6 still dropped after the ban" cl $B6 $MC udp-no-echo fd99:1::2 40000 5008
 check "auto entries counted"          bash -c "test \"\$(curl -s 127.0.0.1:1999/metrics | awk '\$1==\"xdp_blocklist_auto_entries\"{print \$2}')\" -ge 2"
-check "logged"                        grep -q 'Auto blocklist: 10.99.0.3/32 banned 2 times' $T/loader.log
+check "logged"                        grep -q 'Auto blocklist: 10.99.0.3 banned 2 times' $T/loader.log
 check "v6 logged"                     grep -q 'Auto blocklist: fd99:0:0:3::/64 banned 2 times' $T/loader.log
 # the source stays silent now: removed after auto_idle_secs, long before auto_duration_secs
 for i in $(seq 1 40); do grep -q 'auto until=.*rate limit bans' $T/blocklist.txt || break; sleep 1; done
-check "idle auto entry removed"       bash -c "! grep -q 'auto until=.*rate limit bans' $T/blocklist.txt && grep -q 'Auto blocklist: 10.99.0.3/32 sent nothing' $T/loader.log"
+check "idle auto entry removed"       bash -c "! grep -q 'auto until=.*rate limit bans' $T/blocklist.txt && grep -q 'Auto blocklist: 10.99.0.3 sent nothing' $T/loader.log"
 check "v6 idle auto entry removed"    grep -q 'Auto blocklist: fd99:0:0:3::/64 sent nothing' $T/loader.log
 sleep 2
 check "works again after expiry"      cl $B $MC udp-echo 10.99.1.2 40000 5009

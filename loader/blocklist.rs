@@ -810,10 +810,10 @@ mod tests {
     fn parses_dual_stack_lists() {
         let list = parse_list("1.2.3.4\n10.0.0.0/8 # comment\n2001:db8::/32\n2001:db8:1::5\n", "test");
         let shown: std::collections::BTreeSet<String> = list.iter().map(|n| n.to_string()).collect();
-        assert!(shown.contains("1.2.3.4/32"));
+        assert!(shown.contains("1.2.3.4"));
         assert!(shown.contains("10.0.0.0/8"));
         assert!(shown.contains("2001:db8::/32"));
-        assert!(shown.contains("2001:db8:1::5/128"));
+        assert!(shown.contains("2001:db8:1::5"));
         assert_eq!(list.len(), 4);
     }
 
@@ -831,7 +831,7 @@ mod tests {
     #[test]
     fn ban_keys_become_source_prefixes() {
         let v4 = Addr6::from_ip("1.2.3.4".parse().unwrap());
-        assert_eq!(ban_net(v4, 64).to_string(), "1.2.3.4/32");
+        assert_eq!(ban_net(v4, 64).to_string(), "1.2.3.4");
         let v6 = Addr6::from_ip("2001:db8:1:2::".parse().unwrap());
         assert_eq!(ban_net(v6, 64).to_string(), "2001:db8:1:2::/64");
     }
@@ -843,6 +843,23 @@ mod tests {
         assert_eq!(line_net(&line), Some(n));
         let v4 = net("1.2.3.4");
         assert_eq!(line_net(&auto_line(v4, 1_900_000_000, 1)), Some(v4));
+    }
+
+    #[test]
+    fn host_prefixes_are_written_as_plain_addresses() {
+        let v4 = net("1.2.3.4/32");
+        let line = auto_line(v4, 1_900_000_000, 2);
+        assert!(line.starts_with("1.2.3.4   # auto until="), "{line}");
+        assert_eq!(line_net(&line), Some(v4));
+        let v6 = net("2001:db8::9/128");
+        assert!(auto_line(v6, 1_900_000_000, 2).starts_with("2001:db8::9   "));
+        let mut h = History::default();
+        h.bans.insert(v4, vec![1]);
+        h.bans.insert(net("2001:db8::/64"), vec![2]);
+        let json = serde_json::to_string(&h).unwrap();
+        assert!(json.contains(r#""1.2.3.4":[1]"#) && json.contains(r#""2001:db8::/64":[2]"#), "{json}");
+        let back: History = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.bans[&v4], vec![1]);
     }
 
     #[test]

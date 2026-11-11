@@ -93,8 +93,14 @@ impl Net {
     }
 }
 
+/// A single host (/32, /128) shows as the bare address, like the IPv4-only
+/// versions wrote it into logs, the blocklist and metric labels.
 impl fmt::Display for Net {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let max = if self.addr.is_ipv4() { 32 } else { 128 };
+        if self.len == max {
+            return self.addr6().fmt(f);
+        }
         write!(f, "{}/{}", self.addr6(), self.len)
     }
 }
@@ -231,7 +237,11 @@ mod tests {
     fn source_prefixes() {
         assert_eq!(
             source_prefix("1.2.3.4".parse().unwrap(), 64).to_string(),
-            "1.2.3.4/32"
+            "1.2.3.4"
+        );
+        assert_eq!(
+            source_prefix("2001:db8::1:2:3:4".parse().unwrap(), 128).to_string(),
+            "2001:db8::1:2:3:4"
         );
         assert_eq!(
             source_prefix("2001:db8::1:2:3:4".parse().unwrap(), 64).to_string(),
