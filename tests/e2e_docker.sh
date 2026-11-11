@@ -154,7 +154,7 @@ mode = "enforce"
 networks = ["10.99.1.0/24", "10.99.3.0/24", "fd99:1::/64", "fd99:3::/64"]
 pps = 1000
 ban_secs = 5
-allow = ["10.99.0.4/32", "fd99:0:0:4::/64"]
+allow = ["10.99.0.4/32", "fd99:0:0:4::/64", "fd99:0:0:a::3"]
 strikes = 20
 strike_window_secs = 10
 [unused]
@@ -407,6 +407,10 @@ cl env E2E_BIND=10.99.0.4 $MC udp-flood 10.99.1.2 40000 4000
 cl env E2E_BIND=fd99:0:0:4::2 $MC udp-flood fd99:1::2 40000 4000
 check "allowlisted source not banned" cl env E2E_BIND=10.99.0.4 $MC udp-echo 10.99.1.2 40000 5006
 check "v6 allowlisted source not banned" cl env E2E_BIND=fd99:0:0:4::2 $MC udp-echo fd99:1::2 40000 5006
+# a ban counts per /64, an allowlisted host inside it is never dropped
+cl env E2E_BIND=fd99:0:0:a::2 $MC udp-flood fd99:1::2 40000 4000
+check "v6 /64 neighbour of an allowlisted host banned" cl env E2E_BIND=fd99:0:0:a::2 $MC udp-no-echo fd99:1::2 40000 5040
+check "v6 allowlisted host inside a banned /64 not dropped" cl env E2E_BIND=fd99:0:0:a::3 $MC udp-echo fd99:1::2 40000 5041
 # a download the server started itself (QUIC to port 443): the answer is fast
 ip netns exec sv $MC dns-answer 10.99.0.9 443 0
 ip netns exec sv $MC dns-answer fd99:0:0:9::2 443 0

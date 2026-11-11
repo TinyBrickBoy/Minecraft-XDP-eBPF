@@ -310,22 +310,31 @@ static __always_inline __u8 whitelisted(const struct addr6 *src)
     return size && *size && lpm_contains(&whitelist, src);
 }
 
-// true while key has an active ban in bans (counts the drop); an expired
-// ban is removed
-static __always_inline __u8 banned(void *bans, const struct addr6 *key, const __u64 now)
+// the active ban of key in bans, NULL without one; an expired ban is removed
+static __always_inline struct ban *active_ban(void *bans, const struct addr6 *key, const __u64 now)
 {
     struct ban *ban = bpf_map_lookup_elem(bans, key);
     if (!ban)
     {
-        return 0;
+        return NULL;
     }
     if (now < ban->until_ns)
     {
-        __sync_fetch_and_add(&ban->dropped, 1);
-        return 1;
+        return ban;
     }
     bpf_map_delete_elem(bans, key);
-    return 0;
+    return NULL;
+}
+
+/*
+ * Sources that are never banned or dropped by a ban: allowlisted (the exact
+ * address) or an outbound peer of the destination. Bans count per prefix and
+ * strikes can be forged, so a ban of a neighbour (or a spoofed one) must
+ * not cut these off.
+ */
+static __always_inline __u8 ban_exempt(const struct addr6 *src, const struct addr6 *dst)
+{
+    return lpm_contains(&ratelimit_allow, src) || outbound_peer(src, dst);
 }
 
 /*
@@ -357,7 +366,7 @@ static __always_inline __u8 rate_exceeded(const struct l3 *l, void *windows, voi
     }
     // the allowlist and the outbound peers are only consulted for sources
     // above the limit
-    if (lpm_contains(&ratelimit_allow, &l->src) || outbound_peer(&l->src, &l->dst))
+    if (ban_exempt(&l->src, &l->dst))
     {
         window->start_ns = now;
         window->packets = 1;
@@ -419,8 +428,18 @@ static __always_inline __u8 blocked_source(const struct l3 *l, const __u64 bytes
     struct addr6 agg;
     const __u8 has_agg = src_aggregate(&l->src, &agg);
     const __u64 now = bpf_ktime_get_ns();
-    if (banned(&ratelimit_bans, &pfx, now) || (has_agg && banned(&ratelimit_bans_agg, &agg, now)))
+    struct ban *ban = active_ban(&ratelimit_bans, &pfx, now);
+    if (!ban && has_agg)
     {
+        ban = active_ban(&ratelimit_bans_agg, &agg, now);
+    }
+    if (ban)
+    {
+        if (ban_exempt(&l->src, &l->dst))
+        {
+            return 0;
+        }
+        __sync_fetch_and_add(&ban->dropped, 1);
         struct block_stats *st = block_stats_slot();
         if (st)
         {
@@ -439,13 +458,14 @@ static __always_inline __u8 blocked_source(const struct l3 *l, const __u64 bytes
 }
 
 /*
- * Counts a violation of src: a packet to an unused address, an invalid
- * handshake, forged TCP flags, an invalid RakNet message. More than
- * STRIKE_LIMIT within STRIKE_WINDOW_NS ban the source like the rate limit.
- * Never call it for traffic whose source is typically spoofed on behalf of
- * a victim (reflection answers).
+ * Counts a violation of the source of l: a packet to an unused address, an
+ * invalid handshake, forged TCP flags, an invalid RakNet message. More than
+ * STRIKE_LIMIT within STRIKE_WINDOW_NS ban the source like the rate limit
+ * (never an allowlisted source or an outbound peer, see ban_exempt). Never
+ * call it for traffic whose source is typically spoofed on behalf of a
+ * victim (reflection answers).
  */
-static __always_inline void add_strike_in(const struct addr6 *src, void *windows, void *bans, const struct addr6 *key,
+static __always_inline void add_strike_in(const struct l3 *l, void *windows, void *bans, const struct addr6 *key,
                                           const __u64 limit, const __u64 now)
 {
     struct rate_window *window = bpf_map_lookup_elem(windows, key);
@@ -467,26 +487,27 @@ static __always_inline void add_strike_in(const struct addr6 *src, void *windows
         return;
     }
     bpf_map_delete_elem(windows, key);
-    if (lpm_contains(&ratelimit_allow, src))
+    if (ban_exempt(&l->src, &l->dst))
     {
         return;
     }
     issue_ban(bans, key, now, strikes, BAN_STRIKES);
 }
 
-static __always_inline void add_strike(const struct addr6 *src)
+static __always_inline void add_strike(const struct l3 *l)
 {
+    const struct addr6 *src = &l->src;
     if (RATELIMIT_MODE == RATELIMIT_OFF || !STRIKE_LIMIT || whitelisted(src))
     {
         return;
     }
     const struct addr6 pfx = src_prefix(src);
     const __u64 now = bpf_ktime_get_ns();
-    add_strike_in(src, &strike_windows, &ratelimit_bans, &pfx, STRIKE_LIMIT, now);
+    add_strike_in(l, &strike_windows, &ratelimit_bans, &pfx, STRIKE_LIMIT, now);
     struct addr6 agg;
     if (src_aggregate(src, &agg))
     {
-        add_strike_in(src, &strike_windows_agg, &ratelimit_bans_agg, &agg, AGG_STRIKE_LIMIT, now);
+        add_strike_in(l, &strike_windows_agg, &ratelimit_bans_agg, &agg, AGG_STRIKE_LIMIT, now);
     }
 }
 

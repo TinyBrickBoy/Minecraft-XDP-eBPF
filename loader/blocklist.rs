@@ -936,6 +936,10 @@ mod tests {
         // a neighbouring prefix and another v4 address are not exempt
         let other = net("2001:db8:1:3::/64");
         assert_eq!(auto.record(&[(other, ban(1)), (net("1.2.3.5/32"), ban(1))], 11).len(), 2);
+        // a ban of the aggregate tier covering the allowlisted host neither
+        let p48 = net("2001:db8:1::/48");
+        assert!(auto.record(&[(p48, ban(2))], 12).is_empty());
+        assert!(!auto.history.bans.contains_key(&p48));
         std::fs::remove_dir_all(&dir).ok();
     }
 

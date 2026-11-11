@@ -48,8 +48,11 @@ This fork of [Outfluencer/Minecraft-XDP-eBPF](https://github.com/Outfluencer/Min
 - **Blocklist and rate limit** (`[blocklist]`, `[ratelimit]`): sources in a
   live reloaded file (addresses and prefixes) are dropped before anything
   else; a source sending more than `pps` packets per second to the protected
-  networks is banned for `ban_secs` (allowlist for own proxies/CDNs). Bans
-  are logged, per source counters are exported (`xdp_blocklist_*`,
+  networks is banned for `ban_secs` (allowlist for own proxies/CDNs). An
+  allowlisted address and a current outbound peer of the destination are
+  never banned (also not for violations) and never dropped by a ban of
+  their prefix; a ban prefix covering an allowlist entry is never escalated
+  to the blocklist. Bans are logged, per source counters are exported (`xdp_blocklist_*`,
   `xdp_ratelimit_*`).
 - **Manual overrides** (`[targets]`): always protected `java`/`bedrock`
   entries and `exclude` entries that are never filtered.

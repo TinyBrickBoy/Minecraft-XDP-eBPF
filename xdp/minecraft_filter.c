@@ -591,14 +591,14 @@ static __always_inline __s32 handle_udp(const void *data, const void *data_end, 
     case RAKNET_UNCONNECTED_PING_OPEN:
         if (payload_len < RAKNET_PING_LEN || !raknet_magic_at(payload + 9, data_end))
         {
-            add_strike(&l->src);
+            add_strike(l);
             goto drop;
         }
         break;
     case RAKNET_OPEN_CONNECTION_REQUEST_1:
         if (payload_len < RAKNET_REQUEST_1_MIN_LEN || !raknet_magic_at(payload + 1, data_end))
         {
-            add_strike(&l->src);
+            add_strike(l);
             goto drop;
         }
         break;
@@ -607,7 +607,7 @@ static __always_inline __s32 handle_udp(const void *data, const void *data_end, 
         if (payload_len < RAKNET_REQUEST_2_MIN_LEN || !raknet_magic_at(payload + 1, data_end) ||
             !raknet_request_2_fields_valid(payload, payload_len, data_end))
         {
-            add_strike(&l->src);
+            add_strike(l);
             goto drop;
         }
         // only the flow that just sent request 1, and only as often as the
@@ -717,7 +717,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
     // them is what scanners do, so it counts as a violation
     if (unused_destination(ctx, &l))
     {
-        add_strike(&l.src);
+        add_strike(&l);
         return XDP_DROP;
     }
 
@@ -794,7 +794,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
     if (detect_tcp_bypass(tcp))
     {
         count_stats(stats_ptr, dst_stats_ptr, TCP_BYPASS, 1);
-        add_strike(&l.src);
+        add_strike(&l);
         goto drop;
     }
 
@@ -811,7 +811,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
         if (l.l3len != l.hdrlen + tcp_hdr_len)
         {
             count_stats(stats_ptr, dst_stats_ptr, TCP_BYPASS, 1);
-            add_strike(&l.src);
+            add_strike(&l);
             goto drop;
         }
 
@@ -1033,7 +1033,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
 // the generated program drastically smaller
 drop_connection:
     count_stats(stats_ptr, dst_stats_ptr, DROP_CONNECTION, 1);
-    add_strike(&l.src);
+    add_strike(&l);
     bpf_map_delete_elem(&conntrack_map, &flow_key);
     // fall through
 drop:
