@@ -458,11 +458,15 @@ pub fn setup(
     };
     let bans: BanMap =
         BpfHashMap::try_from(ebpf.take_map("ratelimit_bans").context("can't take map 'ratelimit_bans'")?)?;
+    let agg_bans: BanMap =
+        BpfHashMap::try_from(ebpf.take_map("ratelimit_bans_agg").context("can't take map 'ratelimit_bans_agg'")?)?;
 
     let mut worker = Worker {
         list,
         bans,
         v6_len: config.filter.ipv6_source_prefix,
+        agg_bans,
+        agg_len: config.filter.aggregate_prefix(),
         source_map,
         sources: handles.sources.clone(),
         idle_secs: bl.auto_idle_secs,
@@ -501,6 +505,9 @@ struct Worker {
     bans: BanMap,
     /// IPv6 source prefix length of the kernel's bans
     v6_len: u8,
+    /// bans of the IPv6 aggregate tier, and its prefix length (None = off)
+    agg_bans: BanMap,
+    agg_len: Option<u8>,
     source_map: SourceMap,
     sources: Arc<Mutex<HashMap<IpAddr, SourceStats>>>,
     /// automatic entries are removed after this long without a packet (0 = never)
@@ -526,7 +533,12 @@ impl Worker {
     fn tick(&mut self, first: bool) {
         self.whitelist.sync(first);
         // automatic bans: log new ones, publish them, escalate repeated ones
-        let active = active_bans(&self.bans, crate::targets::monotonic_ns(), self.v6_len);
+        let now_ns = crate::targets::monotonic_ns();
+        let mut active = active_bans(&self.bans, now_ns, self.v6_len);
+        if let Some(agg_len) = self.agg_len {
+            // shown (and escalated) as the aggregate prefix, e.g. a /48
+            active.extend(active_bans(&self.agg_bans, now_ns, agg_len).into_iter().filter(|(net, _)| net.addr.is_ipv6()));
+        }
         log_new_bans(&active, &mut self.logged, self.ban_secs);
         let now = unix_now();
         let mut add = Vec::new();
@@ -845,6 +857,20 @@ mod tests {
         assert_eq!(ban_net(v4, 64).to_string(), "1.2.3.4");
         let v6 = Addr6::from_ip("2001:db8:1:2::".parse().unwrap());
         assert_eq!(ban_net(v6, 64).to_string(), "2001:db8:1:2::/64");
+    }
+
+    #[test]
+    fn aggregate_ban_keys_become_aggregate_prefixes() {
+        let key = Addr6::from_ip("2001:db8:1::".parse().unwrap());
+        let net = ban_net(key, 48);
+        assert_eq!(net.to_string(), "2001:db8:1::/48");
+        // the same key in the per-source map is the /64
+        assert_eq!(ban_net(key, 64).to_string(), "2001:db8:1::/64");
+        assert!(net.covers(&ban_net(key, 64)));
+        // escalated like any other prefix
+        let line = auto_line(net, 1_900_000_000, 3);
+        assert!(line.starts_with("2001:db8:1::/48   # auto until="), "{line}");
+        assert_eq!(line_net(&line), Some(net));
     }
 
     #[test]

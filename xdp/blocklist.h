@@ -171,6 +171,16 @@ struct
     __type(value, struct rate_window);
 } ratelimit_windows SEC(".maps");
 
+// the same per IPv6 aggregate prefix (src_aggregate); every *_agg map is
+// separate because the keys of both tiers can be equal
+struct
+{
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct addr6); // aggregate prefix
+    __type(value, struct rate_window);
+} ratelimit_windows_agg SEC(".maps");
+
 // an automatic ban; must match `Ban` in loader/blocklist.rs
 struct ban
 {
@@ -194,9 +204,26 @@ struct
 {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
+    __type(key, struct addr6); // aggregate prefix
+    __type(value, struct rate_window);
+} strike_windows_agg SEC(".maps");
+
+struct
+{
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
     __type(key, struct addr6); // source prefix (src_prefix)
     __type(value, struct ban);
 } ratelimit_bans SEC(".maps");
+
+// bans of whole IPv6 aggregate prefixes (read by the loader as /48 etc.)
+struct
+{
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct addr6); // aggregate prefix
+    __type(value, struct ban);
+} ratelimit_bans_agg SEC(".maps");
 
 // global counters; must match `BlockStats` in loader/blocklist.rs
 struct block_stats
@@ -252,10 +279,10 @@ static __always_inline __u8 lpm_value(void *trie, const struct addr6 *addr)
     return value ? *value : 0;
 }
 
-static __always_inline void issue_ban(const struct addr6 *src, const __u64 now, const __u64 count, const __u64 reason)
+static __always_inline void issue_ban(void *bans, const struct addr6 *src, const __u64 now, const __u64 count, const __u64 reason)
 {
     const struct ban fresh = {.until_ns = now + RATELIMIT_BAN_NS, .since_ns = now, .rate = count, .dropped = 0, .reason = reason};
-    if (bpf_map_update_elem(&ratelimit_bans, src, &fresh, BPF_NOEXIST) == 0)
+    if (bpf_map_update_elem(bans, src, &fresh, BPF_NOEXIST) == 0)
     {
         struct block_stats *st = block_stats_slot();
         if (st)
@@ -281,6 +308,65 @@ static __always_inline __u8 whitelisted(const struct addr6 *src)
     __u32 zero = 0;
     const __u64 *size = bpf_map_lookup_elem(&whitelist_size, &zero);
     return size && *size && lpm_contains(&whitelist, src);
+}
+
+// true while key has an active ban in bans (counts the drop); an expired
+// ban is removed
+static __always_inline __u8 banned(void *bans, const struct addr6 *key, const __u64 now)
+{
+    struct ban *ban = bpf_map_lookup_elem(bans, key);
+    if (!ban)
+    {
+        return 0;
+    }
+    if (now < ban->until_ns)
+    {
+        __sync_fetch_and_add(&ban->dropped, 1);
+        return 1;
+    }
+    bpf_map_delete_elem(bans, key);
+    return 0;
+}
+
+/*
+ * Counts the packet of key in its one second window of `windows`; above
+ * limit the source is banned in `bans` (returns 1), unless it is allowlisted
+ * or an outbound peer.
+ */
+static __always_inline __u8 rate_exceeded(const struct l3 *l, void *windows, void *bans, const struct addr6 *key,
+                                          const __u64 limit, const __u64 now)
+{
+    struct rate_window *window = bpf_map_lookup_elem(windows, key);
+    if (!window)
+    {
+        const struct rate_window fresh = {.start_ns = now, .packets = 1};
+        bpf_map_update_elem(windows, key, &fresh, BPF_ANY);
+        return 0;
+    }
+    if (now - window->start_ns >= 1000000000ULL)
+    {
+        // new window; racing CPUs can only lose a few counts, never ban early
+        window->start_ns = now;
+        window->packets = 1;
+        return 0;
+    }
+    const __u64 packets = __sync_fetch_and_add(&window->packets, 1) + 1;
+    if (packets <= limit)
+    {
+        return 0;
+    }
+    // the allowlist and the outbound peers are only consulted for sources
+    // above the limit
+    if (lpm_contains(&ratelimit_allow, &l->src) || outbound_peer(&l->src, &l->dst))
+    {
+        window->start_ns = now;
+        window->packets = 1;
+        return 0;
+    }
+
+    issue_ban(bans, key, now, packets, BAN_RATE);
+    bpf_map_delete_elem(windows, key);
+    return 1;
 }
 
 static __always_inline __u8 blocked_source(const struct l3 *l, const __u64 bytes)
@@ -327,57 +413,29 @@ static __always_inline __u8 blocked_source(const struct l3 *l, const __u64 bytes
         return 0;
     }
 
-    // bans and the rate limit count per source prefix (IPv6: IPV6_SOURCE_PREFIX)
+    // bans and the rate limit count per source prefix (IPv6: IPV6_SOURCE_PREFIX,
+    // and a second time per aggregate prefix, see src_aggregate)
     const struct addr6 pfx = src_prefix(&l->src);
+    struct addr6 agg;
+    const __u8 has_agg = src_aggregate(&l->src, &agg);
     const __u64 now = bpf_ktime_get_ns();
-    struct ban *ban = bpf_map_lookup_elem(&ratelimit_bans, &pfx);
-    if (ban)
+    if (banned(&ratelimit_bans, &pfx, now) || (has_agg && banned(&ratelimit_bans_agg, &agg, now)))
     {
-        if (now < ban->until_ns)
+        struct block_stats *st = block_stats_slot();
+        if (st)
         {
-            __sync_fetch_and_add(&ban->dropped, 1);
-            struct block_stats *st = block_stats_slot();
-            if (st)
-            {
-                st->banned_packets++;
-                st->banned_bytes += bytes;
-            }
-            return RATELIMIT_MODE == RATELIMIT_ENFORCE;
+            st->banned_packets++;
+            st->banned_bytes += bytes;
         }
-        bpf_map_delete_elem(&ratelimit_bans, &pfx);
+        return RATELIMIT_MODE == RATELIMIT_ENFORCE;
     }
 
-    struct rate_window *window = bpf_map_lookup_elem(&ratelimit_windows, &pfx);
-    if (!window)
+    if (rate_exceeded(l, &ratelimit_windows, &ratelimit_bans, &pfx, RATELIMIT_PPS, now) ||
+        (has_agg && rate_exceeded(l, &ratelimit_windows_agg, &ratelimit_bans_agg, &agg, AGG_RATELIMIT_PPS, now)))
     {
-        const struct rate_window fresh = {.start_ns = now, .packets = 1};
-        bpf_map_update_elem(&ratelimit_windows, &pfx, &fresh, BPF_ANY);
-        return 0;
+        return RATELIMIT_MODE == RATELIMIT_ENFORCE;
     }
-    if (now - window->start_ns >= 1000000000ULL)
-    {
-        // new window; racing CPUs can only lose a few counts, never ban early
-        window->start_ns = now;
-        window->packets = 1;
-        return 0;
-    }
-    const __u64 packets = __sync_fetch_and_add(&window->packets, 1) + 1;
-    if (packets <= RATELIMIT_PPS)
-    {
-        return 0;
-    }
-    // the allowlist and the outbound peers are only consulted for sources
-    // above the limit
-    if (lpm_contains(&ratelimit_allow, src) || outbound_peer(&l->src, &l->dst))
-    {
-        window->start_ns = now;
-        window->packets = 1;
-        return 0;
-    }
-
-    issue_ban(&pfx, now, packets, BAN_RATE);
-    bpf_map_delete_elem(&ratelimit_windows, &pfx);
-    return RATELIMIT_MODE == RATELIMIT_ENFORCE;
+    return 0;
 }
 
 /*
@@ -387,19 +445,14 @@ static __always_inline __u8 blocked_source(const struct l3 *l, const __u64 bytes
  * Never call it for traffic whose source is typically spoofed on behalf of
  * a victim (reflection answers).
  */
-static __always_inline void add_strike(const struct addr6 *src)
+static __always_inline void add_strike_in(const struct addr6 *src, void *windows, void *bans, const struct addr6 *key,
+                                          const __u64 limit, const __u64 now)
 {
-    if (RATELIMIT_MODE == RATELIMIT_OFF || !STRIKE_LIMIT || whitelisted(src))
-    {
-        return;
-    }
-    const struct addr6 pfx = src_prefix(src);
-    const __u64 now = bpf_ktime_get_ns();
-    struct rate_window *window = bpf_map_lookup_elem(&strike_windows, &pfx);
+    struct rate_window *window = bpf_map_lookup_elem(windows, key);
     if (!window)
     {
         const struct rate_window fresh = {.start_ns = now, .packets = 1};
-        bpf_map_update_elem(&strike_windows, &pfx, &fresh, BPF_ANY);
+        bpf_map_update_elem(windows, key, &fresh, BPF_ANY);
         return;
     }
     if (now - window->start_ns >= STRIKE_WINDOW_NS)
@@ -409,16 +462,32 @@ static __always_inline void add_strike(const struct addr6 *src)
         return;
     }
     const __u64 strikes = __sync_fetch_and_add(&window->packets, 1) + 1;
-    if (strikes <= STRIKE_LIMIT)
+    if (strikes <= limit)
     {
         return;
     }
-    bpf_map_delete_elem(&strike_windows, &pfx);
+    bpf_map_delete_elem(windows, key);
     if (lpm_contains(&ratelimit_allow, src))
     {
         return;
     }
-    issue_ban(&pfx, now, strikes, BAN_STRIKES);
+    issue_ban(bans, key, now, strikes, BAN_STRIKES);
+}
+
+static __always_inline void add_strike(const struct addr6 *src)
+{
+    if (RATELIMIT_MODE == RATELIMIT_OFF || !STRIKE_LIMIT || whitelisted(src))
+    {
+        return;
+    }
+    const struct addr6 pfx = src_prefix(src);
+    const __u64 now = bpf_ktime_get_ns();
+    add_strike_in(src, &strike_windows, &ratelimit_bans, &pfx, STRIKE_LIMIT, now);
+    struct addr6 agg;
+    if (src_aggregate(src, &agg))
+    {
+        add_strike_in(src, &strike_windows_agg, &ratelimit_bans_agg, &agg, AGG_STRIKE_LIMIT, now);
+    }
 }
 
 /*

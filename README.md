@@ -64,7 +64,15 @@ This fork of [Outfluencer/Minecraft-XDP-eBPF](https://github.com/Outfluencer/Min
   destination; only neighbour solicitations from `::` (duplicate address
   detection) pass.
   Throttle, rate limit, strikes, bans and the penalty box count IPv6
-  sources per `[filter] ipv6_source_prefix` (default /64). IPv6 fragments
+  sources per `[filter] ipv6_source_prefix` (default /64). Throttle, rate
+  limit, strikes and bans count IPv6 a second time per
+  `ipv6_aggregate_prefix` (default /48, a site's usual allocation) with
+  `ipv6_aggregate_factor` (default 8) times the per-source limits: a source
+  is throttled or banned when either tier is over its limit, so rotating
+  through the /64s of one /48 gains a factor of 8 instead of 65536, and a
+  /48 over its SYN limit can not fill the throttle map with /64 entries. A
+  ban of the aggregate tier is shown (and escalated) as the /48 prefix.
+  IPv4 is unaffected. IPv6 fragments
   to protected targets are dropped. Packets with more than four extension
   headers or a truncated header chain cannot be matched to a port: they are
   dropped when the destination address has any protected target (any port)
@@ -169,6 +177,8 @@ restart the loader. Use `--config <path>` to point at a different file.
 | `player_idle_timeout_secs` | int | 60 | Idle timeout for verified connections; an idle entry is removed in-kernel after one to two intervals, requiring a new handshake. |
 | `online_names` | bool   | true    | Enforce online-mode usernames (≤16 chars). |
 | `ipv6_source_prefix` | int | 64 | Prefix length per IPv6 source for throttling, rate limits and bans (32–128). IPv4 is always per address. |
+| `ipv6_aggregate_prefix` | int | 48 | Second, coarser IPv6 tier for throttle, rate limit, strikes and bans (16–`ipv6_source_prefix`; equal turns it off). |
+| `ipv6_aggregate_factor` | int | 8 | Limits of the aggregate tier as a multiple of `hit_count`, `[ratelimit] pps` and `strikes` (1–1024). |
 
 **`[xdp]`** — how the program attaches and the capacity of its in-kernel tables
 (the maps are preallocated, so higher limits cost kernel memory up front):

@@ -115,6 +115,16 @@ struct
     __type(value, struct throttle_entry); // window timer + hit counter
 } connection_throttle SEC(".maps");
 
+// the same per IPv6 aggregate prefix (src_aggregate); a separate map, the
+// keys of both tiers can be equal (2001:db8:1::/48 and 2001:db8:1::/64)
+struct
+{
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65535);           // placeholder, set by the loader ([xdp] max_throttled_ips)
+    __type(key, struct addr6);            // aggregate prefix
+    __type(value, struct throttle_entry); // window timer + hit counter
+} connection_throttle_agg SEC(".maps");
+
 // while connection_throttle is full, only retry inserting after this long
 // (per core): a failed insert on a full preallocated map scans every cpu's
 // freelist under spinlocks, so during that time we drop without even trying
@@ -123,7 +133,7 @@ struct
 struct
 {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
+    __uint(max_entries, 2); // [0] connection_throttle, [1] connection_throttle_agg
     __type(key, __u32);
     __type(value, __u64); // per-cpu: no insert retry before this ktime
 } throttle_insert_backoff SEC(".maps");
@@ -316,9 +326,9 @@ static __always_inline __u8 detect_tcp_bypass(const struct tcphdr *tcp)
  * bpf_timer that deletes the entry again. Returns 0 when the source has used
  * up its window or the throttle map is full (fail closed).
  */
-static __always_inline __u8 throttle_allows_in(void *throttle_map, const struct addr6 *src, const __u32 limit)
+static __always_inline __u8 throttle_allows_in(void *throttle_map, __u32 backoff_slot, const struct addr6 *key_in, const __u32 limit)
 {
-    const struct addr6 key = src_prefix(src);
+    const struct addr6 key = *key_in;
     if (!limit)
     {
         return 1;
@@ -335,11 +345,10 @@ static __always_inline __u8 throttle_allows_in(void *throttle_map, const struct 
         return 1;
     }
 
-    __u32 zero = 0;
-    __u64 *backoff = bpf_map_lookup_elem(&throttle_insert_backoff, &zero);
+    __u64 *backoff = bpf_map_lookup_elem(&throttle_insert_backoff, &backoff_slot);
     if (!backoff)
     {
-        // per-cpu array index 0 always exists, this is unreachable
+        // per-cpu array indexes 0 and 1 always exist, this is unreachable
         return 0;
     }
     const __u64 now = bpf_ktime_get_ns();
@@ -376,9 +385,34 @@ static __always_inline __u8 throttle_allows_in(void *throttle_map, const struct 
     return 1;
 }
 
+// true when key already used up its window (nothing is counted)
+static __always_inline __u8 throttle_spent(void *throttle_map, const struct addr6 *key, const __u32 limit)
+{
+    const struct throttle_entry *entry = bpf_map_lookup_elem(throttle_map, key);
+    return entry && entry->hits >= limit;
+}
+
+/*
+ * IPv6 sources pass two tiers: their source prefix (/64) and its aggregate
+ * prefix (/48, AGG_HIT_COUNT). A /64 over its own limit is rejected before
+ * the /48 is counted, so one noisy /64 does not use up the budget of its
+ * neighbours; a /48 over its limit is rejected before a /64 entry is
+ * created, so one /48 can not fill connection_throttle. IPv4 only has the
+ * first tier.
+ */
 static __always_inline __u8 throttle_allows(const struct addr6 *src)
 {
-    return throttle_allows_in(&connection_throttle, src, HIT_COUNT);
+    const struct addr6 key = src_prefix(src);
+    struct addr6 agg;
+    if (HIT_COUNT && src_aggregate(src, &agg))
+    {
+        if (throttle_spent(&connection_throttle, &key, HIT_COUNT) ||
+            !throttle_allows_in(&connection_throttle_agg, 1, &agg, AGG_HIT_COUNT))
+        {
+            return 0;
+        }
+    }
+    return throttle_allows_in(&connection_throttle, 0, &key, HIT_COUNT);
 }
 
 /*

@@ -32,6 +32,11 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
     let end_port: u32 = filter.end_port as u32;
     let hit_count: u32 = filter.hit_count;
     let ipv6_source_prefix: u32 = u32::from(filter.ipv6_source_prefix);
+    // the coarser IPv6 tier (0 = off) with its limits
+    let ipv6_aggregate_prefix: u32 = filter.aggregate_prefix().map_or(0, u32::from);
+    let agg_hit_count: u32 = filter.aggregate_limit(u64::from(filter.hit_count)).min(u64::from(u32::MAX)) as u32;
+    let agg_ratelimit_pps: u64 = filter.aggregate_limit(config.ratelimit.pps);
+    let agg_strike_limit: u64 = filter.aggregate_limit(config.ratelimit.strikes);
     let hit_count_reset_ns: u64 = filter.hit_count_reset_secs * 1_000_000_000;
     let player_idle_ns: u64 = filter.player_idle_timeout_secs * 1_000_000_000;
     // established flows to the static range are adopted for a while after
@@ -75,6 +80,10 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
         .override_global("DNS_RECHECK_NS", &dns_recheck_ns, true)
         .override_global("HIT_COUNT", &hit_count, true)
         .override_global("IPV6_SOURCE_PREFIX", &ipv6_source_prefix, true)
+        .override_global("IPV6_AGGREGATE_PREFIX", &ipv6_aggregate_prefix, true)
+        .override_global("AGG_HIT_COUNT", &agg_hit_count, true)
+        .override_global("AGG_RATELIMIT_PPS", &agg_ratelimit_pps, true)
+        .override_global("AGG_STRIKE_LIMIT", &agg_strike_limit, true)
         .override_global("HIT_COUNT_RESET_NS", &hit_count_reset_ns, true)
         .override_global("PLAYER_IDLE_NS", &player_idle_ns, true)
         // Replace the placeholder map capacities baked into the object with
@@ -84,6 +93,7 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
         .map_max_entries("conntrack_map", config.xdp.max_pending_connections)
         .map_max_entries("player_connection_map", config.xdp.max_player_connections)
         .map_max_entries("connection_throttle", config.xdp.max_throttled_ips)
+        .map_max_entries("connection_throttle_agg", config.xdp.max_throttled_ips)
         .load(object)
         .context("failed to load BPF program")?;
 

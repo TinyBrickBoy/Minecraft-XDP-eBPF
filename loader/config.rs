@@ -35,6 +35,17 @@ hit_count_reset_secs = 3
 # Valid 32..=128. IPv4 is always counted per address.
 ipv6_source_prefix = 64
 
+# Second, coarser IPv6 tier for the throttle, rate limit, strikes and bans:
+# a site usually gets a whole /48, so rotating through its 65536 /64s must
+# not multiply its limits. Each aggregate prefix may use ipv6_aggregate_factor
+# times the per-source limits (hit_count, [ratelimit] pps and strikes); a
+# source is throttled or banned when either tier is over its limit, a ban of
+# the aggregate tier shows as the aggregate prefix (2001:db8:1::/48). The
+# prefix is valid 16..=ipv6_source_prefix (equal turns the tier off), the
+# factor 1..=1024.
+ipv6_aggregate_prefix = 48
+ipv6_aggregate_factor = 8
+
 # Idle timeout for verified player connections in seconds, enforced inside the
 # eBPF program: a connection's entry is removed after one to two timeout
 # intervals without packets, so a returning client has to redo the handshake.
@@ -294,6 +305,11 @@ pub struct FilterConfig {
     /// Prefix length per IPv6 source for throttle, rate limit and bans.
     /// Maps to `IPV6_SOURCE_PREFIX`.
     pub ipv6_source_prefix: u8,
+    /// Coarser IPv6 tier (see [`FilterConfig::aggregate_prefix`]). Maps to
+    /// `IPV6_AGGREGATE_PREFIX`.
+    pub ipv6_aggregate_prefix: u8,
+    /// Limits of the aggregate tier as a multiple of the per-source limits.
+    pub ipv6_aggregate_factor: u32,
     /// Idle timeout for verified connections in seconds; an entry is removed
     /// in-kernel after one to two intervals without packets. Maps to
     /// `PLAYER_IDLE_NS` (converted to ns).
@@ -315,6 +331,12 @@ impl Default for FilterConfig {
             hit_count: 10,
             hit_count_reset_secs: 3,
             ipv6_source_prefix: 64,
+            // a /48 per site (RFC 6177 still recommends /48 for end sites);
+            // 8 times the /64 limits: a site with a handful of active /64s
+            // is never limited by the tier, while rotating through its /64s
+            // gains at most a factor of 8 instead of 65536
+            ipv6_aggregate_prefix: 48,
+            ipv6_aggregate_factor: 8,
             player_idle_timeout_secs: 60,
             online_names: true,
             adopt_grace_secs: 120,
@@ -762,6 +784,13 @@ impl FilterConfig {
         }
         check_range("[filter] ipv6_source_prefix", u64::from(self.ipv6_source_prefix), 32, 128)?;
         check_range(
+            "[filter] ipv6_aggregate_prefix",
+            u64::from(self.ipv6_aggregate_prefix),
+            16,
+            u64::from(self.ipv6_source_prefix),
+        )?;
+        check_range("[filter] ipv6_aggregate_factor", u64::from(self.ipv6_aggregate_factor), 1, 1024)?;
+        check_range(
             "[filter] hit_count_reset_secs",
             self.hit_count_reset_secs,
             1,
@@ -775,6 +804,19 @@ impl FilterConfig {
         )?;
         check_range("[filter] online_mode_cache_secs", self.online_mode_cache_secs, 10, 86_400)?;
         check_range("[filter] adopt_grace_secs", self.adopt_grace_secs, 0, 3_600)
+    }
+}
+
+impl FilterConfig {
+    /// The prefix length of the IPv6 aggregate tier, None when it is off
+    /// (equal to the source prefix: the tier would count the same keys).
+    pub fn aggregate_prefix(&self) -> Option<u8> {
+        (self.ipv6_aggregate_prefix < self.ipv6_source_prefix).then_some(self.ipv6_aggregate_prefix)
+    }
+
+    /// A per-source limit scaled for the aggregate tier.
+    pub fn aggregate_limit(&self, limit: u64) -> u64 {
+        limit.saturating_mul(u64::from(self.ipv6_aggregate_factor))
     }
 }
 
@@ -1105,9 +1147,44 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_aggregate_tier() {
+        let cfg = Config::default();
+        assert_eq!(cfg.filter.aggregate_prefix(), Some(48));
+        assert_eq!(cfg.filter.aggregate_limit(10), 80);
+        assert_eq!(cfg.filter.aggregate_limit(u64::MAX), u64::MAX);
+        let parsed: Config = toml::from_str("[filter]\nipv6_aggregate_prefix = 56\nipv6_aggregate_factor = 4").unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(parsed.filter.aggregate_prefix(), Some(56));
+        assert_eq!(parsed.filter.aggregate_limit(3000), 12_000);
+        // equal to the source prefix: the tier is off
+        let mut cfg = Config::default();
+        cfg.filter.ipv6_aggregate_prefix = 64;
+        cfg.validate().unwrap();
+        assert_eq!(cfg.filter.aggregate_prefix(), None);
+        for (prefix, factor) in [(15u8, 8u32), (65, 8), (48, 0), (48, 1025)] {
+            let mut cfg = Config::default();
+            cfg.filter.ipv6_aggregate_prefix = prefix;
+            cfg.filter.ipv6_aggregate_factor = factor;
+            assert!(cfg.validate().is_err(), "{prefix} {factor}");
+        }
+        // bounded by the source prefix
+        let mut cfg = Config::default();
+        cfg.filter.ipv6_source_prefix = 40;
+        assert!(cfg.validate().is_err());
+        cfg.filter.ipv6_aggregate_prefix = 32;
+        cfg.validate().unwrap();
+        // IPv4-only configs load unchanged
+        let v4: Config = toml::from_str("[filter]\nhit_count = 5").unwrap();
+        v4.validate().unwrap();
+    }
+
+    #[test]
     fn ipv6_source_prefix_validation() {
         let mut ok = Config::default();
         ok.filter.ipv6_source_prefix = 32;
+        // the aggregate tier must not be finer than the source prefix
+        assert!(ok.validate().is_err());
+        ok.filter.ipv6_aggregate_prefix = 32;
         assert!(ok.validate().is_ok());
         let mut cfg = Config::default();
         assert_eq!(cfg.filter.ipv6_source_prefix, 64);

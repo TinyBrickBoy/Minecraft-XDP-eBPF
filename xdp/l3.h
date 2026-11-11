@@ -56,6 +56,20 @@ static __always_inline struct addr6 src_prefix(const struct addr6 *src)
     return addr_mask(*src, IPV6_SOURCE_PREFIX);
 }
 
+// the coarser IPv6 tier of throttle, rate limit, strikes and bans
+// (IPV6_AGGREGATE_PREFIX, default /48): one site owns a whole /48, so
+// rotating through its /64s must not multiply its limits. Returns 0 (no
+// tier) for IPv4 and while the tier is off
+static __always_inline __u8 src_aggregate(const struct addr6 *src, struct addr6 *out)
+{
+    if (!IPV6_AGGREGATE_PREFIX || addr_is_v4(src))
+    {
+        return 0;
+    }
+    *out = addr_mask(*src, IPV6_AGGREGATE_PREFIX);
+    return 1;
+}
+
 // ICMPv6 router solicitation/advertisement, neighbour solicitation/
 // advertisement and redirect: never dropped, or the host loses its neighbours.
 // NDP is never fragmented (RFC 6980), and a fragment has no icmp header to
