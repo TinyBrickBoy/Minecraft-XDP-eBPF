@@ -31,6 +31,7 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
     let start_port: u32 = filter.start_port as u32;
     let end_port: u32 = filter.end_port as u32;
     let hit_count: u32 = filter.hit_count;
+    let ipv6_source_prefix: u32 = u32::from(filter.ipv6_source_prefix);
     let hit_count_reset_ns: u64 = filter.hit_count_reset_secs * 1_000_000_000;
     let player_idle_ns: u64 = filter.player_idle_timeout_secs * 1_000_000_000;
     // established flows to the static range are adopted for a while after
@@ -73,6 +74,7 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
         .override_global("PENALTY_VERIFIED_NS", &penalty_verified_ns, true)
         .override_global("DNS_RECHECK_NS", &dns_recheck_ns, true)
         .override_global("HIT_COUNT", &hit_count, true)
+        .override_global("IPV6_SOURCE_PREFIX", &ipv6_source_prefix, true)
         .override_global("HIT_COUNT_RESET_NS", &hit_count_reset_ns, true)
         .override_global("PLAYER_IDLE_NS", &player_idle_ns, true)
         // Replace the placeholder map capacities baked into the object with

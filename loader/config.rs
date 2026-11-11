@@ -30,6 +30,11 @@ hit_count = 10
 # 3 seconds. Must be between 1 and 86400 (one day).
 hit_count_reset_secs = 3
 
+# Source prefix length for IPv6 throttling, rate limits and bans: an
+# attacker usually owns a whole /64, per-address limits would be useless.
+# Valid 32..=128. IPv4 is always counted per address.
+ipv6_source_prefix = 64
+
 # Idle timeout for verified player connections in seconds, enforced inside the
 # eBPF program: a connection's entry is removed after one to two timeout
 # intervals without packets, so a returning client has to redo the handshake.
@@ -56,11 +61,13 @@ online_mode_cache_secs = 300
 adopt_grace_secs = 120
 
 [targets]
-# Destinations protected regardless of auto detection, as "ip:port".
+# Destinations protected regardless of auto detection, as "ip:port" or
+# "[2001:db8::1]:25565" for IPv6.
 java = []
 bedrock = []
 
-# Destinations that are never protected, as "ip:port/tcp" or "ip:port/udp".
+# Destinations that are never protected, as "ip:port/tcp", "ip:port/udp" or
+# "[2001:db8::1]:443/tcp".
 # Overrides the static range and auto detection.
 exclude = []
 
@@ -71,7 +78,7 @@ exclude = []
 # answer correctly are protected.
 enabled = false
 
-# Only servers inside these networks are considered, e.g. ["85.93.5.0/24"].
+# Only servers inside these networks are considered, e.g. ["85.93.5.0/24", "2001:db8::/48"].
 networks = []
 
 # Interfaces on which server replies (TCP SYN-ACKs, RakNet pongs) of remote
@@ -105,7 +112,7 @@ state_file = "targets.json"
 # with "monitor" and check the xdp_reflection_* metrics before enforcing.
 mode = "off"
 
-# Protected networks, e.g. ["85.93.5.0/24"].
+# Protected networks, e.g. ["85.93.5.0/24", "2001:db8::/48"].
 networks = []
 
 # UDP source ports whose answers are checked.
@@ -284,6 +291,9 @@ pub struct FilterConfig {
     /// Throttle window length in seconds; each IP's SYN counter resets in-kernel
     /// once its window expires. Maps to `HIT_COUNT_RESET_NS` (converted to ns).
     pub hit_count_reset_secs: u64,
+    /// Prefix length per IPv6 source for throttle, rate limit and bans.
+    /// Maps to `IPV6_SOURCE_PREFIX`.
+    pub ipv6_source_prefix: u8,
     /// Idle timeout for verified connections in seconds; an entry is removed
     /// in-kernel after one to two intervals without packets. Maps to
     /// `PLAYER_IDLE_NS` (converted to ns).
@@ -304,6 +314,7 @@ impl Default for FilterConfig {
             end_port: 25565,
             hit_count: 10,
             hit_count_reset_secs: 3,
+            ipv6_source_prefix: 64,
             player_idle_timeout_secs: 60,
             online_names: true,
             adopt_grace_secs: 120,
@@ -749,6 +760,7 @@ impl FilterConfig {
                 self.end_port
             );
         }
+        check_range("[filter] ipv6_source_prefix", u64::from(self.ipv6_source_prefix), 32, 128)?;
         check_range(
             "[filter] hit_count_reset_secs",
             self.hit_count_reset_secs,
@@ -778,18 +790,18 @@ impl TargetsConfig {
     }
 }
 
-/// Parses "ip:port" (IPv4 only, the filter does not inspect IPv6).
-pub fn parse_socket_addr(entry: &str) -> Result<std::net::SocketAddrV4> {
+/// Parses "ip:port" or "[ipv6]:port".
+pub fn parse_socket_addr(entry: &str) -> Result<std::net::SocketAddr> {
     entry
         .parse()
-        .with_context(|| format!("expected \"ipv4:port\", got '{entry}'"))
+        .with_context(|| format!("expected \"ipv4:port\" or \"[ipv6]:port\", got '{entry}'"))
 }
 
-/// Parses "ip:port/tcp" or "ip:port/udp" into the address and its IP protocol.
-pub fn parse_exclude(entry: &str) -> Result<(std::net::SocketAddrV4, u8)> {
-    let (addr, proto) = entry
-        .rsplit_once('/')
-        .with_context(|| format!("expected \"ipv4:port/tcp\" or \"ipv4:port/udp\", got '{entry}'"))?;
+/// Parses "ip:port/tcp" or "[ipv6]:port/udp" into the address and its IP protocol.
+pub fn parse_exclude(entry: &str) -> Result<(std::net::SocketAddr, u8)> {
+    let (addr, proto) = entry.rsplit_once('/').with_context(|| {
+        format!("expected \"ip:port/tcp\" or \"[ipv6]:port/udp\", got '{entry}'")
+    })?;
     let proto = match proto {
         "tcp" => libc::IPPROTO_TCP as u8,
         "udp" => libc::IPPROTO_UDP as u8,
@@ -798,19 +810,27 @@ pub fn parse_exclude(entry: &str) -> Result<(std::net::SocketAddrV4, u8)> {
     Ok((parse_socket_addr(addr)?, proto))
 }
 
-/// Parses "a.b.c.d/len" into (network address, prefix length).
-pub fn parse_cidr(entry: &str) -> Result<(std::net::Ipv4Addr, u8)> {
-    let (addr, len) = entry.split_once('/').unwrap_or((entry, "32"));
-    let addr: std::net::Ipv4Addr = addr
+/// Parses "a.b.c.d/len" or "ipv6/len"; without a length the network is a
+/// single address.
+pub fn parse_cidr(entry: &str) -> Result<crate::addr::Net> {
+    let (addr, len) = match entry.split_once('/') {
+        Some((addr, len)) => (addr, Some(len)),
+        None => (entry, None),
+    };
+    let addr: std::net::IpAddr = addr
         .parse()
         .with_context(|| format!("invalid network address in '{entry}'"))?;
-    let len: u8 = len
-        .parse()
-        .with_context(|| format!("invalid prefix length in '{entry}'"))?;
-    if len > 32 {
-        bail!("prefix length of '{entry}' must be <= 32");
+    let max = if addr.is_ipv4() { 32 } else { 128 };
+    let len: u8 = match len {
+        Some(len) => len
+            .parse()
+            .with_context(|| format!("invalid prefix length in '{entry}'"))?,
+        None => max,
+    };
+    if len > max {
+        bail!("prefix length of '{entry}' must be <= {max}");
     }
-    Ok((addr, len))
+    Ok(crate::addr::Net { addr, len })
 }
 
 impl AutodetectConfig {
@@ -927,7 +947,7 @@ mod tests {
         cfg.validate().expect("valid targets");
         assert!(parse_exclude("1.2.3.4:5/icmp").is_err());
         assert!(parse_socket_addr("1.2.3.4").is_err());
-        assert_eq!(parse_cidr("85.93.5.0/24").unwrap().1, 24);
+        assert_eq!(parse_cidr("85.93.5.0/24").unwrap().len, 24);
     }
 
     #[test]
@@ -1019,5 +1039,31 @@ mod tests {
     fn rejects_unknown_log_level() {
         let err = toml::from_str::<Config>("[logging]\nlevel = \"verbose\"").unwrap_err();
         assert!(err.to_string().contains("verbose"));
+    }
+
+    #[test]
+    fn parses_dual_stack_entries() {
+        assert_eq!(parse_socket_addr("1.2.3.4:25565").unwrap().to_string(), "1.2.3.4:25565");
+        assert_eq!(parse_socket_addr("[2001:db8::10]:25565").unwrap().to_string(), "[2001:db8::10]:25565");
+        assert!(parse_socket_addr("2001:db8::10:25565").is_err());
+        let (addr, proto) = parse_exclude("[2001:db8::1]:443/tcp").unwrap();
+        assert_eq!((addr.port(), proto), (443, libc::IPPROTO_TCP as u8));
+        assert_eq!(parse_cidr("2001:db8::/48").unwrap().len, 48);
+        assert_eq!(parse_cidr("2001:db8::1").unwrap().len, 128);
+        assert_eq!(parse_cidr("1.2.3.4").unwrap().len, 32);
+        assert!(parse_cidr("2001:db8::/129").is_err());
+        assert!(parse_cidr("1.2.3.0/33").is_err());
+    }
+
+    #[test]
+    fn ipv6_source_prefix_validation() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.filter.ipv6_source_prefix, 64);
+        cfg.filter.ipv6_source_prefix = 31;
+        assert!(cfg.validate().is_err());
+        cfg.filter.ipv6_source_prefix = 129;
+        assert!(cfg.validate().is_err());
+        cfg.filter.ipv6_source_prefix = 128;
+        assert!(cfg.validate().is_ok());
     }
 }

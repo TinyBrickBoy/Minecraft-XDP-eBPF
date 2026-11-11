@@ -1,3 +1,4 @@
+mod addr;
 mod blocklist;
 mod config;
 mod detect;
@@ -12,6 +13,7 @@ mod shutdown;
 mod targets;
 mod unused;
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +21,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use aya::maps::HashMap;
-use log::{error, info};
+use log::{error, info, warn};
 
 use config::Config;
 use shutdown::Shutdown;
@@ -273,12 +275,18 @@ fn apply_config_targets(config: &Config, targets: &Targets) -> Result<()> {
         (&config.targets.bedrock, Kind::Bedrock),
     ] {
         for entry in entries {
-            let addr = config::parse_socket_addr(entry)?;
+            let SocketAddr::V4(addr) = config::parse_socket_addr(entry)? else {
+                warn!("[targets] IPv6 entry '{entry}' ignored, IPv6 not supported yet");
+                continue;
+            };
             targets.set(DstKey::new(addr, kind.proto()), kind, Source::Static)?;
         }
     }
     for entry in &config.targets.exclude {
-        let (addr, proto) = config::parse_exclude(entry)?;
+        let (SocketAddr::V4(addr), proto) = config::parse_exclude(entry)? else {
+            warn!("[targets] exclude: IPv6 entry '{entry}' ignored, IPv6 not supported yet");
+            continue;
+        };
         targets.set(DstKey::new(addr, proto), Kind::None, Source::Exclude)?;
     }
     Ok(())

@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -22,6 +22,7 @@ use anyhow::{Result, bail};
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
+use crate::addr::Net;
 use crate::config::{AutodetectConfig, Config, parse_cidr, parse_exclude};
 use crate::shutdown::Shutdown;
 use crate::targets::{DstKey, Kind, PROTO_TCP, PROTO_UDP, Source, Targets};
@@ -101,13 +102,19 @@ impl Scope {
         let auto = &config.autodetect;
         let mut networks = Vec::new();
         for network in &auto.networks {
-            let (addr, len) = parse_cidr(network)?;
+            let Net { addr: IpAddr::V4(addr), len } = parse_cidr(network)? else {
+                warn!("[autodetect] networks: IPv6 network '{network}' ignored, IPv6 not supported yet");
+                continue;
+            };
             let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
             networks.push((u32::from(addr) & mask, mask));
         }
         let mut exclude = HashSet::new();
         for entry in &config.targets.exclude {
-            let (addr, proto) = parse_exclude(entry)?;
+            let (SocketAddr::V4(addr), proto) = parse_exclude(entry)? else {
+                warn!("[targets] exclude: IPv6 entry '{entry}' ignored, IPv6 not supported yet");
+                continue;
+            };
             exclude.insert(DstKey::new(addr, proto));
         }
         Ok(Self {

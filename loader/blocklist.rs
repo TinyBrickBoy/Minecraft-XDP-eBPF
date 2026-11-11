@@ -2,7 +2,7 @@
 //! (see xdp/blocklist.h).
 
 use std::collections::{HashMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,6 +18,7 @@ use aya::programs::{SchedClassifier, TcAttachType};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
+use crate::addr::Net;
 use crate::config::{Config, ProtectionMode, parse_cidr};
 use crate::shutdown::Shutdown;
 use crate::unused::UnusedNetwork;
@@ -132,7 +133,10 @@ fn parse_scoped(text: &str, origin: &str) -> HashMap<(Ipv4Addr, u8), u8> {
             continue;
         }
         match parse_cidr(line) {
-            Ok((addr, len)) => {
+            Ok(Net { addr: IpAddr::V6(_), .. }) => {
+                warn!("{origin}:{}: IPv6 entry '{line}' ignored, IPv6 not supported yet", no + 1)
+            }
+            Ok(Net { addr: IpAddr::V4(addr), len }) => {
                 let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
                 let entry = out.entry((Ipv4Addr::from(u32::from(addr) & mask), len)).or_insert(scope);
                 *entry = (*entry).min(scope);
@@ -319,7 +323,10 @@ pub fn setup(
     }
     let mut allow_nets = Vec::new();
     for entry in &rl.allow {
-        allow_nets.push(parse_cidr(entry)?);
+        match parse_cidr(entry)? {
+            Net { addr: IpAddr::V4(addr), len } => allow_nets.push((addr, len)),
+            Net { .. } => warn!("[ratelimit] allow: IPv6 entry '{entry}' ignored, IPv6 not supported yet"),
+        }
     }
     // the protected networks: used by the rate limit, the scope of automatic
     // entries and the DNS scan detection
@@ -331,7 +338,10 @@ pub fn setup(
             ebpf.take_map("ratelimit_networks").context("can't take map 'ratelimit_networks'")?,
         )?;
         for (index, network) in rl.networks.iter().enumerate() {
-            let (addr, len) = parse_cidr(network)?;
+            let Net { addr: IpAddr::V4(addr), len } = parse_cidr(network)? else {
+                warn!("[ratelimit] networks: IPv6 network '{network}' ignored, IPv6 not supported yet");
+                continue;
+            };
             networks.set(index as u32, UnusedNetwork::new(addr, len), 0)?;
         }
     }

@@ -1,6 +1,6 @@
 //! Userspace side of the UDP reflection protection (see xdp/reflection.h).
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -11,8 +11,9 @@ use aya::Pod;
 use aya::maps::lpm_trie::{Key, LpmTrie};
 use aya::maps::{Array, MapData, PerCpuHashMap};
 use aya::programs::{SchedClassifier, TcAttachType};
-use log::{error, info};
+use log::{error, info, warn};
 
+use crate::addr::Net;
 use crate::config::{Config, ProtectionMode, parse_cidr};
 use crate::shutdown::Shutdown;
 
@@ -118,7 +119,10 @@ pub fn setup(
             .context("can't take map 'reflection_networks'")?,
     )?;
     for network in &refl.networks {
-        let (addr, len) = parse_cidr(network)?;
+        let Net { addr: IpAddr::V4(addr), len } = parse_cidr(network)? else {
+            warn!("[reflection] networks: IPv6 network '{network}' ignored, IPv6 not supported yet");
+            continue;
+        };
         let key = Key::new(len as u32, u32::from_ne_bytes(addr.octets()));
         networks.insert(&key, 1, 0)?;
     }

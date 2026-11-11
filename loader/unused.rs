@@ -1,13 +1,14 @@
 //! Userspace side of the unused address drop (see xdp/unused.h).
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use anyhow::{Context, Result};
 use aya::Ebpf;
 use aya::Pod;
 use aya::maps::{Array, MapData, PerCpuHashMap};
-use log::info;
+use log::{info, warn};
 
+use crate::addr::Net;
 use crate::config::{Config, parse_cidr};
 
 /// Userspace mirror of `struct unused_network`.
@@ -59,7 +60,10 @@ pub fn setup(ebpf: &mut Ebpf, config: &Config) -> Result<Option<StatsMap>> {
             .context("can't take map 'unused_networks'")?,
     )?;
     for (index, network) in config.unused.networks.iter().enumerate() {
-        let (addr, len) = parse_cidr(network)?;
+        let Net { addr: IpAddr::V4(addr), len } = parse_cidr(network)? else {
+            warn!("[unused] networks: IPv6 network '{network}' ignored, IPv6 not supported yet");
+            continue;
+        };
         networks.set(index as u32, UnusedNetwork::new(addr, len), 0)?;
     }
     info!(
