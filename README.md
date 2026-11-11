@@ -56,60 +56,77 @@ This fork of [Outfluencer/Minecraft-XDP-eBPF](https://github.com/Outfluencer/Min
   allowlisted address and a current outbound peer of the destination are
   never banned (also not for violations) and never dropped by a ban of
   their prefix; a ban prefix covering an allowlist entry is never escalated
-  to the blocklist. Bans are logged, per source counters are exported (`xdp_blocklist_*`,
-  `xdp_ratelimit_*`).
+  to the blocklist. Bans are logged, per source counters are exported
+  (`xdp_blocklist_*`, `xdp_ratelimit_*`).
 - **Manual overrides** (`[targets]`): always protected `java`/`bedrock`
   entries and `exclude` entries that are never filtered.
-- **IPv6**: every feature works for IPv6 destinations and sources. Targets
-  are written as `"[2001:db8::10]:25565"`, networks as `"2001:db8::/48"`;
-  v4-mapped input (`::ffff:a.b.c.d`) and IPv6 networks overlapping
-  `::ffff:0:0/96` (`::/0`, `::/64`, ...) are rejected, write IPv4 as
-  `a.b.c.d`; the kernel stores IPv4 v4-mapped, so such a network would also
-  match every IPv4 address (automatic bans are never escalated to one).
-  IPv6 packets from `::/80` (`::1`, v4-mapped, ...) or multicast sources and
-  to `::/80` destinations never appear on the wire and are dropped for every
-  destination; only neighbour solicitations from `::` (duplicate address
-  detection) pass.
-  Throttle, rate limit, strikes, bans and the penalty box count IPv6
-  sources per `[filter] ipv6_source_prefix` (default /64). Throttle, rate
-  limit, strikes and bans count IPv6 a second time per
-  `ipv6_aggregate_prefix` (default /48, a site's usual allocation) with
-  `ipv6_aggregate_factor` (default 8) times the per-source limits: a source
-  is throttled or banned when either tier is over its limit, so rotating
-  through the /64s of one /48 gains a factor of 8 instead of 65536, and a
-  /48 over its SYN limit can not fill the throttle map with /64 entries. A
-  ban of the aggregate tier is shown (and escalated) as the /48 prefix.
-  IPv4 is unaffected. IPv6 fragments
-  to protected targets are dropped. Packets with more than four extension
-  headers or a truncated header chain cannot be matched to a port: they are
-  dropped when the destination address has any protected target (any port)
-  or a static java port range is configured, when the destination is inside
-  any `[ratelimit]`, `[unused]` or `[reflection]` network, and when the
-  source is blocklisted or banned; only otherwise they pass. A truncated
-  fixed IPv6 header is always dropped (the kernel discards it too).
-  Neighbour discovery (ICMPv6 133-137) is never dropped when it is what
-  RFC 4861 allows on the wire: hop limit 255, no extension headers, at most
-  1280 bytes; anything else with those types is filtered like other
-  traffic. DNS scan detection blocklists IPv6 scanners per exact address. IPv4 `/32`
-  and IPv6 `/128` entries are shown as plain addresses everywhere (logs,
-  auto-blocklist file, state file, `source` label of `xdp_ratelimit_ban`);
-  real prefixes keep their length. The `source` label of a ban is the
-  banned /64 prefix for IPv6 (`2001:db8::/64`) and the plain address for
-  IPv4. The penalty box uses an nftables `inet` table (`xdp_penalty`) with
-  ip and ip6 dnat; a legacy `ip xdp_penalty` table of older versions is
-  removed automatically. Each family is set up on its own: the service
-  listens on the interface's first IPv4 and first global IPv6 address (any
-  global IPv6 address of the host when the interface has none); a family
-  without an address or whose listener can not be bound stays without the
-  penalty box (its throttled clients are dropped as with `enabled = false`)
-  and gets no redirect rule, the other family keeps it. Only connections
-  opened by a SYN of a penalized source pass untracked (they are redirected
-  to the service); its other flows are filtered as usual, its verified
-  connections keep running, and the `unredirected` chain drops marked
-  packets of connections that were not redirected.
+- **IPv6**: every feature works for IPv6 destinations and sources.
+  - Targets are written as `"[2001:db8::10]:25565"`, networks as
+    `"2001:db8::/48"`. v4-mapped input (`::ffff:a.b.c.d`) and IPv6 networks
+    overlapping `::ffff:0:0/96` (`::/0`, `::/64`, ...) are rejected, write
+    IPv4 as `a.b.c.d`: the kernel stores IPv4 v4-mapped, so such a network
+    would also match every IPv4 address (automatic bans are never escalated
+    to one either).
+  - IPv6 packets from `::/80` (`::1`, v4-mapped, ...) or multicast sources
+    and to `::/80` destinations never appear on the wire and are dropped for
+    every destination; only neighbour solicitations from `::` (duplicate
+    address detection) pass.
+  - Throttle, rate limit, strikes, bans and the penalty box count IPv6
+    sources per `[filter] ipv6_source_prefix` (default /64). Throttle, rate
+    limit, strikes and bans count IPv6 a second time per
+    `ipv6_aggregate_prefix` (default /48, a site's usual allocation) with
+    `ipv6_aggregate_factor` (default 8) times the per-source limits: a
+    source is throttled or banned when either tier is over its limit, so
+    rotating through the /64s of one /48 gains a factor of 8 instead of
+    65536, and a /48 over its SYN limit can not fill the throttle map with
+    /64 entries. IPv4 is counted per address, unchanged.
+  - Bans show as the counted prefix: the `src_ip` label of
+    `xdp_ratelimit_ban`, the log and automatic blocklist lines carry the
+    `ipv6_source_prefix` prefix (`2001:db8:1:2::/64` by default) or, for a
+    ban of the aggregate tier, the `ipv6_aggregate_prefix` prefix
+    (`2001:db8:1::/48`), and the plain address for IPv4. IPv4 `/32` and
+    IPv6 `/128` entries are shown as plain addresses everywhere (logs,
+    auto-blocklist file, state file, metric labels); real prefixes keep
+    their length. DNS scan detection blocklists IPv6 scanners per exact
+    address.
+  - Fragments: like IPv4, only first fragments (offset 0, also atomic
+    fragments) to a protected target are dropped, after the port check;
+    non-first TCP fragments carry no port and pass, they can not be
+    reassembled without the dropped first fragment. Bedrock targets drop
+    every first fragment, non-first UDP fragments only meet the reflection
+    check.
+  - Packets with more than four extension headers or a truncated header
+    chain can not be matched to a port: they are dropped when the
+    destination address has any protected target (any port) or a static
+    java port range is configured, when the destination is inside any
+    `[ratelimit]`, `[unused]` or `[reflection]` network, or when the source
+    is blocklisted or banned; only otherwise they pass. The default static
+    range (`start_port = end_port = 25565`) counts as configured, so by
+    default such packets are dropped for every destination. A truncated
+    fixed IPv6 header is always dropped (the kernel discards it too).
+  - Neighbour discovery (ICMPv6 133-137) is never dropped when it is what
+    RFC 4861 allows on the wire: hop limit 255, no extension headers, at
+    most 1280 bytes; anything else with those types is filtered like other
+    traffic.
+  - The penalty box uses an nftables `inet` table (`xdp_penalty`) with ip
+    and ip6 dnat; a legacy `ip xdp_penalty` table of older versions is
+    removed automatically. Each family is set up on its own: the service
+    listens on the interface's first IPv4 and first global IPv6 address
+    (any global IPv6 address of the host when the interface has none); a
+    family without an address or whose listener can not be bound stays
+    without the penalty box (its throttled clients are dropped as with
+    `enabled = false`) and gets no redirect rule, the other family keeps
+    it. Only connections opened by a SYN of a penalized source pass
+    untracked (they are redirected to the service); its other flows are
+    filtered as usual, its verified connections keep running, and the
+    `unredirected` chain drops marked packets of connections that were not
+    redirected.
 
-Tests: `cargo test` and `tests/e2e_docker.sh` (real traffic through the
-filter inside an isolated privileged container, see the script header).
+Tests: `cargo test`, `tests/e2e_docker.sh` (real traffic through the
+filter inside an isolated privileged container, see the script header) and
+`tests/verifier_docker.sh` (loads every program into the kernel's verifier,
+once with the all-zero config of the object and once with every config knob
+switched on).
 
 ## Features
 - **Protocol Analysis**: Analyzes Minecraft handshakes, status, ping, and login requests.
