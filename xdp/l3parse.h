@@ -44,6 +44,11 @@ struct l3
     __u8 tos;     // IPv4 tos / IPv6 traffic class
 };
 
+static __always_inline int is_ext_hdr(const __u8 next)
+{
+    return next == NEXTHDR_HOP || next == NEXTHDR_ROUTING || next == NEXTHDR_FRAGMENT || next == NEXTHDR_DEST;
+}
+
 static __always_inline int parse_l3_v4(const __u8 *ip, const void *data_end, struct l3 *out)
 {
     out->family = FAMILY_V4; // set first: callers read it on L3_BAD too
@@ -96,7 +101,7 @@ static __always_inline int parse_l3_v6(const __u8 *ip, const void *data_end, str
 #pragma unroll
     for (__u32 i = 0; i < MAX_EXT_HDRS; i++)
     {
-        if (next != NEXTHDR_HOP && next != NEXTHDR_ROUTING && next != NEXTHDR_FRAGMENT && next != NEXTHDR_DEST)
+        if (!is_ext_hdr(next))
         {
             break;
         }
@@ -109,7 +114,12 @@ static __always_inline int parse_l3_v6(const __u8 *ip, const void *data_end, str
         {
             __u16 fo;
             __builtin_memcpy(&fo, h + 2, 2);
-            out->frag = (bpf_ntohs(fo) & 0xfff8) ? FRAG_LATER : FRAG_FIRST;
+            // sticky: a later fragment header never downgrades FRAG_LATER
+            const __u8 frag = (bpf_ntohs(fo) & 0xfff8) ? FRAG_LATER : FRAG_FIRST;
+            if (frag > out->frag)
+            {
+                out->frag = frag;
+            }
             off += 8;
         }
         else
@@ -122,9 +132,13 @@ static __always_inline int parse_l3_v6(const __u8 *ip, const void *data_end, str
             return L3_BAD;
         }
     }
-    if (next == NEXTHDR_HOP || next == NEXTHDR_ROUTING || next == NEXTHDR_FRAGMENT || next == NEXTHDR_DEST)
+    if (is_ext_hdr(next))
     {
         return L3_BAD; // more than MAX_EXT_HDRS extension headers
+    }
+    if ((const void *)(ip + off) > data_end)
+    {
+        return L3_BAD; // extension header body truncated
     }
     out->proto = next;
     out->l4off = off;

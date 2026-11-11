@@ -8,6 +8,13 @@
  * past data_end trips the address sanitizer instead of going unnoticed.
  */
 #include <linux/types.h>
+#include <arpa/inet.h>
+#ifndef bpf_htons
+#define bpf_htons(x) htons(x)
+#define bpf_ntohs(x) ntohs(x)
+#define bpf_htonl(x) htonl(x)
+#define bpf_ntohl(x) ntohl(x)
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,13 +32,6 @@
 #define CONFIG_H
 static volatile __u8 ONLINE_NAMES = 1;
 
-#include <arpa/inet.h>
-#ifndef bpf_htons
-#define bpf_htons(x) htons(x)
-#define bpf_ntohs(x) ntohs(x)
-#define bpf_htonl(x) htonl(x)
-#define bpf_ntohl(x) ntohl(x)
-#endif
 #include "../common.h"
 #include "../varint.h"
 #include "../protocol.h"
@@ -808,6 +808,15 @@ static void test_parse_v4(void)
     CHECK(run_parse(p, 19, &l) == L3_BAD); // truncated header
     p[0] = 0x00;
     CHECK(run_parse(p, n, &l) == L3_NOT_IP);
+    CHECK(run_parse(p, 0, &l) == L3_NOT_IP); // zero-length input
+
+    n = build_v4(p, 6, 0, 0);
+    p[0] = 0x4f; // ihl 60 > packet
+    CHECK(run_parse(p, n, &l) == L3_BAD);
+
+    n = build_v4(p, 6, 0, 8);
+    p[0] = 0x46; // ihl 6: 24-byte header with options
+    CHECK(run_parse(p, n, &l) == L3_OK && l.proto == 6 && l.l4off == 24 && l.hdrlen == 24);
 }
 
 static void test_parse_v6(void)
@@ -836,6 +845,23 @@ static void test_parse_v6(void)
     // atomic fragment (offset 0, no M) is still a fragment header -> first
     p[43] = 0x00;
     CHECK(run_parse(p, n, &l) == L3_OK && l.frag == FRAG_FIRST);
+
+    // sticky: later fragment followed by an offset-0 fragment header stays later
+    n = build_v6(p, 44, 8 + 8 + 8);
+    p[40] = 44; p[42] = 0x00; p[43] = 0x08;
+    p[48] = 17; p[50] = 0x00; p[51] = 0x00;
+    CHECK(run_parse(p, n, &l) == L3_OK && l.frag == FRAG_LATER && l.l4off == 56);
+
+    // exactly MAX_EXT_HDRS headers: hop-by-hop + 3 destination options, then udp
+    n = build_v6(p, 0, 32 + 8);
+    p[40] = 60; p[48] = 60; p[56] = 60; p[64] = 17;
+    CHECK(run_parse(p, n, &l) == L3_OK && l.proto == 17 && l.l4off == 40 + 32);
+
+    // destination options declaring 16 bytes but cut after 8
+    n = build_v6(p, 60, 8);
+    p[40] = 17; p[41] = 1;
+    CHECK(run_parse(p, n, &l) == L3_BAD);
+    CHECK(l.family == FAMILY_V6);
 
     // five hop-by-hop headers: over the limit
     n = build_v6(p, 0, 5 * 8 + 8);
