@@ -2,9 +2,6 @@
 //! (xdp/common.h): IPv6 as is, IPv4 v4-mapped (::ffff:a.b.c.d), bytes in
 //! network order.
 
-// Parts are consumed by the modules migrated in the following tasks.
-#![allow(dead_code)]
-
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr};
 
