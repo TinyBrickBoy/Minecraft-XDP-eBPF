@@ -337,12 +337,8 @@ pub fn setup(
         let mut networks: Array<MapData, UnusedNetwork> = Array::try_from(
             ebpf.take_map("ratelimit_networks").context("can't take map 'ratelimit_networks'")?,
         )?;
-        for (index, network) in rl.networks.iter().enumerate() {
-            let Net { addr: IpAddr::V4(addr), len } = parse_cidr(network)? else {
-                warn!("[ratelimit] networks: IPv6 network '{network}' ignored, IPv6 not supported yet");
-                continue;
-            };
-            networks.set(index as u32, UnusedNetwork::new(addr, len), 0)?;
+        for (index, slot) in crate::unused::network_slots("[ratelimit]", &rl.networks)?.iter().enumerate() {
+            networks.set(index as u32, *slot, 0)?;
         }
     }
     if rl.mode != ProtectionMode::Off {

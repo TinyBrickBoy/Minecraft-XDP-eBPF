@@ -792,9 +792,21 @@ impl TargetsConfig {
 
 /// Parses "ip:port" or "[ipv6]:port".
 pub fn parse_socket_addr(entry: &str) -> Result<std::net::SocketAddr> {
-    entry
+    let addr: std::net::SocketAddr = entry
         .parse()
-        .with_context(|| format!("expected \"ipv4:port\" or \"[ipv6]:port\", got '{entry}'"))
+        .with_context(|| format!("expected \"ipv4:port\" or \"[ipv6]:port\", got '{entry}'"))?;
+    if let std::net::IpAddr::V6(v6) = addr.ip() {
+        reject_mapped(v6, entry)?;
+    }
+    Ok(addr)
+}
+
+/// The kernel stores IPv4 v4-mapped, so a mapped input would alias the IPv4 entry.
+fn reject_mapped(addr: std::net::Ipv6Addr, entry: &str) -> Result<()> {
+    if addr.to_ipv4_mapped().is_some() {
+        bail!("write IPv4 addresses as a.b.c.d, not ::ffff:a.b.c.d (in '{entry}')");
+    }
+    Ok(())
 }
 
 /// Parses "ip:port/tcp" or "[ipv6]:port/udp" into the address and its IP protocol.
@@ -820,6 +832,9 @@ pub fn parse_cidr(entry: &str) -> Result<crate::addr::Net> {
     let addr: std::net::IpAddr = addr
         .parse()
         .with_context(|| format!("invalid network address in '{entry}'"))?;
+    if let std::net::IpAddr::V6(v6) = addr {
+        reject_mapped(v6, entry)?;
+    }
     let max = if addr.is_ipv4() { 32 } else { 128 };
     let len: u8 = match len {
         Some(len) => len
@@ -1056,7 +1071,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_v4_mapped_input() {
+        assert!(parse_cidr("::ffff:1.2.3.4/128").is_err());
+        assert!(parse_cidr("::ffff:1.2.3.4").is_err());
+        assert!(parse_socket_addr("[::ffff:1.2.3.4]:25565").is_err());
+        assert!(parse_exclude("[::ffff:1.2.3.4]:443/tcp").is_err());
+        let err = parse_cidr("::ffff:1.2.3.4").unwrap_err().to_string();
+        assert_eq!(err, "write IPv4 addresses as a.b.c.d, not ::ffff:a.b.c.d (in '::ffff:1.2.3.4')");
+    }
+
+    #[test]
     fn ipv6_source_prefix_validation() {
+        let mut ok = Config::default();
+        ok.filter.ipv6_source_prefix = 32;
+        assert!(ok.validate().is_ok());
         let mut cfg = Config::default();
         assert_eq!(cfg.filter.ipv6_source_prefix, 64);
         cfg.filter.ipv6_source_prefix = 31;

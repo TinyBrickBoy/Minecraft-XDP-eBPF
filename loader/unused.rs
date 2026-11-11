@@ -32,6 +32,20 @@ impl UnusedNetwork {
     }
 }
 
+/// The array slots for a network list. The kernel stops at the first empty
+/// slot, so skipped (IPv6) entries must not leave gaps.
+pub fn network_slots(section: &str, networks: &[String]) -> Result<Vec<UnusedNetwork>> {
+    let mut slots = Vec::new();
+    for network in networks {
+        let Net { addr: IpAddr::V4(addr), len } = parse_cidr(network)? else {
+            warn!("{section} networks: IPv6 network '{network}' ignored, IPv6 not supported yet");
+            continue;
+        };
+        slots.push(UnusedNetwork::new(addr, len));
+    }
+    Ok(slots)
+}
+
 /// Userspace mirror of `struct unused_stats`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
@@ -59,12 +73,8 @@ pub fn setup(ebpf: &mut Ebpf, config: &Config) -> Result<Option<StatsMap>> {
         ebpf.take_map("unused_networks")
             .context("can't take map 'unused_networks'")?,
     )?;
-    for (index, network) in config.unused.networks.iter().enumerate() {
-        let Net { addr: IpAddr::V4(addr), len } = parse_cidr(network)? else {
-            warn!("[unused] networks: IPv6 network '{network}' ignored, IPv6 not supported yet");
-            continue;
-        };
-        networks.set(index as u32, UnusedNetwork::new(addr, len), 0)?;
+    for (index, slot) in network_slots("[unused]", &config.unused.networks)?.iter().enumerate() {
+        networks.set(index as u32, *slot, 0)?;
     }
     info!(
         "Dropping traffic to unrouted addresses of {:?}",
@@ -75,4 +85,18 @@ pub fn setup(ebpf: &mut Ebpf, config: &Config) -> Result<Option<StatsMap>> {
             .context("can't take map 'unused_stats'")?,
     )?;
     Ok(Some(stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skipped_ipv6_networks_leave_no_gap() {
+        let nets = ["2001:db8::/48".to_string(), "10.0.0.0/24".to_string()];
+        let slots = network_slots("[test]", &nets).unwrap();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].valid, 1);
+        assert_eq!(slots[0].addr, u32::from(Ipv4Addr::new(10, 0, 0, 0)).to_be());
+    }
 }

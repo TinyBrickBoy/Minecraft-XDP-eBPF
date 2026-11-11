@@ -160,6 +160,45 @@ mod tests {
     }
 
     #[test]
+    fn masks_keys_and_empty_nets() {
+        let v4 = Net {
+            addr: "10.1.2.3".parse().unwrap(),
+            len: 24,
+        };
+        assert_eq!(v4.mask6().0[..12], [0xff; 12]);
+        assert_eq!(v4.mask6().0[12..], [0xff, 0xff, 0xff, 0]);
+        let v6 = Net {
+            addr: "2001:db8::".parse().unwrap(),
+            len: 32,
+        };
+        assert_eq!(v6.mask6().0[..4], [0xff; 4]);
+        assert_eq!(v6.mask6().0[4..], [0; 12]);
+
+        let k4 = lpm_key(&Net {
+            addr: "10.9.9.9".parse().unwrap(),
+            len: 8,
+        });
+        assert_eq!(k4.prefix_len(), 104);
+        assert_eq!(k4.data().to_string(), "10.0.0.0");
+        let k6 = lpm_key(&v6);
+        assert_eq!(k6.prefix_len(), 32);
+        assert_eq!(k6.data().to_string(), "2001:db8::");
+
+        let any4 = Net {
+            addr: "0.0.0.0".parse().unwrap(),
+            len: 0,
+        };
+        assert!(any4.contains("203.0.113.9".parse().unwrap()));
+        assert!(!any4.contains("2001:db8::1".parse().unwrap()));
+        let any6 = Net {
+            addr: "::".parse().unwrap(),
+            len: 0,
+        };
+        assert!(any6.contains("2001:db8::1".parse().unwrap()));
+        assert!(!any6.contains("203.0.113.9".parse().unwrap()));
+    }
+
+    #[test]
     fn source_prefixes() {
         assert_eq!(
             source_prefix("1.2.3.4".parse().unwrap(), 64).to_string(),
