@@ -99,7 +99,7 @@ struct
     __type(value, __u64);
 } blocklist_size SEC(".maps");
 
-static __always_inline __u8 in_ratelimit_networks(const __u32 daddr)
+static __always_inline __u8 in_ratelimit_networks(const struct addr6 *daddr)
 {
 #pragma unroll
     for (__u32 i = 0; i < UNUSED_MAX_NETWORKS; i++)
@@ -110,7 +110,7 @@ static __always_inline __u8 in_ratelimit_networks(const __u32 daddr)
         {
             return 0;
         }
-        if ((daddr & net->mask) == net->addr)
+        if (net_match(daddr, net))
         {
             return 1;
         }
@@ -127,9 +127,10 @@ static __always_inline __u8 in_ratelimit_networks(const __u32 daddr)
  */
 struct outbound_key
 {
-    __u32 remote;
-    __u32 local;
+    struct addr6 remote;
+    struct addr6 local;
 };
+_Static_assert(sizeof(struct outbound_key) == 32, "outbound_key size mismatch!");
 
 struct
 {
@@ -141,9 +142,9 @@ struct
 
 #define OUTBOUND_WINDOW_NS (30ULL * 1000000000ULL)
 
-static __always_inline __u8 outbound_peer(const __u32 remote, const __u32 local)
+static __always_inline __u8 outbound_peer(const struct addr6 *remote, const struct addr6 *local)
 {
-    const struct outbound_key key = {.remote = remote, .local = local};
+    const struct outbound_key key = {.remote = *remote, .local = *local};
     const __u64 *last = bpf_map_lookup_elem(&outbound_peers, &key);
     return last && bpf_ktime_get_ns() - *last < OUTBOUND_WINDOW_NS;
 }
@@ -166,7 +167,7 @@ struct
 {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
-    __type(key, __u32); // source address
+    __type(key, struct addr6); // source prefix (src_prefix)
     __type(value, struct rate_window);
 } ratelimit_windows SEC(".maps");
 
@@ -185,7 +186,7 @@ struct
 {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
-    __type(key, __u32);
+    __type(key, struct addr6); // source prefix (src_prefix)
     __type(value, struct rate_window);
 } strike_windows SEC(".maps");
 
@@ -193,7 +194,7 @@ struct
 {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
-    __type(key, __u32);
+    __type(key, struct addr6); // source prefix (src_prefix)
     __type(value, struct ban);
 } ratelimit_bans SEC(".maps");
 
@@ -228,7 +229,7 @@ struct
 {
     __uint(type, BPF_MAP_TYPE_LRU_PERCPU_HASH);
     __uint(max_entries, 4096);
-    __type(key, __u32);
+    __type(key, struct addr6); // exact source address
     __type(value, struct source_stats);
 } blocked_sources SEC(".maps");
 
@@ -238,23 +239,23 @@ static __always_inline struct block_stats *block_stats_slot(void)
     return bpf_map_lookup_elem(&block_stats, &zero);
 }
 
-static __always_inline __u8 lpm_contains(void *trie, const __u32 addr)
+static __always_inline __u8 lpm_contains(void *trie, const struct addr6 *addr)
 {
-    const struct net_key key = {.prefixlen = 32, .addr = addr};
+    const struct net_key key = {.prefixlen = 128, .addr = *addr};
     return bpf_map_lookup_elem(trie, &key) != NULL;
 }
 
-static __always_inline __u8 lpm_value(void *trie, const __u32 addr)
+static __always_inline __u8 lpm_value(void *trie, const struct addr6 *addr)
 {
-    const struct net_key key = {.prefixlen = 32, .addr = addr};
+    const struct net_key key = {.prefixlen = 128, .addr = *addr};
     const __u8 *value = bpf_map_lookup_elem(trie, &key);
     return value ? *value : 0;
 }
 
-static __always_inline void issue_ban(const __u32 src, const __u64 now, const __u64 count, const __u64 reason)
+static __always_inline void issue_ban(const struct addr6 *src, const __u64 now, const __u64 count, const __u64 reason)
 {
     const struct ban fresh = {.until_ns = now + RATELIMIT_BAN_NS, .since_ns = now, .rate = count, .dropped = 0, .reason = reason};
-    if (bpf_map_update_elem(&ratelimit_bans, &src, &fresh, BPF_NOEXIST) == 0)
+    if (bpf_map_update_elem(&ratelimit_bans, src, &fresh, BPF_NOEXIST) == 0)
     {
         struct block_stats *st = block_stats_slot();
         if (st)
@@ -275,23 +276,23 @@ static __always_inline void issue_ban(const __u32 src, const __u64 now, const __
  * Returns 1 when the packet has to be dropped because of its source.
  * bytes is the frame length, for the statistics.
  */
-static __always_inline __u8 whitelisted(const __u32 src)
+static __always_inline __u8 whitelisted(const struct addr6 *src)
 {
     __u32 zero = 0;
     const __u64 *size = bpf_map_lookup_elem(&whitelist_size, &zero);
     return size && *size && lpm_contains(&whitelist, src);
 }
 
-static __always_inline __u8 blocked_source(const struct iphdr *ip, const __u64 bytes)
+static __always_inline __u8 blocked_source(const struct l3 *l, const __u64 bytes)
 {
-    const __u32 src = ip->saddr;
+    const struct addr6 *src = &l->src; // exact address: lists and per-address stats
     if (whitelisted(src))
     {
         return 0;
     }
 
     const __u8 scope = BLOCKLIST_ACTIVE && blocklist_nonempty() ? lpm_value(&blocklist, src) : 0;
-    if (scope == BLOCK_ALL || (scope == BLOCK_PROTECTED && in_ratelimit_networks(ip->daddr)))
+    if (scope == BLOCK_ALL || (scope == BLOCK_PROTECTED && in_ratelimit_networks(&l->dst)))
     {
         struct block_stats *st = block_stats_slot();
         if (st)
@@ -299,12 +300,12 @@ static __always_inline __u8 blocked_source(const struct iphdr *ip, const __u64 b
             st->blocklist_packets++;
             st->blocklist_bytes += bytes;
         }
-        struct source_stats *per = bpf_map_lookup_elem(&blocked_sources, &src);
+        struct source_stats *per = bpf_map_lookup_elem(&blocked_sources, src);
         if (!per)
         {
             const struct source_stats zero = {0};
-            bpf_map_update_elem(&blocked_sources, &src, &zero, BPF_NOEXIST);
-            per = bpf_map_lookup_elem(&blocked_sources, &src);
+            bpf_map_update_elem(&blocked_sources, src, &zero, BPF_NOEXIST);
+            per = bpf_map_lookup_elem(&blocked_sources, src);
         }
         if (per)
         {
@@ -321,13 +322,15 @@ static __always_inline __u8 blocked_source(const struct iphdr *ip, const __u64 b
 
     // automatic bans and the rate limit only concern the protected networks:
     // traffic to the router itself (BGP, tunnels) is never cut off
-    if (!in_ratelimit_networks(ip->daddr))
+    if (!in_ratelimit_networks(&l->dst))
     {
         return 0;
     }
 
+    // bans and the rate limit count per source prefix (IPv6: IPV6_SOURCE_PREFIX)
+    const struct addr6 pfx = src_prefix(&l->src);
     const __u64 now = bpf_ktime_get_ns();
-    struct ban *ban = bpf_map_lookup_elem(&ratelimit_bans, &src);
+    struct ban *ban = bpf_map_lookup_elem(&ratelimit_bans, &pfx);
     if (ban)
     {
         if (now < ban->until_ns)
@@ -341,14 +344,14 @@ static __always_inline __u8 blocked_source(const struct iphdr *ip, const __u64 b
             }
             return RATELIMIT_MODE == RATELIMIT_ENFORCE;
         }
-        bpf_map_delete_elem(&ratelimit_bans, &src);
+        bpf_map_delete_elem(&ratelimit_bans, &pfx);
     }
 
-    struct rate_window *window = bpf_map_lookup_elem(&ratelimit_windows, &src);
+    struct rate_window *window = bpf_map_lookup_elem(&ratelimit_windows, &pfx);
     if (!window)
     {
         const struct rate_window fresh = {.start_ns = now, .packets = 1};
-        bpf_map_update_elem(&ratelimit_windows, &src, &fresh, BPF_ANY);
+        bpf_map_update_elem(&ratelimit_windows, &pfx, &fresh, BPF_ANY);
         return 0;
     }
     if (now - window->start_ns >= 1000000000ULL)
@@ -365,15 +368,15 @@ static __always_inline __u8 blocked_source(const struct iphdr *ip, const __u64 b
     }
     // the allowlist and the outbound peers are only consulted for sources
     // above the limit
-    if (lpm_contains(&ratelimit_allow, src) || outbound_peer(src, ip->daddr))
+    if (lpm_contains(&ratelimit_allow, src) || outbound_peer(&l->src, &l->dst))
     {
         window->start_ns = now;
         window->packets = 1;
         return 0;
     }
 
-    issue_ban(src, now, packets, BAN_RATE);
-    bpf_map_delete_elem(&ratelimit_windows, &src);
+    issue_ban(&pfx, now, packets, BAN_RATE);
+    bpf_map_delete_elem(&ratelimit_windows, &pfx);
     return RATELIMIT_MODE == RATELIMIT_ENFORCE;
 }
 
@@ -384,18 +387,19 @@ static __always_inline __u8 blocked_source(const struct iphdr *ip, const __u64 b
  * Never call it for traffic whose source is typically spoofed on behalf of
  * a victim (reflection answers).
  */
-static __always_inline void add_strike(const __u32 src)
+static __always_inline void add_strike(const struct addr6 *src)
 {
     if (RATELIMIT_MODE == RATELIMIT_OFF || !STRIKE_LIMIT || whitelisted(src))
     {
         return;
     }
+    const struct addr6 pfx = src_prefix(src);
     const __u64 now = bpf_ktime_get_ns();
-    struct rate_window *window = bpf_map_lookup_elem(&strike_windows, &src);
+    struct rate_window *window = bpf_map_lookup_elem(&strike_windows, &pfx);
     if (!window)
     {
         const struct rate_window fresh = {.start_ns = now, .packets = 1};
-        bpf_map_update_elem(&strike_windows, &src, &fresh, BPF_ANY);
+        bpf_map_update_elem(&strike_windows, &pfx, &fresh, BPF_ANY);
         return;
     }
     if (now - window->start_ns >= STRIKE_WINDOW_NS)
@@ -409,12 +413,12 @@ static __always_inline void add_strike(const __u32 src)
     {
         return;
     }
-    bpf_map_delete_elem(&strike_windows, &src);
+    bpf_map_delete_elem(&strike_windows, &pfx);
     if (lpm_contains(&ratelimit_allow, src))
     {
         return;
     }
-    issue_ban(src, now, strikes, BAN_STRIKES);
+    issue_ban(&pfx, now, strikes, BAN_STRIKES);
 }
 
 /*
@@ -435,37 +439,37 @@ struct
 {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 4096);
-    __type(key, __u32); // destination address
+    __type(key, struct addr6); // exact destination address
     __type(value, struct dns_verdict);
 } dns_verdicts SEC(".maps");
 
 // must match `DnsQuery` in loader/blocklist.rs
 struct dns_query
 {
-    __u32 dst;
-    __u32 pad;
+    struct addr6 dst;
     __u64 last_ns;
     __u64 count;
 };
+_Static_assert(sizeof(struct dns_query) == 32, "dns_query size mismatch!");
 
 struct
 {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 8192);
-    __type(key, __u32); // source address
+    __type(key, struct addr6); // exact source address
     __type(value, struct dns_query);
 } dns_queries SEC(".maps");
 
 // returns 1 when the packet is a DNS query to a protected address that is
 // known to run no DNS server (drop it)
-static __always_inline __u8 dns_scan_check(const struct iphdr *ip, const void *data_end)
+static __always_inline __u8 dns_scan_check(const void *ip, const struct l3 *l, const void *data_end)
 {
-    if (!DNS_SCAN || ip->protocol != IPPROTO_UDP || (ip->frag_off & bpf_htons(IP_OFFSET)))
+    if (!DNS_SCAN || l->proto != IPPROTO_UDP || l->frag == FRAG_LATER)
     {
         return 0;
     }
-    const struct udphdr *udp = (const void *)ip + (ip->ihl * 4);
-    if ((const void *)(udp + 1) > data_end || udp->dest != bpf_htons(53) || !in_ratelimit_networks(ip->daddr))
+    const struct udphdr *udp = l4_ptr(ip, l);
+    if ((const void *)(udp + 1) > data_end || udp->dest != bpf_htons(53) || !in_ratelimit_networks(&l->dst))
     {
         return 0;
     }
@@ -478,27 +482,25 @@ static __always_inline __u8 dns_scan_check(const struct iphdr *ip, const void *d
     {
         return 0;
     }
-    const __u32 dst = ip->daddr;
     const __u64 now = bpf_ktime_get_ns();
-    const struct dns_verdict *verdict = bpf_map_lookup_elem(&dns_verdicts, &dst);
+    const struct dns_verdict *verdict = bpf_map_lookup_elem(&dns_verdicts, &l->dst);
     const __u8 fresh = verdict && now - verdict->checked_ns < DNS_RECHECK_NS;
     if (fresh && verdict->has_server)
     {
         return 0;
     }
     // unknown or no server: note the source for the loader
-    const __u32 src = ip->saddr;
-    struct dns_query *q = bpf_map_lookup_elem(&dns_queries, &src);
+    struct dns_query *q = bpf_map_lookup_elem(&dns_queries, &l->src);
     if (q)
     {
-        q->dst = dst;
+        q->dst = l->dst;
         q->last_ns = now;
         __sync_fetch_and_add(&q->count, 1);
     }
     else
     {
-        const struct dns_query fresh_q = {.dst = dst, .pad = 0, .last_ns = now, .count = 1};
-        bpf_map_update_elem(&dns_queries, &src, &fresh_q, BPF_ANY);
+        const struct dns_query fresh_q = {.dst = l->dst, .last_ns = now, .count = 1};
+        bpf_map_update_elem(&dns_queries, &l->src, &fresh_q, BPF_ANY);
     }
     return fresh; // known to have no server: drop
 }
@@ -513,12 +515,13 @@ __s32 outbound_record(struct __sk_buff *skb)
 {
     const void *data = (const void *)(long)skb->data;
     const void *data_end = (const void *)(long)skb->data_end;
-    const struct iphdr *ip = ipv4_header(data, data_end, skb->ifindex);
-    if (!ip || ip->ihl < 5 || !in_ratelimit_networks(ip->saddr))
+    struct l3 l;
+    const void *ip;
+    if (packet_l3(data, data_end, skb->ifindex, &l, &ip) != L3_OK || !in_ratelimit_networks(&l.src))
     {
         return TC_ACT_UNSPEC;
     }
-    const struct outbound_key key = {.remote = ip->daddr, .local = ip->saddr};
+    const struct outbound_key key = {.remote = l.dst, .local = l.src};
     const __u64 now = bpf_ktime_get_ns();
     __u64 *last = bpf_map_lookup_elem(&outbound_peers, &key);
     if (last)
@@ -535,16 +538,16 @@ __s32 outbound_record(struct __sk_buff *skb)
     // (QUIC 443, DNS 53, ...). Answers to clients (that could be an
     // attacker) never exempt them.
     __u8 opens = 0;
-    if (!(ip->frag_off & bpf_htons(IP_OFFSET)))
+    if (l.frag != FRAG_LATER)
     {
-        if (ip->protocol == IPPROTO_TCP)
+        if (l.proto == IPPROTO_TCP)
         {
-            const struct tcphdr *tcp = (const void *)ip + (ip->ihl * 4);
+            const struct tcphdr *tcp = l4_ptr(ip, &l);
             opens = (const void *)(tcp + 1) <= data_end && tcp->syn && !tcp->ack;
         }
-        else if (ip->protocol == IPPROTO_UDP)
+        else if (l.proto == IPPROTO_UDP)
         {
-            const struct udphdr *udp = (const void *)ip + (ip->ihl * 4);
+            const struct udphdr *udp = l4_ptr(ip, &l);
             opens = (const void *)(udp + 1) <= data_end && bpf_ntohs(udp->source) >= 32768 &&
                     bpf_ntohs(udp->dest) < 1024;
         }

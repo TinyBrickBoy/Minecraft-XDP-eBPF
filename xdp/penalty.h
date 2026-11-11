@@ -25,7 +25,7 @@ struct
 {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
-    __type(key, __u32);
+    __type(key, struct addr6); // source prefix (src_prefix)
     __type(value, __u64);
 } verified_sources SEC(".maps");
 
@@ -34,7 +34,7 @@ struct
 {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
-    __type(key, __u32);
+    __type(key, struct addr6); // source prefix (src_prefix)
     __type(value, __u64);
 } penalty SEC(".maps");
 
@@ -59,41 +59,44 @@ static __always_inline __u8 penalty_enabled(void)
     return ready && *ready;
 }
 
-static __always_inline void note_verified_source(const __u32 src)
+static __always_inline void note_verified_source(const struct addr6 *src)
 {
     if (!PENALTY_NS)
     {
         return;
     }
+    const struct addr6 pfx = src_prefix(src);
     const __u64 now = bpf_ktime_get_ns();
-    bpf_map_update_elem(&verified_sources, &src, &now, BPF_ANY);
+    bpf_map_update_elem(&verified_sources, &pfx, &now, BPF_ANY);
 }
 
-static __always_inline __u8 penalized(const __u32 src)
+static __always_inline __u8 penalized(const struct addr6 *src)
 {
     if (!penalty_enabled())
     {
         return 0;
     }
-    const __u64 *until = bpf_map_lookup_elem(&penalty, &src);
+    const struct addr6 pfx = src_prefix(src);
+    const __u64 *until = bpf_map_lookup_elem(&penalty, &pfx);
     return until && bpf_ktime_get_ns() < *until;
 }
 
 // puts src in the penalty box if it is a known real client; returns 1 then
-static __always_inline __u8 try_penalize(const __u32 src)
+static __always_inline __u8 try_penalize(const struct addr6 *src)
 {
     if (!penalty_enabled())
     {
         return 0;
     }
+    const struct addr6 pfx = src_prefix(src);
     const __u64 now = bpf_ktime_get_ns();
-    const __u64 *verified = bpf_map_lookup_elem(&verified_sources, &src);
+    const __u64 *verified = bpf_map_lookup_elem(&verified_sources, &pfx);
     if (!verified || now - *verified > PENALTY_VERIFIED_NS)
     {
         return 0;
     }
     const __u64 until = now + PENALTY_NS;
-    bpf_map_update_elem(&penalty, &src, &until, BPF_ANY);
+    bpf_map_update_elem(&penalty, &pfx, &until, BPF_ANY);
     return 1;
 }
 
@@ -107,22 +110,19 @@ __s32 penalty_mark(struct __sk_buff *skb)
 {
     const void *data = (const void *)(long)skb->data;
     const void *data_end = (const void *)(long)skb->data_end;
-    const struct iphdr *ip = ipv4_header(data, data_end, skb->ifindex);
-    if (!ip || ip->ihl < 5 || ip->protocol != IPPROTO_TCP)
+    struct l3 l;
+    const void *ip;
+    if (packet_l3(data, data_end, skb->ifindex, &l, &ip) != L3_OK || l.proto != IPPROTO_TCP || l.frag == FRAG_LATER)
     {
         return TC_ACT_UNSPEC;
     }
-    const struct tcphdr *tcp = (const void *)ip + (ip->ihl * 4);
-    if ((const void *)(tcp + 1) > data_end)
-    {
-        return TC_ACT_UNSPEC;
-    }
-    if (!penalized(ip->saddr))
+    const struct tcphdr *tcp = l4_ptr(ip, &l);
+    if ((const void *)(tcp + 1) > data_end || !penalized(&l.src))
     {
         return TC_ACT_UNSPEC;
     }
     __u8 grace = 0;
-    if (lookup_target(ip->daddr, tcp->dest, IPPROTO_TCP, &grace) == KIND_JAVA)
+    if (lookup_target(&l.dst, tcp->dest, IPPROTO_TCP, &grace) == KIND_JAVA)
     {
         skb->mark |= PENALTY_MARK;
     }

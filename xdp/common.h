@@ -159,16 +159,6 @@ static __always_inline struct flow_key gen_flow_key(const struct addr6 *src, con
     return key;
 }
 
-// key identifying one TCP flow (all fields in network byte order)
-struct ipv4_flow_key
-{
-    const __u32 src_ip;
-    const __u32 dst_ip;
-    const __u16 src_port;
-    const __u16 dst_port;
-};
-_Static_assert(sizeof(struct ipv4_flow_key) == 12, "ipv4_flow_key size mismatch!");
-
 // per-connection tracking data while the handshake sequence is inspected
 struct initial_state
 {
@@ -178,16 +168,6 @@ struct initial_state
     __u32 expected_sequence;
 };
 _Static_assert(sizeof(struct initial_state) == 12, "initial_state size mismatch!");
-
-static __always_inline struct ipv4_flow_key gen_ipv4_flow_key(const __u32 src_ip, const __u32 dst_ip, const __u16 src_port, const __u16 dst_port)
-{
-    struct ipv4_flow_key key = {
-        .src_ip = src_ip,
-        .dst_ip = dst_ip,
-        .src_port = src_port,
-        .dst_port = dst_port};
-    return key;
-}
 
 static __always_inline struct initial_state gen_initial_state(const __u16 state, const __s32 protocol, const __u32 expected_sequence)
 {

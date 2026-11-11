@@ -3,6 +3,7 @@
 
 #include <linux/types.h>
 
+#include "common.h"
 #include "config.h"
 
 // selects which statistics count_stats() increments; a bitmask so related
@@ -41,12 +42,12 @@ _Static_assert(sizeof(struct statistics) == 80, "statistics size mismatch!");
 // `DstKey` in loader/targets.rs
 struct dst_key
 {
-    __u32 daddr;
+    struct addr6 daddr;
     __u16 dport;
     __u8 proto; // IPPROTO_TCP or IPPROTO_UDP
     __u8 pad;
 };
-_Static_assert(sizeof(struct dst_key) == 8, "dst_key size mismatch!");
+_Static_assert(sizeof(struct dst_key) == 20, "dst_key size mismatch!");
 
 static __always_inline void add_stats(struct statistics *stats_ptr, const __u32 bitmask, const __u64 amount)
 {

@@ -166,4 +166,10 @@ static __always_inline int parse_l3(const void *ip, const void *data_end, struct
     return L3_NOT_IP;
 }
 
+// l4 header pointer, bounded for the verifier (l4off <= MAX_L3_HDRLEN)
+static __always_inline const void *l4_ptr(const void *ip, const struct l3 *l)
+{
+    return (const __u8 *)ip + (l->l4off & 1023);
+}
+
 #endif

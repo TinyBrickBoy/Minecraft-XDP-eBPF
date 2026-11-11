@@ -32,14 +32,6 @@
 #include "protocol.h"
 #include "stats.h"
 
-// fragment bits of iphdr->frag_off (kernel-internal net/ip.h, not uapi)
-#ifndef IP_MF
-#define IP_MF 0x2000 // flag: "more fragments"
-#endif
-#ifndef IP_OFFSET
-#define IP_OFFSET 0x1FFF // "fragment offset" part
-#endif
-
 #include "l3.h"
 #include "reflection.h"
 #include "unused.h"
@@ -53,7 +45,7 @@ struct
 {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 16384);          // placeholder, set by the loader ([xdp] max_pending_connections)
-    __type(key, struct ipv4_flow_key);   // flow key
+    __type(key, struct flow_key);        // flow key
     __type(value, struct initial_state); // inspection state machine data
 } conntrack_map SEC(".maps");
 
@@ -74,7 +66,7 @@ struct
 {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 65535);         // placeholder, set by the loader ([xdp] max_player_connections)
-    __type(key, struct ipv4_flow_key);  // flow key
+    __type(key, struct flow_key);       // flow key
     __type(value, struct player_entry); // idle timer + packet counter
 } player_connection_map SEC(".maps");
 
@@ -82,7 +74,7 @@ struct
  * bpf_timer callback: delete the verified connection if it was idle for a
  * full interval, otherwise snapshot the counter and check again next interval
  */
-static __s32 player_connection_idle_check(void *map, struct ipv4_flow_key *key, struct player_entry *entry)
+static __s32 player_connection_idle_check(void *map, struct flow_key *key, struct player_entry *entry)
 {
     const __u64 packets = entry->packets;
     if (packets == entry->last_packets)
@@ -118,7 +110,7 @@ struct
     // timers fire and delete the expired windows.
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 65535);           // placeholder, set by the loader ([xdp] max_throttled_ips)
-    __type(key, __u32);                   // ipv4 source address
+    __type(key, struct addr6);            // source prefix (src_prefix)
     __type(value, struct throttle_entry); // window timer + hit counter
 } connection_throttle SEC(".maps");
 
@@ -141,7 +133,7 @@ struct
  * repeat senders cause no map/timer churn; entries that were idle for the
  * whole window are deleted.
  */
-static __s32 throttle_window_expired(void *map, __u32 *key, struct throttle_entry *entry)
+static __s32 throttle_window_expired(void *map, struct addr6 *key, struct throttle_entry *entry)
 {
     if (__sync_lock_test_and_set(&entry->hits, 0) == 0)
     {
@@ -215,9 +207,9 @@ struct
  * encryption, i.e. it runs in online mode (set by the loader, which watches
  * the server replies). Unknown means false: nobody is rejected then.
  */
-static __always_inline __u8 target_online(const __u32 daddr, const __u16 dport)
+static __always_inline __u8 target_online(const struct addr6 *daddr, const __u16 dport)
 {
-    const struct dst_key key = {.daddr = daddr, .dport = dport, .proto = IPPROTO_TCP, .pad = 0};
+    const struct dst_key key = {.daddr = *daddr, .dport = dport, .proto = IPPROTO_TCP, .pad = 0};
     const struct target_entry *target = bpf_map_lookup_elem(&protected_targets, &key);
     return target && bpf_ktime_get_ns() < target->online_until_ns;
 }
@@ -228,9 +220,9 @@ static __always_inline __u8 target_online(const __u32 daddr, const __u16 dport)
  * target became protected (or before the loader started) are unknown to our
  * maps, and without adoption they would all be cut off.
  */
-static __always_inline __u8 lookup_target(const __u32 daddr, const __u16 dport, const __u8 proto, __u8 *grace)
+static __always_inline __u8 lookup_target(const struct addr6 *daddr, const __u16 dport, const __u8 proto, __u8 *grace)
 {
-    const struct dst_key key = {.daddr = daddr, .dport = dport, .proto = proto, .pad = 0};
+    const struct dst_key key = {.daddr = *daddr, .dport = dport, .proto = proto, .pad = 0};
     const struct target_entry *target = bpf_map_lookup_elem(&protected_targets, &key);
     if (target)
     {
@@ -247,6 +239,26 @@ static __always_inline __u8 lookup_target(const __u32 daddr, const __u16 dport, 
     return KIND_NONE;
 }
 
+// destination addresses that have at least one protected target (any port);
+// written by the loader together with protected_targets
+struct
+{
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct addr6);
+    __type(value, __u8);
+} protected_addrs SEC(".maps");
+
+/*
+ * True when daddr is protected on any port: IPv6 packets whose header chain
+ * can not be parsed (no l4 header, no port) are dropped then. The static
+ * java port range applies to every address.
+ */
+static __always_inline __u8 dst_has_targets(const struct addr6 *daddr)
+{
+    return START_PORT || bpf_map_lookup_elem(&protected_addrs, daddr) != NULL;
+}
+
 #include "penalty.h"
 
 /*
@@ -254,7 +266,7 @@ static __always_inline __u8 lookup_target(const __u32 daddr, const __u16 dport, 
  * only if the global slot is missing, which can not happen (per-cpu array
  * index 0 always exists).
  */
-static __always_inline __u8 lookup_stats(const __u32 daddr, const __u16 dport, const __u8 proto,
+static __always_inline __u8 lookup_stats(const struct addr6 *daddr, const __u16 dport, const __u8 proto,
                                          struct statistics **stats_ptr, struct statistics **dst_stats_ptr)
 {
     if (!PROMETHEUS)
@@ -269,7 +281,7 @@ static __always_inline __u8 lookup_stats(const __u32 daddr, const __u16 dport, c
         return 0;
     }
 
-    const struct dst_key dst = {.daddr = daddr, .dport = dport, .proto = proto, .pad = 0};
+    const struct dst_key dst = {.daddr = *daddr, .dport = dport, .proto = proto, .pad = 0};
     *dst_stats_ptr = bpf_map_lookup_elem(&dst_stats_map, &dst);
     if (!*dst_stats_ptr)
     {
@@ -303,14 +315,15 @@ static __always_inline __u8 detect_tcp_bypass(const struct tcphdr *tcp)
  * bpf_timer that deletes the entry again. Returns 0 when the source has used
  * up its window or the throttle map is full (fail closed).
  */
-static __always_inline __u8 throttle_allows_in(void *throttle_map, const __u32 src_ip, const __u32 limit)
+static __always_inline __u8 throttle_allows_in(void *throttle_map, const struct addr6 *src, const __u32 limit)
 {
+    const struct addr6 key = src_prefix(src);
     if (!limit)
     {
         return 1;
     }
 
-    struct throttle_entry *entry = bpf_map_lookup_elem(throttle_map, &src_ip);
+    struct throttle_entry *entry = bpf_map_lookup_elem(throttle_map, &key);
     if (entry)
     {
         if (entry->hits >= limit)
@@ -336,7 +349,7 @@ static __always_inline __u8 throttle_allows_in(void *throttle_map, const __u32 s
         return 0;
     }
     const struct throttle_entry fresh = {.hits = 1, .pad = 0};
-    const long err = bpf_map_update_elem(throttle_map, &src_ip, &fresh, BPF_NOEXIST);
+    const long err = bpf_map_update_elem(throttle_map, &key, &fresh, BPF_NOEXIST);
     if (err < 0)
     {
         if (err != -EEXIST)
@@ -346,7 +359,7 @@ static __always_inline __u8 throttle_allows_in(void *throttle_map, const __u32 s
         }
         return 0;
     }
-    entry = bpf_map_lookup_elem(throttle_map, &src_ip);
+    entry = bpf_map_lookup_elem(throttle_map, &key);
     if (!entry)
     {
         return 0;
@@ -356,15 +369,15 @@ static __always_inline __u8 throttle_allows_in(void *throttle_map, const __u32 s
         bpf_timer_start(&entry->timer, HIT_COUNT_RESET_NS, 0) < 0)
     {
         // never leak an entry that has no expiry timer armed
-        bpf_map_delete_elem(throttle_map, &src_ip);
+        bpf_map_delete_elem(throttle_map, &key);
         return 0;
     }
     return 1;
 }
 
-static __always_inline __u8 throttle_allows(const __u32 src_ip)
+static __always_inline __u8 throttle_allows(const struct addr6 *src)
 {
-    return throttle_allows_in(&connection_throttle, src_ip, HIT_COUNT);
+    return throttle_allows_in(&connection_throttle, src, HIT_COUNT);
 }
 
 /*
@@ -374,7 +387,7 @@ static __always_inline __u8 throttle_allows(const __u32 src_ip)
  * timer that will eventually clean the entry up. `stat` is the counter that
  * records the promotion (VERIFIED or ADOPTED).
  */
-static __always_inline __u32 switch_to_verified_idle(const __u64 raw_packet_len, struct statistics *stats_ptr, struct statistics *dst_stats_ptr, const struct ipv4_flow_key *flow_key, const __u32 stat, const __u64 idle_ns)
+static __always_inline __u32 switch_to_verified_idle(const __u64 raw_packet_len, struct statistics *stats_ptr, struct statistics *dst_stats_ptr, const struct flow_key *flow_key, const __u32 stat, const __u64 idle_ns)
 {
     bpf_map_delete_elem(&conntrack_map, flow_key);
     const struct player_entry fresh = {.packets = 1, .last_packets = 0, .idle_ns = idle_ns};
@@ -403,7 +416,7 @@ drop:
     return XDP_DROP;
 }
 
-static __always_inline __u32 switch_to_verified(const __u64 raw_packet_len, struct statistics *stats_ptr, struct statistics *dst_stats_ptr, const struct ipv4_flow_key *flow_key, const __u32 stat)
+static __always_inline __u32 switch_to_verified(const __u64 raw_packet_len, struct statistics *stats_ptr, struct statistics *dst_stats_ptr, const struct flow_key *flow_key, const __u32 stat)
 {
     return switch_to_verified_idle(raw_packet_len, stats_ptr, dst_stats_ptr, flow_key, stat, PLAYER_IDLE_NS);
 }
@@ -419,8 +432,8 @@ static __always_inline __u32 switch_to_verified(const __u64 raw_packet_len, stru
 #define RAKNET_OPEN_CONNECTION_REQUEST_2 0x07
 
 // minimum payload sizes: id + time + magic + guid for pings, id + magic +
-// protocol (+ mtu padding) for request 1, id + magic + ipv4 address + mtu +
-// guid for request 2
+// protocol (+ mtu padding) for request 1, id + magic + address (ipv4 7 bytes,
+// ipv6 29 bytes) + mtu + guid for request 2 (the ipv4 form is the shorter one)
 #define RAKNET_PING_LEN 33
 #define RAKNET_REQUEST_1_MIN_LEN 18
 #define RAKNET_REQUEST_2_MIN_LEN 34
@@ -466,40 +479,40 @@ static __always_inline __u8 is_amplification_port(const __u16 port)
  * unverified flow is dropped. Stateless parts of the RakNet stream are
  * deliberately not inspected: they differ between RakNet implementations.
  */
-static __always_inline __s32 handle_udp(const void *data, const void *data_end, const struct iphdr *ip)
+static __always_inline __s32 handle_udp(const void *data, const void *data_end, const void *ip, const struct l3 *l)
 {
     const __u64 raw_packet_len = (__u64)(data_end - data);
 
     // non-first fragments carry no udp header: only the reflection check
     // (fragmented amplified answers) applies, see also the tcp path
-    if (ip->frag_off & bpf_htons(IP_OFFSET))
+    if (l->frag == FRAG_LATER)
     {
-        const __s32 verdict = reflection_check(ip, NULL, raw_packet_len);
+        const __s32 verdict = reflection_check(l, NULL, raw_packet_len);
         return verdict < 0 ? XDP_PASS : verdict;
     }
 
-    const struct udphdr *udp = (const void *)ip + (ip->ihl * 4);
+    const struct udphdr *udp = l4_ptr(ip, l);
     if ((const void *)(udp + 1) > data_end)
     {
         return XDP_DROP;
     }
 
     // unsolicited answers of abused udp services, for whole networks
-    const __s32 verdict = reflection_check(ip, udp, raw_packet_len);
+    const __s32 verdict = reflection_check(l, udp, raw_packet_len);
     if (verdict >= 0)
     {
         return verdict;
     }
 
     __u8 grace = 0;
-    if (lookup_target(ip->daddr, udp->dest, IPPROTO_UDP, &grace) != KIND_BEDROCK)
+    if (lookup_target(&l->dst, udp->dest, IPPROTO_UDP, &grace) != KIND_BEDROCK)
     {
         return XDP_PASS;
     }
 
     struct statistics *stats_ptr = NULL;
     struct statistics *dst_stats_ptr = NULL;
-    if (!lookup_stats(ip->daddr, udp->dest, IPPROTO_UDP, &stats_ptr, &dst_stats_ptr))
+    if (!lookup_stats(&l->dst, udp->dest, IPPROTO_UDP, &stats_ptr, &dst_stats_ptr))
     {
         return XDP_DROP;
     }
@@ -507,12 +520,12 @@ static __always_inline __s32 handle_udp(const void *data, const void *data_end, 
     count_stats(stats_ptr, dst_stats_ptr, INCOMING_BYTES, raw_packet_len);
 
     // RakNet datagrams always fit the MTU, a fragmented one is forged
-    if (ip->frag_off & bpf_htons(IP_MF))
+    if (l->frag != FRAG_NONE)
     {
         goto drop;
     }
 
-    const struct ipv4_flow_key flow_key = gen_ipv4_flow_key(ip->saddr, ip->daddr, udp->source, udp->dest);
+    const struct flow_key flow_key = gen_flow_key(&l->src, &l->dst, udp->source, udp->dest);
 
     // verified connections skip all further inspection
     struct player_entry *player = bpf_map_lookup_elem(&player_connection_map, &flow_key);
@@ -546,21 +559,21 @@ static __always_inline __s32 handle_udp(const void *data, const void *data_end, 
     case RAKNET_UNCONNECTED_PING_OPEN:
         if (payload_len < RAKNET_PING_LEN || !raknet_magic_at(payload + 9, data_end))
         {
-            add_strike(ip->saddr);
+            add_strike(&l->src);
             goto drop;
         }
         break;
     case RAKNET_OPEN_CONNECTION_REQUEST_1:
         if (payload_len < RAKNET_REQUEST_1_MIN_LEN || !raknet_magic_at(payload + 1, data_end))
         {
-            add_strike(ip->saddr);
+            add_strike(&l->src);
             goto drop;
         }
         break;
     case RAKNET_OPEN_CONNECTION_REQUEST_2:
         if (payload_len < RAKNET_REQUEST_2_MIN_LEN || !raknet_magic_at(payload + 1, data_end))
         {
-            add_strike(ip->saddr);
+            add_strike(&l->src);
             goto drop;
         }
         return switch_to_verified(raw_packet_len, stats_ptr, dst_stats_ptr, &flow_key, VERIFIED);
@@ -576,7 +589,7 @@ static __always_inline __s32 handle_udp(const void *data, const void *data_end, 
 
     // pings and request 1: new handshakes, throttled like java SYNs
     count_stats(stats_ptr, dst_stats_ptr, SYN_RECEIVE, 1);
-    if (!throttle_allows(ip->saddr))
+    if (!throttle_allows(&l->src))
     {
         goto drop;
     }
@@ -599,42 +612,59 @@ __s32 minecraft_filter(struct xdp_md *ctx)
     const void *data = (const void *)(long)ctx->data;
     const void *data_end = (const void *)(long)ctx->data_end;
 
-    const struct iphdr *ip = ipv4_header(data, data_end, ctx->ingress_ifindex);
-    if (!ip)
+    struct l3 l;
+    const void *ip = data;
+    const int parsed = packet_l3(data, data_end, ctx->ingress_ifindex, &l, &ip);
+    if (parsed == L3_NOT_IP)
     {
         return XDP_PASS;
     }
-    if (ip->ihl < 5)
+    if (parsed == L3_BAD)
     {
-        return XDP_DROP;
+        // malformed IPv4 header: dropped (before, ihl < 5 was dropped and a
+        // header shorter than 20 bytes passed; both are garbage). Malformed or
+        // overlong IPv6 extension header chains can not be matched against
+        // targets without their l4 header; they only pass when the
+        // destination address protects nothing at all
+        if (l.family != FAMILY_V6)
+        {
+            return XDP_DROP;
+        }
+        return dst_has_targets(&l.dst) ? XDP_DROP : XDP_PASS;
+    }
+
+    // neighbour discovery is never dropped, by no feature
+    if (is_ndp(ip, data_end, &l))
+    {
+        return XDP_PASS;
     }
 
     // blocked and banned sources go first, whatever they send
-    if (blocked_source(ip, (__u64)(data_end - data)))
+    if (blocked_source(&l, (__u64)(data_end - data)))
     {
         return XDP_DROP;
     }
 
     // DNS queries to protected addresses without a DNS server (resolver scans)
-    if (dns_scan_check(ip, data_end))
+    if (dns_scan_check(ip, &l, data_end))
     {
         return XDP_DROP;
     }
 
     // addresses without a route would be dropped by the stack anyway; hitting
     // them is what scanners do, so it counts as a violation
-    if (unused_destination(ctx, ip))
+    if (unused_destination(ctx, &l))
     {
-        add_strike(ip->saddr);
+        add_strike(&l.src);
         return XDP_DROP;
     }
 
-    if (ip->protocol == IPPROTO_UDP)
+    if (l.proto == IPPROTO_UDP)
     {
-        return handle_udp(data, data_end, ip);
+        return handle_udp(data, data_end, ip, &l);
     }
 
-    if (ip->protocol != IPPROTO_TCP)
+    if (l.proto != IPPROTO_TCP)
     {
         return XDP_PASS;
     }
@@ -648,12 +678,12 @@ __s32 minecraft_filter(struct xdp_md *ctx)
     // overlap either: they live in bytes 0-3 of the tcp header while the
     // smallest non-first offset is 8 bytes, and linux >= 4.19 drops
     // overlapping fragments outright
-    if (ip->frag_off & bpf_htons(IP_OFFSET))
+    if (l.frag == FRAG_LATER)
     {
         return XDP_PASS;
     }
 
-    const struct tcphdr *tcp = (const void *)ip + (ip->ihl * 4);
+    const struct tcphdr *tcp = l4_ptr(ip, &l);
     if ((const void *)(tcp + 1) > data_end)
     {
         return XDP_DROP;
@@ -661,7 +691,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
 
     // everything that is not a protected java target is not our business
     __u8 grace = 0;
-    const __u8 kind = lookup_target(ip->daddr, tcp->dest, IPPROTO_TCP, &grace);
+    const __u8 kind = lookup_target(&l.dst, tcp->dest, IPPROTO_TCP, &grace);
     if (kind != KIND_JAVA)
     {
         return XDP_PASS;
@@ -673,7 +703,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
     // data. Legitimate tcp does not fragment, the MSS keeps segments below
     // the MTU. Dropping the first fragment makes reassembly impossible, the
     // kernel discards the passed non-first fragments after the frag timeout
-    if (ip->frag_off & bpf_htons(IP_MF))
+    if (l.frag == FRAG_FIRST)
     {
         return XDP_DROP;
     }
@@ -691,7 +721,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
 
     struct statistics *stats_ptr = NULL;
     struct statistics *dst_stats_ptr = NULL;
-    if (!lookup_stats(ip->daddr, tcp->dest, IPPROTO_TCP, &stats_ptr, &dst_stats_ptr))
+    if (!lookup_stats(&l.dst, tcp->dest, IPPROTO_TCP, &stats_ptr, &dst_stats_ptr))
     {
         return XDP_DROP;
     }
@@ -702,12 +732,11 @@ __s32 minecraft_filter(struct xdp_md *ctx)
     if (detect_tcp_bypass(tcp))
     {
         count_stats(stats_ptr, dst_stats_ptr, TCP_BYPASS, 1);
-        add_strike(ip->saddr);
+        add_strike(&l.src);
         goto drop;
     }
 
-    const __u32 src_ip = ip->saddr;
-    const struct ipv4_flow_key flow_key = gen_ipv4_flow_key(src_ip, ip->daddr, tcp->source, tcp->dest);
+    const struct flow_key flow_key = gen_flow_key(&l.src, &l.dst, tcp->source, tcp->dest);
 
     // new connection: throttle it, then start tracking it
     if (tcp->syn)
@@ -715,25 +744,26 @@ __s32 minecraft_filter(struct xdp_md *ctx)
         count_stats(stats_ptr, dst_stats_ptr, SYN_RECEIVE, 1);
 
         // drop SYNs carrying payload (e.g. TCP fast open): the data would
-        // reach the backend without ever passing the inspection state machine
-        if (bpf_ntohs(ip->tot_len) > (ip->ihl * 4) + tcp_hdr_len)
+        // reach the backend without ever passing the inspection state machine.
+        // A length field shorter than the headers is forged, drop that too
+        if (l.l3len != l.hdrlen + tcp_hdr_len)
         {
             count_stats(stats_ptr, dst_stats_ptr, TCP_BYPASS, 1);
-            add_strike(ip->saddr);
+            add_strike(&l.src);
             goto drop;
         }
 
         // a client in the penalty box is redirected to the penalty service
-        if (penalized(src_ip))
+        if (penalized(&l.src))
         {
             return XDP_PASS;
         }
 
-        if (!throttle_allows(src_ip))
+        if (!throttle_allows(&l.src))
         {
             // a known real client gets the penalty box (a "please wait"
             // message) instead of a silent drop; spoofed floods are dropped
-            if (try_penalize(src_ip))
+            if (try_penalize(&l.src))
             {
                 return XDP_PASS;
             }
@@ -768,7 +798,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
     if (!initial_state)
     {
         // a connection to the penalty service
-        if (penalized(src_ip))
+        if (penalized(&l.src))
         {
             return XDP_PASS;
         }
@@ -790,9 +820,13 @@ __s32 minecraft_filter(struct xdp_md *ctx)
 
     const __u8 *tcp_payload = (const __u8 *)tcp + tcp_hdr_len;
 
-    // ip total length - ip header - tcp header = length of the tcp payload
-    const __u16 ip_tot_len = bpf_ntohs(ip->tot_len);
-    const __u16 tcp_payload_len = ip_tot_len - (ip->ihl * 4) - tcp_hdr_len;
+    // ip total length - ip headers - tcp header = length of the tcp payload;
+    // a length field shorter than the headers is forged
+    if (l.l3len < l.hdrlen + tcp_hdr_len)
+    {
+        goto drop;
+    }
+    const __u16 tcp_payload_len = l.l3len - l.hdrlen - tcp_hdr_len;
     const __u8 *tcp_payload_end = tcp_payload + tcp_payload_len;
 
     // tcp packet split over multiple ethernet frames, we don't support that
@@ -891,7 +925,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
                 goto drop;
             }
             initial_state->state = PING_COMPLETE;
-            note_verified_source(src_ip);
+            note_verified_source(&l.src);
             goto update_state;
         }
         if (state == AWAIT_LOGIN)
@@ -905,12 +939,12 @@ __s32 minecraft_filter(struct xdp_md *ctx)
             // an offline-mode uuid (cracked launcher, most bots) can never
             // pass the authentication of an online mode server: reject it
             // here instead of letting the server do the expensive part
-            if (uuid_version == 3 && target_online(ip->daddr, tcp->dest))
+            if (uuid_version == 3 && target_online(&l.dst, tcp->dest))
             {
                 count_stats(stats_ptr, dst_stats_ptr, OFFLINE_REJECTED, 1);
                 goto drop_connection;
             }
-            note_verified_source(src_ip);
+            note_verified_source(&l.src);
             // tracking ends here, no need to update the expected sequence
             return switch_to_verified(raw_packet_len, stats_ptr, dst_stats_ptr, &flow_key, VERIFIED);
         }
@@ -934,7 +968,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
 // the generated program drastically smaller
 drop_connection:
     count_stats(stats_ptr, dst_stats_ptr, DROP_CONNECTION, 1);
-    add_strike(ip->saddr);
+    add_strike(&l.src);
     bpf_map_delete_elem(&conntrack_map, &flow_key);
     // fall through
 drop:

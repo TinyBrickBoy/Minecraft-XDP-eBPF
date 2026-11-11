@@ -10,7 +10,7 @@
 
 #include <linux/types.h>
 #include <linux/if_ether.h>
-#include <linux/ip.h>
+#include "l3parse.h"
 
 struct
 {
@@ -20,29 +20,58 @@ struct
     __type(value, __u8); // 1
 } l3_interfaces SEC(".maps");
 
-// the IPv4 header of a packet on `ifindex`, or NULL for anything else
-static __always_inline const struct iphdr *ipv4_header(const void *data, const void *data_end, __u32 ifindex)
+/*
+ * Parses the IP header of a packet on `ifindex` into *out. Returns the
+ * L3_* result; *ip_out points at the IP header on L3_OK and L3_BAD.
+ */
+static __always_inline int packet_l3(const void *data, const void *data_end, __u32 ifindex,
+                                     struct l3 *out, const void **ip_out)
 {
-    if (L3_INTERFACES && bpf_map_lookup_elem(&l3_interfaces, &ifindex))
+    const void *ip = data;
+    if (!(L3_INTERFACES && bpf_map_lookup_elem(&l3_interfaces, &ifindex)))
     {
-        const struct iphdr *ip = data;
-        if ((const void *)(ip + 1) > data_end || ip->version != 4)
+        const struct ethhdr *eth = data;
+        if ((const void *)(eth + 1) > data_end)
         {
-            return NULL;
+            return L3_NOT_IP;
         }
-        return ip;
+        if (eth->h_proto != bpf_htons(ETH_P_IP) && eth->h_proto != bpf_htons(ETH_P_IPV6))
+        {
+            return L3_NOT_IP;
+        }
+        ip = eth + 1;
     }
-    const struct ethhdr *eth = data;
-    if ((const void *)(eth + 1) > data_end || eth->h_proto != bpf_htons(ETH_P_IP))
+    *ip_out = ip;
+    return parse_l3(ip, data_end, out);
+}
+
+// the source as counted by throttle, rate limit, strikes, bans and penalty:
+// IPv4 per address, IPv6 per IPV6_SOURCE_PREFIX
+static __always_inline struct addr6 src_prefix(const struct addr6 *src)
+{
+    if (addr_is_v4(src))
     {
-        return NULL;
+        return *src;
     }
-    const struct iphdr *ip = (const void *)(eth + 1);
-    if ((const void *)(ip + 1) > data_end)
+    return addr_mask(*src, IPV6_SOURCE_PREFIX);
+}
+
+// ICMPv6 router solicitation/advertisement, neighbour solicitation/
+// advertisement and redirect: never dropped, or the host loses its neighbours.
+// NDP is never fragmented (RFC 6980), and a fragment has no icmp header to
+// read the type from
+static __always_inline __u8 is_ndp(const void *ip, const void *data_end, const struct l3 *l)
+{
+    if (l->family != FAMILY_V6 || l->proto != 58 || l->frag != FRAG_NONE)
     {
-        return NULL;
+        return 0;
     }
-    return ip;
+    const __u8 *icmp = l4_ptr(ip, l);
+    if ((const void *)(icmp + 1) > data_end)
+    {
+        return 0;
+    }
+    return icmp[0] >= 133 && icmp[0] <= 137;
 }
 
 #endif
