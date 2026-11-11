@@ -197,7 +197,7 @@ Then just run the executable in sudo mode or via root
     `addr = "127.0.0.1:1999"` the metrics are available at:
     `http://127.0.0.1:1999/metrics`
 
-**Note:** This project uses a persistent XDP loader. The userspace program must stay running to keep the filter attached; all map state (throttle windows, verified connections) is managed in-kernel via `bpf_timer`. Stopping the loader will unload the firewall. Requires Linux kernel 5.15 or newer.
+**Note:** This project uses a persistent XDP loader. The userspace program must stay running to keep the filter attached; all map state (throttle windows, verified connections) is managed in-kernel via `bpf_timer`. Stopping the loader will unload the firewall. Needs a recent Linux kernel; 5.15 is not verified for this version (see below).
 
 **Kernel 5.15:** not verified for this version. A test boot of Ubuntu's
 5.15.0-97 kernel (qemu) rejects the XDP program as built with clang 19
@@ -225,7 +225,7 @@ restart the loader. Use `--config <path>` to point at a different file.
 | `ipv6_source_prefix` | int | 64 | Prefix length per IPv6 source for throttling, rate limits and bans (32–128). IPv4 is always per address. |
 | `ipv6_aggregate_prefix` | int | 48 | Second, coarser IPv6 tier of the connection throttle and the verified connection cap (16–128; a value not shorter than `ipv6_source_prefix` turns the tier off, with a warning when longer). |
 | `ipv6_aggregate_factor` | int | 8 | SYN budget of the aggregate tier as a multiple of `hit_count` (1–1024). |
-| `max_verified_per_ipv4` | int | 64 | Verified (java and bedrock) connections per IPv4 address; further handshakes of the address are dropped until one goes idle (`0` = no cap, max 1048576). |
+| `max_verified_per_ipv4` | int | 64 | Verified (java and bedrock) connections per IPv4 address; further handshakes of the address are dropped until one goes idle (`0` = no cap, max 1048576). Whitelisted (`[blocklist]`) and allowlisted (`[ratelimit] allow`, exact address) sources are never capped. |
 | `max_verified_per_ipv6_prefix` | int | 64 | The same per IPv6 `ipv6_source_prefix`. |
 | `max_verified_per_ipv6_aggregate` | int | 512 | The same per IPv6 `ipv6_aggregate_prefix` (only while the aggregate tier is on). |
 

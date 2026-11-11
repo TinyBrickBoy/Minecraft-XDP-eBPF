@@ -147,9 +147,15 @@ static __always_inline __u32 verified_cap(const struct addr6 *src)
     return addr_is_v4(src) ? VERIFIED_PER_IPV4 : VERIFIED_PER_IPV6_PREFIX;
 }
 
-// both tiers of src, or nothing (0) when one of them is full
+// both tiers of src, or nothing (0) when one of them is full. Whitelisted
+// and allowlisted (exact address) sources are not capped and not counted:
+// proxies and CDNs bring many players from one address
 static __always_inline __u8 verified_take_source(const struct addr6 *src)
 {
+    if (whitelisted(src) || lpm_contains(&ratelimit_allow, src))
+    {
+        return 1;
+    }
     const struct addr6 pfx = src_prefix(src);
     if (!verified_take(&verified_per_source, &pfx, verified_cap(src)))
     {
@@ -164,6 +170,10 @@ static __always_inline __u8 verified_take_source(const struct addr6 *src)
     return 1;
 }
 
+// releases without looking at the lists: a source allowlisted after it was
+// counted must still give its slots back (a count may only drift down,
+// never lock a source out); one taken off the lists afterwards releases
+// slots it never took, which only makes its cap more lenient
 static __always_inline void verified_release_source(const struct addr6 *src)
 {
     const struct addr6 pfx = src_prefix(src);
