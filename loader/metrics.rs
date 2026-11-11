@@ -349,8 +349,8 @@ fn publish_block(h: &blocklist::Handles) {
     active.set(bans.len() as i64);
     bans.sort_by(|a, b| b.1.dropped.cmp(&a.1.dropped));
     per_ip.reset();
-    for (ip, ban) in bans.iter().take(200) {
-        per_ip.with_label_values(&[&ip.to_string()]).set(ban.dropped as i64);
+    for (net, ban) in bans.iter().take(200) {
+        per_ip.with_label_values(&[&net.to_string()]).set(ban.dropped as i64);
     }
 }
 

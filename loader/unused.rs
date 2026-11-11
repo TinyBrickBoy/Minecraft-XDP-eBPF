@@ -31,7 +31,7 @@ impl UnusedNetwork {
 
 /// The array slots for a network list, dense: the kernel stops at the first
 /// empty slot.
-pub fn network_slots(_section: &str, networks: &[String]) -> Result<Vec<UnusedNetwork>> {
+pub fn network_slots(networks: &[String]) -> Result<Vec<UnusedNetwork>> {
     networks.iter().map(|network| Ok(UnusedNetwork::new(&parse_cidr(network)?))).collect()
 }
 
@@ -58,7 +58,7 @@ pub fn setup(ebpf: &mut Ebpf, config: &Config) -> Result<Option<StatsMap>> {
         ebpf.take_map("unused_networks")
             .context("can't take map 'unused_networks'")?,
     )?;
-    for (index, slot) in network_slots("[unused]", &config.unused.networks)?.iter().enumerate() {
+    for (index, slot) in network_slots(&config.unused.networks)?.iter().enumerate() {
         networks.set(index as u32, *slot, 0)?;
     }
     info!(
@@ -91,7 +91,7 @@ mod tests {
     #[test]
     fn mixed_networks_fill_dense_slots() {
         let nets = ["2001:db8::/48".to_string(), "10.0.0.0/24".to_string()];
-        let slots = network_slots("[test]", &nets).unwrap();
+        let slots = network_slots(&nets).unwrap();
         assert_eq!(slots.len(), 2);
         assert!(slots.iter().all(|s| s.valid == 1));
         assert_eq!(slots[0].addr.to_string(), "2001:db8::");
