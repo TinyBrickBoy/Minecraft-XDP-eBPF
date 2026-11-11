@@ -8,6 +8,13 @@
  * past data_end trips the address sanitizer instead of going unnoticed.
  */
 #include <linux/types.h>
+#include <arpa/inet.h>
+#ifndef bpf_htons
+#define bpf_htons(x) htons(x)
+#define bpf_ntohs(x) ntohs(x)
+#define bpf_htonl(x) htonl(x)
+#define bpf_ntohl(x) ntohl(x)
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +35,8 @@ static volatile __u8 ONLINE_NAMES = 1;
 #include "../common.h"
 #include "../varint.h"
 #include "../protocol.h"
+#include "../l3parse.h"
+#include "../raknet.h"
 
 /* ------------------------------------------------------------------------
  * Tiny test framework
@@ -716,6 +725,400 @@ static void test_login_rejects_length_mismatch(void)
 
 /* --------------------------------------------------------------------- */
 
+/* ------------------------------------------------------------------------
+ * L3 parser and address helpers
+ * --------------------------------------------------------------------- */
+
+static int run_parse(const __u8 *pkt, size_t len, struct l3 *out)
+{
+    __u8 *copy = malloc(len ? len : 1);
+    memcpy(copy, pkt, len);
+    const int ret = parse_l3(copy, copy + len, out);
+    free(copy);
+    return ret;
+}
+
+static size_t build_v4(__u8 *p, __u8 proto, __u16 frag_off, size_t payload)
+{
+    memset(p, 0, 20 + payload);
+    p[0] = 0x45;
+    const __u16 tot = htons(20 + payload);
+    memcpy(p + 2, &tot, 2);
+    const __u16 fo = htons(frag_off);
+    memcpy(p + 6, &fo, 2);
+    p[9] = proto;
+    p[12] = 1; p[13] = 2; p[14] = 3; p[15] = 4;
+    p[16] = 5; p[17] = 6; p[18] = 7; p[19] = 8;
+    return 20 + payload;
+}
+
+static size_t build_v6(__u8 *p, __u8 next, size_t payload)
+{
+    memset(p, 0, 40 + payload);
+    p[0] = 0x60;
+    const __u16 plen = htons(payload);
+    memcpy(p + 4, &plen, 2);
+    p[6] = next;
+    p[7] = 64;
+    p[8] = 0x20; p[9] = 0x01; p[10] = 0x0d; p[11] = 0xb8; p[23] = 0x01;  // src 2001:db8::1
+    p[24] = 0x20; p[25] = 0x01; p[26] = 0x0d; p[27] = 0xb8; p[39] = 0x02; // dst 2001:db8::2
+    return 40 + payload;
+}
+
+static void test_addr_helpers(void)
+{
+    const struct addr6 v4 = addr_from_v4(htonl(0x01020304));
+    CHECK(addr_is_v4(&v4));
+    CHECK(addr_v4(&v4) == htonl(0x01020304));
+    CHECK(v4.w[0] == 0 && v4.w[1] == 0 && v4.w[2] == htonl(0xffff));
+
+    struct addr6 v6 = {{htonl(0x20010db8), htonl(0x00010002), htonl(0xaaaabbbb), htonl(0xccccdddd)}};
+    CHECK(!addr_is_v4(&v6));
+    const struct addr6 m64 = addr_mask(v6, 64);
+    CHECK(m64.w[0] == htonl(0x20010db8) && m64.w[1] == htonl(0x00010002) && m64.w[2] == 0 && m64.w[3] == 0);
+    const struct addr6 m56 = addr_mask(v6, 56);
+    CHECK(m56.w[1] == htonl(0x00010000) && m56.w[2] == 0);
+    const struct addr6 m128 = addr_mask(v6, 128);
+    CHECK(addr_eq(&m128, &v6));
+    const struct addr6 m0 = addr_mask(v6, 0);
+    CHECK(m0.w[0] == 0 && m0.w[3] == 0);
+
+    const struct flow_key k = gen_flow_key(&v4, &v6, htons(1), htons(2));
+    CHECK(sizeof(k) == 36);
+    CHECK(addr_eq(&k.src, &v4) && addr_eq(&k.dst, &v6) && k.src_port == htons(1) && k.dst_port == htons(2));
+}
+
+static void test_parse_v4(void)
+{
+    __u8 p[128];
+    struct l3 l;
+    size_t n = build_v4(p, 6, 0, 20);
+    CHECK(run_parse(p, n, &l) == L3_OK);
+    CHECK(l.family == FAMILY_V4 && l.proto == 6 && l.l4off == 20 && l.l3len == 40 && l.hdrlen == 20);
+    CHECK(l.frag == FRAG_NONE);
+    CHECK(addr_is_v4(&l.src) && addr_v4(&l.src) == htonl(0x01020304));
+
+    n = build_v4(p, 17, 0x2000, 8); // MF, offset 0
+    CHECK(run_parse(p, n, &l) == L3_OK && l.frag == FRAG_FIRST);
+    n = build_v4(p, 17, 0x0001, 8); // offset 8 bytes
+    CHECK(run_parse(p, n, &l) == L3_OK && l.frag == FRAG_LATER);
+
+    n = build_v4(p, 6, 0, 0);
+    p[0] = 0x44; // ihl 4 < 5
+    CHECK(run_parse(p, n, &l) == L3_BAD);
+    CHECK(run_parse(p, 19, &l) == L3_BAD); // truncated header
+    p[0] = 0x00;
+    CHECK(run_parse(p, n, &l) == L3_NOT_IP);
+    CHECK(run_parse(p, 0, &l) == L3_NOT_IP); // zero-length input
+
+    n = build_v4(p, 6, 0, 0);
+    p[0] = 0x4f; // ihl 60 > packet
+    CHECK(run_parse(p, n, &l) == L3_BAD);
+
+    n = build_v4(p, 6, 0, 8);
+    p[0] = 0x46; // ihl 6: 24-byte header with options
+    CHECK(run_parse(p, n, &l) == L3_OK && l.proto == 6 && l.l4off == 24 && l.hdrlen == 24);
+}
+
+static void test_parse_v6(void)
+{
+    __u8 p[256];
+    struct l3 l;
+    size_t n = build_v6(p, 6, 20);
+    CHECK(run_parse(p, n, &l) == L3_OK);
+    CHECK(l.family == FAMILY_V6 && l.proto == 6 && l.l4off == 40 && l.l3len == 60 && l.hdrlen == 40);
+    CHECK(!addr_is_v4(&l.src) && l.src.w[0] == htonl(0x20010db8) && l.dst.w[3] == htonl(2));
+    CHECK(l.frag == FRAG_NONE);
+
+    // hop-by-hop (8 bytes) then destination options (16 bytes) then udp
+    n = build_v6(p, 0, 8 + 16 + 8);
+    p[40] = 60; p[41] = 0;
+    p[48] = 17; p[49] = 1;
+    CHECK(run_parse(p, n, &l) == L3_OK && l.proto == 17 && l.l4off == 64 && l.hdrlen == 64);
+
+    // fragment header, offset 0 with M flag -> first fragment
+    n = build_v6(p, 44, 8 + 8);
+    p[40] = 17; p[42] = 0x00; p[43] = 0x01;
+    CHECK(run_parse(p, n, &l) == L3_OK && l.frag == FRAG_FIRST && l.proto == 17 && l.l4off == 48);
+    // offset 8 bytes -> later fragment
+    p[42] = 0x00; p[43] = 0x08;
+    CHECK(run_parse(p, n, &l) == L3_OK && l.frag == FRAG_LATER);
+    // atomic fragment (offset 0, no M) is still a fragment header -> first
+    p[43] = 0x00;
+    CHECK(run_parse(p, n, &l) == L3_OK && l.frag == FRAG_FIRST);
+
+    // sticky: later fragment followed by an offset-0 fragment header stays later
+    n = build_v6(p, 44, 8 + 8 + 8);
+    p[40] = 44; p[42] = 0x00; p[43] = 0x08;
+    p[48] = 17; p[50] = 0x00; p[51] = 0x00;
+    CHECK(run_parse(p, n, &l) == L3_OK && l.frag == FRAG_LATER && l.l4off == 56);
+
+    // exactly MAX_EXT_HDRS headers: hop-by-hop + 3 destination options, then udp
+    n = build_v6(p, 0, 32 + 8);
+    p[40] = 60; p[48] = 60; p[56] = 60; p[64] = 17;
+    CHECK(run_parse(p, n, &l) == L3_OK && l.proto == 17 && l.l4off == 40 + 32);
+
+    // destination options declaring 16 bytes but cut after 8
+    n = build_v6(p, 60, 8);
+    p[40] = 17; p[41] = 1;
+    CHECK(run_parse(p, n, &l) == L3_BAD);
+    CHECK(l.family == FAMILY_V6);
+
+    // five hop-by-hop headers: over the limit
+    n = build_v6(p, 0, 5 * 8 + 8);
+    for (int i = 0; i < 5; i++)
+    {
+        p[40 + i * 8] = i == 4 ? 17 : 0;
+    }
+    CHECK(run_parse(p, n, &l) == L3_BAD);
+
+    // truncated extension header: family and addresses are still known
+    n = build_v6(p, 0, 4);
+    CHECK(run_parse(p, n, &l) == L3_BAD);
+    CHECK(l.family == FAMILY_V6 && l.dst.w[3] == htonl(2));
+    // truncated fixed header: family known, addresses zero
+    CHECK(run_parse(p, 39, &l) == L3_BAD);
+    CHECK(l.family == FAMILY_V6 && l.dst.w[0] == 0 && l.dst.w[3] == 0);
+
+    // icmpv6 passes the parser with proto 58
+    n = build_v6(p, 58, 8);
+    p[40] = 135;
+    CHECK(run_parse(p, n, &l) == L3_OK && l.proto == 58);
+}
+
+static void set_v6_addr(__u8 *p, size_t off, const char *text)
+{
+    inet_pton(AF_INET6, text, p + off);
+}
+
+static void test_parse_v6_bogus_addresses(void)
+{
+    __u8 p[128];
+    struct l3 l;
+    const char *bad_src[] = {"::1", "::ffff:8.8.4.4", "::1:2:3", "::0.0.0.7", "ff02::1", "ff0e::5"};
+    for (size_t i = 0; i < sizeof(bad_src) / sizeof(bad_src[0]); i++)
+    {
+        size_t n = build_v6(p, 6, 20);
+        set_v6_addr(p, 8, bad_src[i]);
+        CHECK(run_parse(p, n, &l) == L3_BAD);
+        CHECK(l.bogus == BOGUS_ADDR);
+        // still fully parsed: the l4 header and hop limit are known
+        CHECK(l.proto == 6 && l.l4off == 40 && l.hoplimit == 64);
+    }
+
+    size_t n = build_v6(p, 58, 24);
+    set_v6_addr(p, 8, "::");
+    set_v6_addr(p, 24, "ff02::1:ff00:1");
+    CHECK(run_parse(p, n, &l) == L3_BAD);
+    CHECK(l.bogus == BOGUS_UNSPEC && l.proto == 58 && l.l4off == 40);
+
+    const char *bad_dst[] = {"::ffff:10.0.0.10", "::1", "::"};
+    for (size_t i = 0; i < sizeof(bad_dst) / sizeof(bad_dst[0]); i++)
+    {
+        n = build_v6(p, 17, 8);
+        set_v6_addr(p, 24, bad_dst[i]);
+        CHECK(run_parse(p, n, &l) == L3_BAD && l.bogus == BOGUS_ADDR);
+    }
+    // a destination of :: also from an unspecified source is just bogus
+    n = build_v6(p, 17, 8);
+    set_v6_addr(p, 8, "::");
+    set_v6_addr(p, 24, "::ffff:1.2.3.4");
+    CHECK(run_parse(p, n, &l) == L3_BAD && l.bogus == BOGUS_ADDR);
+
+    // just outside ::/80, link-local, unique local and global sources are fine
+    const char *good[] = {"0:0:0:0:1::", "fe80::1", "fd99::2", "2001:db8::1", "fe00::1"};
+    for (size_t i = 0; i < sizeof(good) / sizeof(good[0]); i++)
+    {
+        n = build_v6(p, 6, 20);
+        set_v6_addr(p, 8, good[i]);
+        CHECK(run_parse(p, n, &l) == L3_OK && l.bogus == BOGUS_NONE);
+    }
+    // multicast destinations are fine (neighbour discovery)
+    n = build_v6(p, 58, 24);
+    set_v6_addr(p, 24, "ff02::1");
+    CHECK(run_parse(p, n, &l) == L3_OK && l.bogus == BOGUS_NONE);
+
+    // the mark does not depend on the chain: five extension headers (over
+    // the limit) or a truncated chain from a v4-mapped or loopback source
+    // are still bogus, not just unparseable
+    const char *chain_src[] = {"::ffff:9.9.9.9", "::1"};
+    for (size_t i = 0; i < 2; i++)
+    {
+        n = build_v6(p, 60, 5 * 8 + 8);
+        for (int h = 0; h < 5; h++)
+        {
+            p[40 + h * 8] = h == 4 ? 17 : 60;
+        }
+        set_v6_addr(p, 8, chain_src[i]);
+        CHECK(run_parse(p, n, &l) == L3_BAD && l.bogus == BOGUS_ADDR);
+        n = build_v6(p, 60, 4); // truncated destination options
+        set_v6_addr(p, 8, chain_src[i]);
+        CHECK(run_parse(p, n, &l) == L3_BAD && l.bogus == BOGUS_ADDR);
+    }
+    // an unspecified source with an unparseable chain: bogus, and never NDP
+    n = build_v6(p, 60, 4);
+    set_v6_addr(p, 8, "::");
+    CHECK(run_parse(p, n, &l) == L3_BAD && l.bogus == BOGUS_UNSPEC && l.proto == 0);
+    // a clean source with an unparseable chain is only L3_BAD
+    n = build_v6(p, 60, 4);
+    CHECK(run_parse(p, n, &l) == L3_BAD && l.bogus == BOGUS_NONE);
+
+    // IPv4 is never bogus, its hop limit is the ttl
+    n = build_v4(p, 6, 0, 20);
+    p[8] = 33;
+    CHECK(run_parse(p, n, &l) == L3_OK && l.bogus == BOGUS_NONE && l.hoplimit == 33);
+}
+
+static const __u8 RAKNET_MAGIC[16] = {0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe,
+                                      0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78};
+
+// open connection request 2 with a server address of `family` (4 or 6)
+static __u32 build_request_2(__u8 *p, __u8 family, __u16 mtu)
+{
+    __u32 n = 0;
+    p[n++] = RAKNET_OPEN_CONNECTION_REQUEST_2;
+    memcpy(p + n, RAKNET_MAGIC, 16);
+    n += 16;
+    p[n++] = family;
+    const __u32 alen = family == 6 ? RAKNET_ADDR6_LEN : RAKNET_ADDR4_LEN;
+    memset(p + n, 0x11, alen);
+    n += alen;
+    p[n++] = mtu >> 8;
+    p[n++] = mtu & 0xff;
+    memset(p + n, 0x22, 8); // guid
+    return n + 8;
+}
+
+static __u8 run_request_2(const __u8 *p, __u32 len, __u32 payload_len)
+{
+    __u8 *heap = heap_copy(p, len, 0);
+    const __u8 ok = raknet_magic_at(heap + 1, heap + len) && raknet_request_2_fields_valid(heap, payload_len, heap + len);
+    free(heap);
+    return ok;
+}
+
+static void test_raknet_request_2(void)
+{
+    __u8 p[128];
+    __u32 n = build_request_2(p, 4, 1400);
+    CHECK(n == RAKNET_REQUEST_2_MIN_LEN);
+    CHECK(run_request_2(p, n, n));
+    n = build_request_2(p, 6, 1200);
+    CHECK(n == 56);
+    CHECK(run_request_2(p, n, n));
+
+    // the mtu bounds
+    const __u16 good_mtu[] = {RAKNET_MTU_MIN, 576, 1492, RAKNET_MTU_MAX};
+    for (size_t i = 0; i < sizeof(good_mtu) / sizeof(good_mtu[0]); i++)
+    {
+        n = build_request_2(p, 4, good_mtu[i]);
+        CHECK(run_request_2(p, n, n));
+    }
+    const __u16 bad_mtu[] = {0, RAKNET_MTU_MIN - 1, RAKNET_MTU_MAX + 1, 9000, 0xffff};
+    for (size_t i = 0; i < sizeof(bad_mtu) / sizeof(bad_mtu[0]); i++)
+    {
+        n = build_request_2(p, 4, bad_mtu[i]);
+        CHECK(!run_request_2(p, n, n));
+        n = build_request_2(p, 6, bad_mtu[i]);
+        CHECK(!run_request_2(p, n, n));
+    }
+
+    // only address families 4 and 6
+    const __u8 bad_family[] = {0, 5, 7, 0xff};
+    for (size_t i = 0; i < sizeof(bad_family) / sizeof(bad_family[0]); i++)
+    {
+        n = build_request_2(p, 4, 1400);
+        p[RAKNET_REQUEST_2_ADDR_OFF] = bad_family[i];
+        CHECK(!run_request_2(p, n, n));
+    }
+
+    // too short for its family: the ipv6 form cut to the ipv4 length, the
+    // guid missing, the payload length shorter than the packet
+    n = build_request_2(p, 6, 1400);
+    CHECK(!run_request_2(p, RAKNET_REQUEST_2_MIN_LEN, RAKNET_REQUEST_2_MIN_LEN));
+    n = build_request_2(p, 4, 1400);
+    CHECK(!run_request_2(p, n - 1, n - 1));
+    CHECK(!run_request_2(p, n, n - 1));
+    // a wrong magic
+    p[5] ^= 1;
+    CHECK(!run_request_2(p, n, n));
+}
+
+// parses p and runs is_ndp on an exact-size copy
+static __u8 run_is_ndp(const __u8 *p, size_t len)
+{
+    __u8 *copy = malloc(len);
+    memcpy(copy, p, len);
+    struct l3 l;
+    const int ret = parse_l3(copy, copy + len, &l);
+    const __u8 ndp = (ret == L3_OK || (ret == L3_BAD && l.bogus == BOGUS_UNSPEC)) && is_ndp(copy, copy + len, &l);
+    free(copy);
+    return ndp;
+}
+
+static void test_is_ndp(void)
+{
+    __u8 p[2048];
+    // neighbour solicitation, hop limit 255
+    size_t n = build_v6(p, 58, 24);
+    p[7] = 255;
+    p[40] = 135;
+    CHECK(run_is_ndp(p, n));
+    for (int type = 133; type <= 137; type++)
+    {
+        p[40] = type;
+        CHECK(run_is_ndp(p, n));
+    }
+    p[40] = 128; // echo request
+    CHECK(!run_is_ndp(p, n));
+    p[40] = 138;
+    CHECK(!run_is_ndp(p, n));
+
+    // duplicate address detection: from ::
+    p[40] = 135;
+    memset(p + 8, 0, 16);
+    CHECK(run_is_ndp(p, n));
+
+    // hop limit below 255: not from the link, or forwarded
+    n = build_v6(p, 58, 24);
+    p[40] = 135;
+    p[7] = 254;
+    CHECK(!run_is_ndp(p, n));
+    p[7] = 64;
+    CHECK(!run_is_ndp(p, n));
+
+    // the size cap: 1280 bytes still pass, one more does not
+    n = build_v6(p, 58, NDP_MAX_LEN - 40);
+    p[7] = 255;
+    p[40] = 136;
+    CHECK(n == NDP_MAX_LEN && run_is_ndp(p, n));
+    n = build_v6(p, 58, NDP_MAX_LEN - 40 + 1);
+    p[7] = 255;
+    p[40] = 136;
+    CHECK(!run_is_ndp(p, n));
+
+    // behind an extension header (hop-by-hop, destination options, fragment)
+    const __u8 ext[] = {0, 60, 44};
+    for (size_t i = 0; i < sizeof(ext); i++)
+    {
+        n = build_v6(p, ext[i], 8 + 24);
+        p[7] = 255;
+        p[40] = 58;
+        p[48] = 135;
+        CHECK(!run_is_ndp(p, n));
+    }
+
+    // not icmpv6, or IPv4
+    n = build_v6(p, 17, 24);
+    p[7] = 255;
+    p[40] = 135;
+    CHECK(!run_is_ndp(p, n));
+    n = build_v4(p, 58, 0, 24);
+    p[8] = 255;
+    p[20] = 135;
+    CHECK(!run_is_ndp(p, n));
+}
+
 int main(void)
 {
     test_varint_decodes_known_vectors();
@@ -739,6 +1142,12 @@ int main(void)
     test_login_1_19_key_block();
     test_login_uuid_eras();
     test_login_rejects_length_mismatch();
+    test_addr_helpers();
+    test_parse_v4();
+    test_parse_v6();
+    test_parse_v6_bogus_addresses();
+    test_raknet_request_2();
+    test_is_ndp();
 
     printf("%u checks, %u failures\n", checks_run, checks_failed);
     return checks_failed ? 1 : 0;

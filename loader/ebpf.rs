@@ -31,6 +31,16 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
     let start_port: u32 = filter.start_port as u32;
     let end_port: u32 = filter.end_port as u32;
     let hit_count: u32 = filter.hit_count;
+    let ipv6_source_prefix: u32 = u32::from(filter.ipv6_source_prefix);
+    // the coarser IPv6 tier of the handshake throttle (0 = off)
+    if let Some(warning) = filter.aggregate_warning() {
+        log::warn!("{warning}");
+    }
+    let ipv6_aggregate_prefix: u32 = filter.aggregate_prefix().map_or(0, u32::from);
+    let verified_per_ipv4: u32 = filter.max_verified_per_ipv4;
+    let verified_per_ipv6_prefix: u32 = filter.max_verified_per_ipv6_prefix;
+    let verified_per_ipv6_aggregate: u32 = filter.max_verified_per_ipv6_aggregate;
+    let agg_hit_count: u32 = filter.aggregate_limit(u64::from(filter.hit_count)).min(u64::from(u32::MAX)) as u32;
     let hit_count_reset_ns: u64 = filter.hit_count_reset_secs * 1_000_000_000;
     let player_idle_ns: u64 = filter.player_idle_timeout_secs * 1_000_000_000;
     // established flows to the static range are adopted for a while after
@@ -73,6 +83,12 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
         .override_global("PENALTY_VERIFIED_NS", &penalty_verified_ns, true)
         .override_global("DNS_RECHECK_NS", &dns_recheck_ns, true)
         .override_global("HIT_COUNT", &hit_count, true)
+        .override_global("IPV6_SOURCE_PREFIX", &ipv6_source_prefix, true)
+        .override_global("IPV6_AGGREGATE_PREFIX", &ipv6_aggregate_prefix, true)
+        .override_global("AGG_HIT_COUNT", &agg_hit_count, true)
+        .override_global("VERIFIED_PER_IPV4", &verified_per_ipv4, true)
+        .override_global("VERIFIED_PER_IPV6_PREFIX", &verified_per_ipv6_prefix, true)
+        .override_global("VERIFIED_PER_IPV6_AGGREGATE", &verified_per_ipv6_aggregate, true)
         .override_global("HIT_COUNT_RESET_NS", &hit_count_reset_ns, true)
         .override_global("PLAYER_IDLE_NS", &player_idle_ns, true)
         // Replace the placeholder map capacities baked into the object with
@@ -81,7 +97,10 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
         // flag, a mismatched name would be silently ignored.
         .map_max_entries("conntrack_map", config.xdp.max_pending_connections)
         .map_max_entries("player_connection_map", config.xdp.max_player_connections)
+        .map_max_entries("verified_per_source", config.xdp.max_player_connections)
+        .map_max_entries("verified_per_aggregate", config.xdp.max_player_connections)
         .map_max_entries("connection_throttle", config.xdp.max_throttled_ips)
+        .map_max_entries("connection_throttle_agg", config.xdp.max_throttled_ips)
         .load(object)
         .context("failed to load BPF program")?;
 

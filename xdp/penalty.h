@@ -25,7 +25,7 @@ struct
 {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
-    __type(key, __u32);
+    __type(key, struct addr6); // source prefix (src_prefix)
     __type(value, __u64);
 } verified_sources SEC(".maps");
 
@@ -34,12 +34,16 @@ struct
 {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
-    __type(key, __u32);
+    __type(key, struct addr6); // source prefix (src_prefix)
     __type(value, __u64);
 } penalty SEC(".maps");
 
-// [0] = 1 once the loader has the redirect and the service in place;
-// without them penalized sources would reach the backend unfiltered
+// [0] = PENALTY_READY_* bits of the families for which the loader has the
+// redirect and the service in place; without them penalized sources of that
+// family would reach the backend unfiltered. Must match loader/penalty.rs
+#define PENALTY_READY_V4 1
+#define PENALTY_READY_V6 2
+
 struct
 {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -48,7 +52,30 @@ struct
     __type(value, __u64);
 } penalty_ready SEC(".maps");
 
-static __always_inline __u8 penalty_enabled(void)
+// connections opened by a SYN of a penalized source (ktime of the SYN). Only
+// their packets pass untracked: any other flow of a penalized source (e.g.
+// one prepared before the penalty, which has no redirect and would reach
+// the real backend) is filtered as usual
+struct
+{
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct flow_key);
+    __type(value, __u64);
+} penalty_flows SEC(".maps");
+
+static __always_inline void penalty_flow_open(const struct flow_key *flow)
+{
+    const __u64 now = bpf_ktime_get_ns();
+    bpf_map_update_elem(&penalty_flows, flow, &now, BPF_ANY);
+}
+
+static __always_inline __u8 penalty_flow(const struct flow_key *flow)
+{
+    return bpf_map_lookup_elem(&penalty_flows, flow) != NULL;
+}
+
+static __always_inline __u8 penalty_enabled(const struct addr6 *src)
 {
     if (!PENALTY_NS)
     {
@@ -56,76 +83,86 @@ static __always_inline __u8 penalty_enabled(void)
     }
     __u32 zero = 0;
     const __u64 *ready = bpf_map_lookup_elem(&penalty_ready, &zero);
-    return ready && *ready;
+    const __u64 family = addr_is_v4(src) ? PENALTY_READY_V4 : PENALTY_READY_V6;
+    return ready && (*ready & family);
 }
 
-static __always_inline void note_verified_source(const __u32 src)
+static __always_inline void note_verified_source(const struct addr6 *src)
 {
     if (!PENALTY_NS)
     {
         return;
     }
+    const struct addr6 pfx = src_prefix(src);
     const __u64 now = bpf_ktime_get_ns();
-    bpf_map_update_elem(&verified_sources, &src, &now, BPF_ANY);
+    bpf_map_update_elem(&verified_sources, &pfx, &now, BPF_ANY);
 }
 
-static __always_inline __u8 penalized(const __u32 src)
+static __always_inline __u8 penalized(const struct addr6 *src)
 {
-    if (!penalty_enabled())
+    if (!penalty_enabled(src))
     {
         return 0;
     }
-    const __u64 *until = bpf_map_lookup_elem(&penalty, &src);
+    const struct addr6 pfx = src_prefix(src);
+    const __u64 *until = bpf_map_lookup_elem(&penalty, &pfx);
     return until && bpf_ktime_get_ns() < *until;
 }
 
 // puts src in the penalty box if it is a known real client; returns 1 then
-static __always_inline __u8 try_penalize(const __u32 src)
+static __always_inline __u8 try_penalize(const struct addr6 *src)
 {
-    if (!penalty_enabled())
+    if (!penalty_enabled(src))
     {
         return 0;
     }
+    const struct addr6 pfx = src_prefix(src);
     const __u64 now = bpf_ktime_get_ns();
-    const __u64 *verified = bpf_map_lookup_elem(&verified_sources, &src);
+    const __u64 *verified = bpf_map_lookup_elem(&verified_sources, &pfx);
     if (!verified || now - *verified > PENALTY_VERIFIED_NS)
     {
         return 0;
     }
     const __u64 until = now + PENALTY_NS;
-    bpf_map_update_elem(&penalty, &src, &until, BPF_ANY);
+    bpf_map_update_elem(&penalty, &pfx, &until, BPF_ANY);
     return 1;
 }
 
 /*
  * tc ingress: marks packets of penalized sources to java targets, so the
  * netfilter rule of the loader redirects their new connections to the
- * penalty service. Never drops or changes anything else.
+ * penalty service, and drops marked packets of connections it did not
+ * redirect. Verified and still inspected connections of the source are
+ * left alone (the XDP program vouches for them); SYNs are always marked.
+ * Never drops or changes anything else.
  */
 SEC("classifier")
 __s32 penalty_mark(struct __sk_buff *skb)
 {
     const void *data = (const void *)(long)skb->data;
     const void *data_end = (const void *)(long)skb->data_end;
-    const struct iphdr *ip = ipv4_header(data, data_end, skb->ifindex);
-    if (!ip || ip->ihl < 5 || ip->protocol != IPPROTO_TCP)
+    struct l3 l;
+    const void *ip;
+    if (packet_l3(data, data_end, skb->ifindex, &l, &ip) != L3_OK || l.proto != IPPROTO_TCP || l.frag == FRAG_LATER)
     {
         return TC_ACT_UNSPEC;
     }
-    const struct tcphdr *tcp = (const void *)ip + (ip->ihl * 4);
-    if ((const void *)(tcp + 1) > data_end)
-    {
-        return TC_ACT_UNSPEC;
-    }
-    if (!penalized(ip->saddr))
+    const struct tcphdr *tcp = l4_ptr(ip, &l);
+    if ((const void *)(tcp + 1) > data_end || !penalized(&l.src))
     {
         return TC_ACT_UNSPEC;
     }
     __u8 grace = 0;
-    if (lookup_target(ip->daddr, tcp->dest, IPPROTO_TCP, &grace) == KIND_JAVA)
+    if (lookup_target(&l.dst, tcp->dest, IPPROTO_TCP, &grace) != KIND_JAVA)
     {
-        skb->mark |= PENALTY_MARK;
+        return TC_ACT_UNSPEC;
     }
+    const struct flow_key flow = gen_flow_key(&l.src, &l.dst, tcp->source, tcp->dest);
+    if (!tcp->syn && (bpf_map_lookup_elem(&player_connection_map, &flow) || bpf_map_lookup_elem(&conntrack_map, &flow)))
+    {
+        return TC_ACT_UNSPEC;
+    }
+    skb->mark |= PENALTY_MARK;
     return TC_ACT_UNSPEC;
 }
 

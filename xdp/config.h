@@ -33,6 +33,12 @@ volatile const __u64 PENALTY_VERIFIED_NS = 0; // a source counts as a real clien
 volatile const __u8 DNS_SCAN = 0;             // note DNS queries to protected addresses for the loader
 volatile const __u64 DNS_RECHECK_NS = 0;      // how long a "DNS server / no DNS server" verdict is trusted          // drop traffic to unrouted addresses of unused_networks
 volatile const __u8 L3_INTERFACES = 0;      // 1 when interfaces without link layer header are attached (see l3.h)
+volatile const __u32 IPV6_SOURCE_PREFIX = 0;  // prefix length per IPv6 source for throttle/limits/bans (32..128)
+volatile const __u32 IPV6_AGGREGATE_PREFIX = 0; // coarser IPv6 tier of the handshake throttle (16..IPV6_SOURCE_PREFIX), 0 disables it
+volatile const __u32 AGG_HIT_COUNT = 0;        // max SYNs per IPv6 aggregate prefix per window
+volatile const __u32 VERIFIED_PER_IPV4 = 0;           // max verified flows per IPv4 address, 0 = no cap
+volatile const __u32 VERIFIED_PER_IPV6_PREFIX = 0;    // max verified flows per IPv6 source prefix, 0 = no cap
+volatile const __u32 VERIFIED_PER_IPV6_AGGREGATE = 0; // max verified flows per IPv6 aggregate prefix, 0 = no cap
 volatile const __u32 HIT_COUNT = 0;           // max SYNs per source ip per window, 0 disables the throttle
 volatile const __u64 HIT_COUNT_RESET_NS = 0;  // throttle window length in nanoseconds
 volatile const __u64 PLAYER_IDLE_NS = 0;      // idle check interval for verified connections in nanoseconds;

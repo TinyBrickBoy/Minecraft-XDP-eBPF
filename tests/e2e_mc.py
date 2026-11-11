@@ -10,12 +10,18 @@ Clients exit 0 on the expected outcome, 1 otherwise:
   bedrock-ping    RakNet unconnected ping is answered with a pong
   bedrock-session SECS  RakNet open connection handshake, then frames
   bedrock-garbage a non-RakNet datagram is NOT answered (dropped)
+  bedrock-orphan-request-2  open connection request 2 without request 1 is NOT answered
+  bedrock-household  two consoles behind one address both get request 2 answered
   udp-echo [SPORT [SIZE]]     a datagram (from SPORT, SIZE bytes) is echoed
   udp-no-echo [SPORT [SIZE]]  ... is NOT echoed (dropped)
   http-get                    a plain http request is answered
   https-get                   a TLS handshake + http request is answered
   http-keepalive SECS         one keep-alive http connection, a request every 0.5 s
   tcp-junk                    a non-http/non-TLS first segment is NOT answered (dropped)
+  syn-dropped                 a TCP connect is NOT answered within 1 s (throttled)
+  v6-ext-chain N  RakNet ping (raw IPv6) behind N extension headers is answered
+  v6-fragment     RakNet ping (raw IPv6) as an atomic fragment is answered
+  v6-ext-echo N, v6-fragment-echo  the same to a udp echo service
 Server: udp-echo-server, http-server, https-server CERT KEY
 """
 import os
@@ -71,6 +77,23 @@ def recv_exact(sock, n):
     return data
 
 
+def family(host):
+    return socket.AF_INET6 if ":" in host else socket.AF_INET
+
+
+def listen_socket(host, port, kind):
+    sock = socket.socket(family(host), kind)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if family(host) == socket.AF_INET6:
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)  # "::" serves both families
+    sock.bind((host, port))
+    return sock
+
+
+def any_addr(host):
+    return "::" if family(host) == socket.AF_INET6 else "0.0.0.0"
+
+
 # ---------------------------------------------------------------- servers
 
 def java_conn(conn, online=False):
@@ -115,9 +138,7 @@ def java_online_conn_full(conn):
 
 
 def serve_tcp(host, port, handler):
-    srv = socket.socket()
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((host, port))
+    srv = listen_socket(host, port, socket.SOCK_STREAM)
     srv.listen(128)
     while True:
         conn, _ = srv.accept()
@@ -138,8 +159,7 @@ def echo_conn(conn):
 
 
 def bedrock_server(host, port):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((host, port))
+    sock = listen_socket(host, port, socket.SOCK_DGRAM)
     guid = struct.pack(">Q", 0x1234)
     info = b"MCPE;e2e;712;1.21.0;0;10;1234;e2e;Survival;1;19132;19133;"
     while True:
@@ -174,7 +194,8 @@ def status(host, port):
 
 
 def player(host, port, secs):
-    with socket.create_connection((host, port), timeout=3) as s:
+    bind = os.environ.get("E2E_BIND")
+    with socket.create_connection((host, port), timeout=3, source_address=(bind, 0) if bind else None) as s:
         login = packet(b"\x00" + varint(6) + b"Tester" + bytes(16))
         s.sendall(handshake(host, port, 2) + login)
         end = time.time() + secs
@@ -217,14 +238,15 @@ def udp_exchange(sock, data, timeout=2):
 
 
 def bedrock_ping(host, port):
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+    with socket.socket(family(host), socket.SOCK_DGRAM) as s:
         s.connect((host, port))
         reply = udp_exchange(s, b"\x01" + struct.pack(">Q", 1) + MAGIC + struct.pack(">Q", 7))
         return bool(reply) and reply[0] == 0x1C and reply[17:33] == MAGIC
 
 
 def bedrock_session(host, port, secs):
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+    with socket.socket(family(host), socket.SOCK_DGRAM) as s:
+        s.bind((os.environ.get("E2E_BIND", any_addr(host)), 0))
         s.connect((host, port))
         r = udp_exchange(s, b"\x05" + MAGIC + b"\x0b" + bytes(1000))
         if not r or r[0] != 0x06:
@@ -243,8 +265,39 @@ def bedrock_session(host, port, secs):
     return True
 
 
+def bedrock_household(host, port):
+    """Two consoles behind one address join at once, each with 3 pings and 3
+    request 1 (MTU retries) before request 2: both get request 2 answered."""
+    bind = os.environ.get("E2E_BIND", any_addr(host))
+    socks = []
+    for _ in range(2):
+        s = socket.socket(family(host), socket.SOCK_DGRAM)
+        s.bind((bind, 0))
+        s.connect((host, port))
+        socks.append(s)
+    ok = []
+    for s in socks:
+        for _ in range(3):
+            udp_exchange(s, b"\x01" + struct.pack(">Q", 1) + MAGIC + struct.pack(">Q", 7), 0.5)
+        for _ in range(3):
+            udp_exchange(s, b"\x05" + MAGIC + b"\x0b" + bytes(600), 0.5)
+        r = udp_exchange(s, b"\x07" + MAGIC + b"\x04" + bytes(6) + struct.pack(">H", 1400) + struct.pack(">Q", 7))
+        ok.append(bool(r) and r[0] == 0x08)
+        s.close()
+    print(ok)
+    return all(ok)
+
+
+def bedrock_orphan_request_2(host, port):
+    """An open connection request 2 without request 1 before is NOT answered."""
+    with socket.socket(family(host), socket.SOCK_DGRAM) as s:
+        s.connect((host, port))
+        r = udp_exchange(s, b"\x07" + MAGIC + b"\x04" + bytes(6) + struct.pack(">H", 1400) + struct.pack(">Q", 7))
+        return r is None
+
+
 def bedrock_garbage(host, port):
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+    with socket.socket(family(host), socket.SOCK_DGRAM) as s:
         s.connect((host, port))
         return udp_exchange(s, b"\x99junkjunkjunk") is None
 
@@ -294,17 +347,16 @@ def https_conn(conn, ctx):
 
 
 def udp_echo_server(host, port):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((host, port))
+    sock = listen_socket(host, port, socket.SOCK_DGRAM)
     while True:
         data, addr = sock.recvfrom(65535)
         sock.sendto(data, addr)
 
 
 def udp_echo(host, port, sport=0, size=32):
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+    with socket.socket(family(host), socket.SOCK_DGRAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((os.environ.get("E2E_BIND", "0.0.0.0"), int(sport)))
+        s.bind((os.environ.get("E2E_BIND", any_addr(host)), int(sport)))
         s.connect((host, port))
         data = bytes(range(256)) * (int(size) // 256 + 1)
         return udp_exchange(s, data[:int(size)]) == data[:int(size)]
@@ -312,8 +364,8 @@ def udp_echo(host, port, sport=0, size=32):
 
 def dns_answer(host, port, sport):
     """Sends a DNS answer (QR bit set), as reflected by an abused resolver."""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.bind((os.environ.get("E2E_BIND", "0.0.0.0"), int(sport)))
+    with socket.socket(family(host), socket.SOCK_DGRAM) as s:
+        s.bind((os.environ.get("E2E_BIND", any_addr(host)), int(sport)))
         s.sendto(b"\x12\x34\x81\x80" + bytes(28), (host, port))
     return True
 
@@ -373,8 +425,8 @@ def connect_spam(host, port, count):
     """Opens and closes `count` connections quickly (connection throttle)."""
     for _ in range(int(count)):
         try:
-            s = socket.socket()
-            s.bind((os.environ.get("E2E_BIND", "0.0.0.0"), 0))
+            s = socket.socket(family(host), socket.SOCK_STREAM)
+            s.bind((os.environ.get("E2E_BIND", any_addr(host)), 0))
             s.settimeout(0.3)
             s.connect((host, port))
             s.close()
@@ -383,11 +435,24 @@ def connect_spam(host, port, count):
     return True
 
 
+def syn_dropped(host, port):
+    """A connection attempt is NOT answered within 1 s (SYN dropped)."""
+    try:
+        s = socket.socket(family(host), socket.SOCK_STREAM)
+        s.bind((os.environ.get("E2E_BIND", any_addr(host)), 0))
+        s.settimeout(1)
+        s.connect((host, port))
+        s.close()
+        return False
+    except socket.timeout:
+        return True
+
+
 def login_message(host, port):
     """Joins and returns the disconnect message, or None."""
     try:
-        s = socket.socket()
-        s.bind((os.environ.get("E2E_BIND", "0.0.0.0"), 0))
+        s = socket.socket(family(host), socket.SOCK_STREAM)
+        s.bind((os.environ.get("E2E_BIND", any_addr(host)), 0))
         s.settimeout(3)
         s.connect((host, port))
         s.sendall(handshake(host, port, 2) + packet(b"\x00" + varint(6) + b"Tester" + bytes(16)))
@@ -413,8 +478,8 @@ def no_penalty_message(host, port):
 
 def udp_flood(host, port, count):
     """Sends `count` small datagrams as fast as possible (rate limit test)."""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.bind((os.environ.get("E2E_BIND", "0.0.0.0"), 0))
+    with socket.socket(family(host), socket.SOCK_DGRAM) as s:
+        s.bind((os.environ.get("E2E_BIND", any_addr(host)), 0))
         for _ in range(int(count)):
             s.sendto(b"flood", (host, port))
     return True
@@ -434,6 +499,98 @@ def tcp_junk(host, port):
             return not s.recv(16)
     except (socket.timeout, ConnectionError):
         return True
+
+
+NEXTHDR_HOP, NEXTHDR_FRAGMENT, NEXTHDR_DEST, NEXTHDR_UDP = 0, 44, 60, 17
+
+
+def _checksum(data):
+    if len(data) % 2:
+        data += b"\x00"
+    total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    # a computed 0 is sent as 0xFFFF: 0 means "no checksum", which IPv6
+    # forbids for UDP (RFC 8200 8.1)
+    return (~total & 0xFFFF) or 0xFFFF
+
+
+V6_PING = b"\x01" + struct.pack(">q", 1) + MAGIC + struct.pack(">q", 2)
+
+
+def _v6_udp_exchange(host, port, ext_types, payload=V6_PING):
+    """Sends a datagram to host:port behind the given IPv6 extension headers
+    (raw socket, header included) and returns the answer received within
+    2 s, or None."""
+    src = os.environ.get("E2E_BIND", "fd99:0::2")
+    rx = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    rx.bind((src, 0))
+    rx.settimeout(2)
+    sport = rx.getsockname()[1]
+
+    s6 = socket.inet_pton(socket.AF_INET6, src)
+    d6 = socket.inet_pton(socket.AF_INET6, host)
+    udp_len = 8 + len(payload)
+    udp = struct.pack("!HHHH", sport, port, udp_len, 0) + payload
+    pseudo = s6 + d6 + struct.pack("!I3xB", udp_len, NEXTHDR_UDP)
+    udp = udp[:6] + struct.pack("!H", _checksum(pseudo + udp)) + udp[8:]
+
+    chain = list(ext_types) + [NEXTHDR_UDP]
+    exts = b""
+    for i, kind in enumerate(ext_types):
+        nxt = chain[i + 1]
+        if kind == NEXTHDR_FRAGMENT:
+            # offset 0, M flag clear: an atomic fragment (RFC 6946), which
+            # linux delivers like an unfragmented packet
+            exts += struct.pack("!BBHI", nxt, 0, 0, 0x12345678)
+        else:
+            # 8 bytes: next header, length 0, PadN option with 4 zero bytes
+            exts += struct.pack("!BB", nxt, 0) + b"\x01\x04\x00\x00\x00\x00"
+    ip6 = struct.pack("!IHBB", 6 << 28, len(exts) + udp_len, chain[0], 64) + s6 + d6
+
+    raw = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    raw.sendto(ip6 + exts + udp, (host, 0))
+    try:
+        return rx.recvfrom(2048)[0]
+    except socket.timeout:
+        return None
+    finally:
+        raw.close()
+        rx.close()
+
+
+def _v6_raknet_ping(host, port, ext_types):
+    """True when a RakNet unconnected pong comes back (see bedrock_ping)."""
+    reply = _v6_udp_exchange(host, port, ext_types)
+    return bool(reply) and reply[0] == 0x1C and reply[17:33] == MAGIC
+
+
+def _v6_echo(host, port, ext_types):
+    """True when a udp echo service sends the datagram back."""
+    return _v6_udp_exchange(host, port, ext_types) == V6_PING
+
+
+def _ext_chain(count):
+    """count extension headers: one hop-by-hop first (it must come first),
+    then destination options."""
+    count = int(count)
+    return ([NEXTHDR_HOP] if count else []) + [NEXTHDR_DEST] * max(count - 1, 0)
+
+
+def v6_ext_chain(host, port, count):
+    return _v6_raknet_ping(host, port, _ext_chain(count))
+
+
+def v6_fragment(host, port):
+    return _v6_raknet_ping(host, port, [NEXTHDR_FRAGMENT])
+
+
+def v6_ext_echo(host, port, count):
+    return _v6_echo(host, port, _ext_chain(count))
+
+
+def v6_fragment_echo(host, port):
+    return _v6_echo(host, port, [NEXTHDR_FRAGMENT])
 
 
 def main():
@@ -458,13 +615,17 @@ def main():
     else:
         fn = {"status": status, "player": player, "garbage": garbage, "echo": echo,
               "bedrock-ping": bedrock_ping, "bedrock-session": bedrock_session,
-              "bedrock-garbage": bedrock_garbage, "udp-echo": udp_echo,
+              "bedrock-garbage": bedrock_garbage, "bedrock-orphan-request-2": bedrock_orphan_request_2,
+              "bedrock-household": bedrock_household,
+              "udp-echo": udp_echo,
               "udp-no-echo": udp_no_echo, "http-get": http_get, "https-get": https_get,
               "http-keepalive": http_keepalive, "tcp-junk": tcp_junk,
               "http-answered": http_answered, "udp-flood": udp_flood,
               "login-uuid": login_uuid, "login-uuid-rejected": login_uuid_rejected,
-              "connect-spam": connect_spam, "penalty-message": penalty_message,
-              "no-penalty-message": no_penalty_message, "dns-answer": dns_answer}[cmd]
+              "connect-spam": connect_spam, "syn-dropped": syn_dropped, "penalty-message": penalty_message,
+              "no-penalty-message": no_penalty_message, "dns-answer": dns_answer,
+              "v6-ext-chain": v6_ext_chain, "v6-fragment": v6_fragment,
+              "v6-ext-echo": v6_ext_echo, "v6-fragment-echo": v6_fragment_echo}[cmd]
         try:
             ok = fn(host, port, *extra)
         except Exception as e:  # noqa: BLE001 - any failure is a test failure

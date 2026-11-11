@@ -48,12 +48,13 @@ struct
     __type(value, struct reflection_config);
 } reflection_config SEC(".maps");
 
-// protected networks, longest prefix match on the ipv4 address
+// protected networks, longest prefix match on the (v4-mapped) address
 struct net_key
 {
-    __u32 prefixlen;
-    __u32 addr; // network byte order
+    __u32 prefixlen; // IPv4 entries: prefix + 96 (v4-mapped)
+    struct addr6 addr;
 };
+_Static_assert(sizeof(struct net_key) == 20, "net_key size mismatch!");
 
 struct
 {
@@ -82,12 +83,12 @@ struct
 // `ExpectKey` in loader/reflection.rs
 struct expect_key
 {
-    __u32 local_ip;  // protected address, network byte order
-    __u32 remote_ip; // service address
+    struct addr6 local_ip;  // protected address
+    struct addr6 remote_ip; // service address
     __u16 local_port;
     __u16 remote_port; // the service port
 };
-_Static_assert(sizeof(struct expect_key) == 12, "expect_key size mismatch!");
+_Static_assert(sizeof(struct expect_key) == 36, "expect_key size mismatch!");
 
 struct
 {
@@ -102,10 +103,11 @@ struct
 // `ReflectionKey` / `ReflectionStats` in loader/reflection.rs
 struct reflection_key
 {
-    __u32 daddr;
+    struct addr6 daddr;
     __u16 sport; // host byte order
     __u16 pad;
 };
+_Static_assert(sizeof(struct reflection_key) == 20, "reflection_key size mismatch!");
 
 struct reflection_stats
 {
@@ -132,9 +134,9 @@ static __always_inline const struct reflection_config *reflection_active(void)
     return config;
 }
 
-static __always_inline __u8 reflection_protects(const __u32 addr)
+static __always_inline __u8 reflection_protects(const struct addr6 *addr)
 {
-    const struct net_key key = {.prefixlen = 32, .addr = addr};
+    const struct net_key key = {.prefixlen = 128, .addr = *addr};
     return bpf_map_lookup_elem(&reflection_networks, &key) != NULL;
 }
 
@@ -157,10 +159,10 @@ static __always_inline __u8 reflection_port(const __u16 port)
  * Counts a reflection packet and returns the verdict for it: XDP_DROP when
  * enforcing, XDP_PASS in monitor mode.
  */
-static __always_inline __s32 reflection_verdict(const struct reflection_config *config, const __u32 daddr,
+static __always_inline __s32 reflection_verdict(const struct reflection_config *config, const struct addr6 *daddr,
                                                 const __u16 sport, const __u64 bytes)
 {
-    const struct reflection_key key = {.daddr = daddr, .sport = sport, .pad = 0};
+    const struct reflection_key key = {.daddr = *daddr, .sport = sport, .pad = 0};
     struct reflection_stats *stats = bpf_map_lookup_elem(&reflection_stats, &key);
     if (!stats)
     {
@@ -181,7 +183,7 @@ static __always_inline __s32 reflection_verdict(const struct reflection_config *
  * a reflection packet (the caller continues with its own checks), otherwise
  * the verdict. udp may be NULL for non-first fragments.
  */
-static __always_inline __s32 reflection_check(const struct iphdr *ip, const struct udphdr *udp, const __u64 bytes)
+static __always_inline __s32 reflection_check(const struct l3 *l, const struct udphdr *udp, const __u64 bytes)
 {
     const struct reflection_config *config = reflection_active();
     if (!config)
@@ -191,22 +193,22 @@ static __always_inline __s32 reflection_check(const struct iphdr *ip, const stru
 
     if (!udp)
     {
-        if (config->drop_fragments && reflection_protects(ip->daddr))
+        if (config->drop_fragments && reflection_protects(&l->dst))
         {
-            return reflection_verdict(config, ip->daddr, 0, bytes);
+            return reflection_verdict(config, &l->dst, 0, bytes);
         }
         return -1;
     }
 
     const __u16 sport = bpf_ntohs(udp->source);
-    if (!reflection_port(sport) || !reflection_protects(ip->daddr))
+    if (!reflection_port(sport) || !reflection_protects(&l->dst))
     {
         return -1;
     }
 
     const struct expect_key key = {
-        .local_ip = ip->daddr,
-        .remote_ip = ip->saddr,
+        .local_ip = l->dst,
+        .remote_ip = l->src,
         .local_port = udp->dest,
         .remote_port = udp->source,
     };
@@ -215,7 +217,7 @@ static __always_inline __s32 reflection_check(const struct iphdr *ip, const stru
     {
         return -1; // an answer to a request we saw leaving
     }
-    return reflection_verdict(config, ip->daddr, sport, bytes);
+    return reflection_verdict(config, &l->dst, sport, bytes);
 }
 
 /*
@@ -233,25 +235,25 @@ __s32 reflection_egress(struct __sk_buff *skb)
 
     const void *data = (const void *)(long)skb->data;
     const void *data_end = (const void *)(long)skb->data_end;
-    const struct iphdr *ip = ipv4_header(data, data_end, skb->ifindex);
-    if (!ip || ip->ihl < 5 || ip->protocol != IPPROTO_UDP ||
-        (ip->frag_off & bpf_htons(IP_OFFSET)))
+    struct l3 l;
+    const void *ip;
+    if (packet_l3(data, data_end, skb->ifindex, &l, &ip) != L3_OK || l.proto != IPPROTO_UDP || l.frag == FRAG_LATER)
     {
         return TC_ACT_UNSPEC;
     }
-    const struct udphdr *udp = (const void *)ip + (ip->ihl * 4);
+    const struct udphdr *udp = l4_ptr(ip, &l);
     if ((const void *)(udp + 1) > data_end)
     {
         return TC_ACT_UNSPEC;
     }
-    if (!reflection_port(bpf_ntohs(udp->dest)) || !reflection_protects(ip->saddr))
+    if (!reflection_port(bpf_ntohs(udp->dest)) || !reflection_protects(&l.src))
     {
         return TC_ACT_UNSPEC;
     }
 
     const struct expect_key key = {
-        .local_ip = ip->saddr,
-        .remote_ip = ip->daddr,
+        .local_ip = l.src,
+        .remote_ip = l.dst,
         .local_port = udp->source,
         .remote_port = udp->dest,
     };

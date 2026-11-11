@@ -1,48 +1,50 @@
 use std::collections::HashMap as StdHashMap;
 use std::fmt;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use aya::Pod;
-use aya::maps::{HashMap, MapData};
+use aya::maps::{HashMap, MapData, MapError};
 use log::{info, warn};
+
+use crate::addr::Addr6;
 
 pub const PROTO_TCP: u8 = libc::IPPROTO_TCP as u8;
 pub const PROTO_UDP: u8 = libc::IPPROTO_UDP as u8;
 
-/// Userspace mirror of `struct dst_key` (see xdp/stats.h), address and port
-/// in network byte order.
+/// Userspace mirror of `struct dst_key` (see xdp/stats.h), address in the
+/// 128-bit form, port in network byte order.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DstKey {
-    daddr: u32,
+    daddr: Addr6,
     dport: u16,
     proto: u8,
     pad: u8,
 }
 
-// SAFETY: repr(C) struct of plain integers without padding, valid for any bit
-// pattern read from the map.
+// SAFETY: repr(C) struct of plain integers without padding (16 + 2 + 1 + 1),
+// valid for any bit pattern read from the map.
 unsafe impl Pod for DstKey {}
 
-const _: () = assert!(std::mem::size_of::<DstKey>() == 8);
+const _: () = assert!(std::mem::size_of::<DstKey>() == 20);
 
 impl DstKey {
-    pub fn new(addr: SocketAddrV4, proto: u8) -> Self {
-        Self {
-            daddr: u32::from_ne_bytes(addr.ip().octets()),
-            dport: addr.port().to_be(),
-            proto,
-            pad: 0,
-        }
+    pub fn new(addr: SocketAddr, proto: u8) -> Self {
+        Self { daddr: Addr6::from_ip(addr.ip()), dport: addr.port().to_be(), proto, pad: 0 }
     }
 
-    pub fn addr(&self) -> SocketAddrV4 {
-        SocketAddrV4::new(
-            Ipv4Addr::from(self.daddr.to_ne_bytes()),
-            u16::from_be(self.dport),
-        )
+    pub fn addr(&self) -> SocketAddr {
+        SocketAddr::new(self.daddr.to_ip(), u16::from_be(self.dport))
+    }
+
+    pub fn ip(&self) -> Addr6 {
+        self.daddr
+    }
+
+    pub fn port(&self) -> u16 {
+        u16::from_be(self.dport)
     }
 
     pub fn proto(&self) -> u8 {
@@ -130,6 +132,8 @@ impl Source {
 /// without reloading the program.
 pub struct Targets {
     map: Mutex<HashMap<MapData, DstKey, TargetEntry>>,
+    /// protected_addrs: addresses with at least one protecting entry
+    addrs: Mutex<HashMap<MapData, Addr6, u8>>,
     entries: Mutex<StdHashMap<DstKey, (Kind, Source)>>,
     /// java targets seen in online mode, until when (ktime)
     online: Mutex<StdHashMap<DstKey, u64>>,
@@ -137,9 +141,10 @@ pub struct Targets {
 }
 
 impl Targets {
-    pub fn new(map: HashMap<MapData, DstKey, TargetEntry>, grace_secs: u64) -> Self {
+    pub fn new(map: HashMap<MapData, DstKey, TargetEntry>, addrs: HashMap<MapData, Addr6, u8>, grace_secs: u64) -> Self {
         Self {
             map: Mutex::new(map),
+            addrs: Mutex::new(addrs),
             entries: Mutex::new(StdHashMap::new()),
             online: Mutex::new(StdHashMap::new()),
             grace_ns: grace_secs * 1_000_000_000,
@@ -156,6 +161,8 @@ impl Targets {
                 return Ok(());
             }
             if old_kind == kind && old_source == source {
+                // retries a protected_addrs update that failed earlier
+                self.sync_addr(&entries, key.ip());
                 return Ok(());
             }
         }
@@ -172,7 +179,25 @@ impl Targets {
             .with_context(|| format!("failed to write target {key}"))?;
         info!("Target {key}: {} ({})", kind.name(), source.name());
         entries.insert(key, (kind, source));
+        self.sync_addr(&entries, key.ip());
         Ok(())
+    }
+
+    /// Keeps `protected_addrs` equal to the set of addresses with at least
+    /// one protecting entry (Kind::None does not protect).
+    fn sync_addr(&self, entries: &StdHashMap<DstKey, (Kind, Source)>, ip: Addr6) {
+        let mut addrs = self.addrs.lock().unwrap();
+        let result = if protects(entries, ip) {
+            addrs.insert(ip, 1, 0)
+        } else {
+            match addrs.remove(&ip) {
+                Err(MapError::KeyNotFound) => Ok(()),
+                other => other,
+            }
+        };
+        if let Err(e) = result {
+            warn!("Failed to update protected address {ip}: {e}");
+        }
     }
 
     /// Removes an auto detected target; config entries are kept.
@@ -187,6 +212,7 @@ impl Targets {
         }
         info!("Target {key}: removed");
         entries.remove(key);
+        self.sync_addr(&entries, key.ip());
     }
 
     /// Records that the java target `key` asked a client for encryption,
@@ -229,6 +255,11 @@ impl Targets {
     }
 }
 
+/// Whether some entry protects `ip` (Kind::None does not).
+fn protects(entries: &StdHashMap<DstKey, (Kind, Source)>, ip: Addr6) -> bool {
+    entries.iter().any(|(k, &(kind, _))| k.ip() == ip && kind != Kind::None)
+}
+
 /// CLOCK_MONOTONIC in nanoseconds, the clock behind bpf_ktime_get_ns().
 pub fn monotonic_ns() -> u64 {
     let mut ts = libc::timespec {
@@ -246,12 +277,41 @@ mod tests {
 
     #[test]
     fn dst_key_round_trips() {
-        let addr: SocketAddrV4 = "85.93.5.1:25569".parse().unwrap();
-        let key = DstKey::new(addr, PROTO_TCP);
-        assert_eq!(key.addr(), addr);
+        let v4: SocketAddr = "85.93.5.1:25569".parse().unwrap();
+        let key = DstKey::new(v4, PROTO_TCP);
+        assert_eq!(key.addr(), v4);
         assert_eq!(key.to_string(), "85.93.5.1:25569/tcp");
-        // network byte order, as the kernel compares it with the headers
-        assert_eq!(key.daddr.to_ne_bytes(), [85, 93, 5, 1]);
+        assert_eq!(key.daddr.0[10..], [0xff, 0xff, 85, 93, 5, 1]);
         assert_eq!(key.dport.to_ne_bytes(), 25569u16.to_be_bytes());
+
+        let v6: SocketAddr = "[2001:db8::10]:19132".parse().unwrap();
+        let key = DstKey::new(v6, PROTO_UDP);
+        assert_eq!(key.addr(), v6);
+        assert_eq!(key.to_string(), "[2001:db8::10]:19132/udp");
+        assert_eq!(std::mem::size_of::<DstKey>(), 20);
+    }
+
+    #[test]
+    fn protects_follows_entries() {
+        let a = DstKey::new("10.0.0.1:25565".parse().unwrap(), PROTO_TCP);
+        let a2 = DstKey::new("10.0.0.1:25566".parse().unwrap(), PROTO_TCP);
+        let b = DstKey::new("10.0.0.2:25565".parse().unwrap(), PROTO_TCP);
+        let mut entries = StdHashMap::new();
+        assert!(!protects(&entries, a.ip()));
+        entries.insert(a, (Kind::Java, Source::Static));
+        assert!(protects(&entries, a.ip()));
+        assert!(!protects(&entries, b.ip()));
+        entries.insert(a2, (Kind::Bedrock, Source::Auto));
+        entries.remove(&a);
+        assert!(protects(&entries, a.ip()));
+        entries.insert(a2, (Kind::None, Source::Exclude));
+        assert!(!protects(&entries, a.ip()));
+    }
+
+    #[test]
+    fn display_v6_target() {
+        let key = DstKey::new("[2001:db8::1]:25565".parse().unwrap(), PROTO_TCP);
+        assert_eq!(key.ip().to_string(), "2001:db8::1");
+        assert_eq!(key.port(), 25565);
     }
 }

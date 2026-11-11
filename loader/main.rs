@@ -1,3 +1,4 @@
+mod addr;
 mod blocklist;
 mod config;
 mod detect;
@@ -159,8 +160,12 @@ fn run(args: &Args, config: &Config, shutdown: &Arc<Shutdown>) -> Result<()> {
     let map = ebpf
         .take_map("protected_targets")
         .context("can't take map 'protected_targets'")?;
+    let addrs = ebpf
+        .take_map("protected_addrs")
+        .context("can't take map 'protected_addrs'")?;
     let targets = Arc::new(Targets::new(
         HashMap::try_from(map)?,
+        HashMap::try_from(addrs)?,
         config.filter.adopt_grace_secs,
     ));
     apply_config_targets(config, &targets)?;
@@ -183,9 +188,9 @@ fn run(args: &Args, config: &Config, shutdown: &Arc<Shutdown>) -> Result<()> {
             None
         }
     };
-    let (_penalty_redirect, penalty_thread) = match penalty {
-        Some((redirect, thread)) => (Some(redirect), Some(thread)),
-        None => (None, None),
+    let (_penalty_redirect, penalty_thread, penalty_ready) = match penalty {
+        Some((redirect, thread, ready)) => (Some(redirect), Some(thread), Some(ready)),
+        None => (None, None, None),
     };
     let (block_handles, block_thread) = match blocklist::setup(&mut ebpf, interface, config, shutdown) {
         Ok(v) => v,
@@ -198,7 +203,11 @@ fn run(args: &Args, config: &Config, shutdown: &Arc<Shutdown>) -> Result<()> {
     // the same filter on further interfaces (upstream tunnels), once every
     // program it needs is loaded
     let mut watched = vec![(interface.to_owned(), interfaces::index(interface))];
-    watched.extend(interfaces::attach_extra(&mut ebpf, &config.xdp.extra_interfaces));
+    let (extra_watched, unmarked) = interfaces::attach_extra(&mut ebpf, &config.xdp.extra_interfaces);
+    watched.extend(extra_watched);
+    if let Some(ready) = penalty_ready {
+        ready.activate(&unmarked);
+    }
 
     let mut threads = Vec::new();
     let extra = metrics::Extra {

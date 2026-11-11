@@ -30,6 +30,32 @@ hit_count = 10
 # 3 seconds. Must be between 1 and 86400 (one day).
 hit_count_reset_secs = 3
 
+# Source prefix length for IPv6 throttling, rate limits and bans: an
+# attacker usually owns a whole /64, per-address limits would be useless.
+# Valid 32..=128. IPv4 is always counted per address.
+ipv6_source_prefix = 64
+
+# Second, coarser IPv6 tier of the connection throttle (java SYNs and the
+# bedrock handshake): a site usually gets a whole /48, so rotating through
+# its 65536 /64s must not multiply its budget. Each aggregate prefix may
+# open ipv6_aggregate_factor times hit_count new connections per window; a
+# source is throttled when either tier is over its limit. Rate limit,
+# strikes and bans stay per ipv6_source_prefix. The prefix is valid 16..=128;
+# not shorter than ipv6_source_prefix turns the tier off (with a warning when
+# longer), the factor is valid 1..=1024.
+ipv6_aggregate_prefix = 48
+ipv6_aggregate_factor = 8
+
+# Verified connections (players past the handshake checks) per source:
+# per IPv4 address, per IPv6 ipv6_source_prefix and per IPv6
+# ipv6_aggregate_prefix. Further handshakes of a source at its cap are
+# dropped until one of its connections goes idle, so one source can not fill
+# the player table (bedrock handshakes are not proven to come from the
+# claimed address). 0 = no cap; at most 1048576.
+max_verified_per_ipv4 = 64
+max_verified_per_ipv6_prefix = 64
+max_verified_per_ipv6_aggregate = 512
+
 # Idle timeout for verified player connections in seconds, enforced inside the
 # eBPF program: a connection's entry is removed after one to two timeout
 # intervals without packets, so a returning client has to redo the handshake.
@@ -56,11 +82,13 @@ online_mode_cache_secs = 300
 adopt_grace_secs = 120
 
 [targets]
-# Destinations protected regardless of auto detection, as "ip:port".
+# Destinations protected regardless of auto detection, as "ip:port" or
+# "[2001:db8::1]:25565" for IPv6.
 java = []
 bedrock = []
 
-# Destinations that are never protected, as "ip:port/tcp" or "ip:port/udp".
+# Destinations that are never protected, as "ip:port/tcp", "ip:port/udp" or
+# "[2001:db8::1]:443/tcp".
 # Overrides the static range and auto detection.
 exclude = []
 
@@ -71,7 +99,7 @@ exclude = []
 # answer correctly are protected.
 enabled = false
 
-# Only servers inside these networks are considered, e.g. ["85.93.5.0/24"].
+# Only servers inside these networks are considered, e.g. ["85.93.5.0/24", "2001:db8::/48"].
 networks = []
 
 # Interfaces on which server replies (TCP SYN-ACKs, RakNet pongs) of remote
@@ -105,7 +133,7 @@ state_file = "targets.json"
 # with "monitor" and check the xdp_reflection_* metrics before enforcing.
 mode = "off"
 
-# Protected networks, e.g. ["85.93.5.0/24"].
+# Protected networks, e.g. ["85.93.5.0/24", "2001:db8::/48"].
 networks = []
 
 # UDP source ports whose answers are checked.
@@ -284,6 +312,20 @@ pub struct FilterConfig {
     /// Throttle window length in seconds; each IP's SYN counter resets in-kernel
     /// once its window expires. Maps to `HIT_COUNT_RESET_NS` (converted to ns).
     pub hit_count_reset_secs: u64,
+    /// Prefix length per IPv6 source for throttle, rate limit and bans.
+    /// Maps to `IPV6_SOURCE_PREFIX`.
+    pub ipv6_source_prefix: u8,
+    /// Coarser IPv6 tier (see [`FilterConfig::aggregate_prefix`]). Maps to
+    /// `IPV6_AGGREGATE_PREFIX`.
+    pub ipv6_aggregate_prefix: u8,
+    /// SYN budget of the aggregate tier as a multiple of `hit_count`.
+    pub ipv6_aggregate_factor: u32,
+    /// Verified flows per IPv4 address (0 = no cap). Maps to `VERIFIED_PER_IPV4`.
+    pub max_verified_per_ipv4: u32,
+    /// Verified flows per IPv6 source prefix. Maps to `VERIFIED_PER_IPV6_PREFIX`.
+    pub max_verified_per_ipv6_prefix: u32,
+    /// Verified flows per IPv6 aggregate prefix. Maps to `VERIFIED_PER_IPV6_AGGREGATE`.
+    pub max_verified_per_ipv6_aggregate: u32,
     /// Idle timeout for verified connections in seconds; an entry is removed
     /// in-kernel after one to two intervals without packets. Maps to
     /// `PLAYER_IDLE_NS` (converted to ns).
@@ -304,6 +346,17 @@ impl Default for FilterConfig {
             end_port: 25565,
             hit_count: 10,
             hit_count_reset_secs: 3,
+            ipv6_source_prefix: 64,
+            // a /48 per site (RFC 6177 still recommends /48 for end sites);
+            // 8 times the /64 limits: a site with a handful of active /64s
+            // is never limited by the tier, while rotating through its /64s
+            // gains at most a factor of 8 instead of 65536
+            ipv6_aggregate_prefix: 48,
+            ipv6_aggregate_factor: 8,
+            // a household or a small NAT; a site (/48) with many players
+            max_verified_per_ipv4: 64,
+            max_verified_per_ipv6_prefix: 64,
+            max_verified_per_ipv6_aggregate: 512,
             player_idle_timeout_secs: 60,
             online_names: true,
             adopt_grace_secs: 120,
@@ -749,6 +802,18 @@ impl FilterConfig {
                 self.end_port
             );
         }
+        check_range("[filter] ipv6_source_prefix", u64::from(self.ipv6_source_prefix), 32, 128)?;
+        // not finer than ipv6_source_prefix: then the tier is off (with a
+        // warning at load, see aggregate_warning), never a failed start
+        check_range("[filter] ipv6_aggregate_prefix", u64::from(self.ipv6_aggregate_prefix), 16, 128)?;
+        check_range("[filter] ipv6_aggregate_factor", u64::from(self.ipv6_aggregate_factor), 1, 1024)?;
+        for (option, value) in [
+            ("[filter] max_verified_per_ipv4", self.max_verified_per_ipv4),
+            ("[filter] max_verified_per_ipv6_prefix", self.max_verified_per_ipv6_prefix),
+            ("[filter] max_verified_per_ipv6_aggregate", self.max_verified_per_ipv6_aggregate),
+        ] {
+            check_range(option, u64::from(value), 0, 1 << 20)?;
+        }
         check_range(
             "[filter] hit_count_reset_secs",
             self.hit_count_reset_secs,
@@ -766,6 +831,31 @@ impl FilterConfig {
     }
 }
 
+impl FilterConfig {
+    /// The prefix length of the IPv6 aggregate tier, None when it is off
+    /// (equal to the source prefix: the tier would count the same keys).
+    pub fn aggregate_prefix(&self) -> Option<u8> {
+        (self.ipv6_aggregate_prefix < self.ipv6_source_prefix).then_some(self.ipv6_aggregate_prefix)
+    }
+
+    /// The warning to log when the aggregate tier is configured but off
+    /// because it is not coarser than the source prefix.
+    pub fn aggregate_warning(&self) -> Option<String> {
+        (self.ipv6_aggregate_prefix > self.ipv6_source_prefix).then(|| {
+            format!(
+                "[filter] ipv6_aggregate_prefix ({}) is longer than ipv6_source_prefix ({}): the IPv6 aggregate tier \
+                 (throttle and verified connection cap per aggregate prefix) is off",
+                self.ipv6_aggregate_prefix, self.ipv6_source_prefix
+            )
+        })
+    }
+
+    /// A per-source limit scaled for the aggregate tier.
+    pub fn aggregate_limit(&self, limit: u64) -> u64 {
+        limit.saturating_mul(u64::from(self.ipv6_aggregate_factor))
+    }
+}
+
 impl TargetsConfig {
     fn validate(&self) -> Result<()> {
         for entry in self.java.iter().chain(&self.bedrock) {
@@ -778,18 +868,30 @@ impl TargetsConfig {
     }
 }
 
-/// Parses "ip:port" (IPv4 only, the filter does not inspect IPv6).
-pub fn parse_socket_addr(entry: &str) -> Result<std::net::SocketAddrV4> {
-    entry
+/// Parses "ip:port" or "[ipv6]:port".
+pub fn parse_socket_addr(entry: &str) -> Result<std::net::SocketAddr> {
+    let addr: std::net::SocketAddr = entry
         .parse()
-        .with_context(|| format!("expected \"ipv4:port\", got '{entry}'"))
+        .with_context(|| format!("expected \"ipv4:port\" or \"[ipv6]:port\", got '{entry}'"))?;
+    if let std::net::IpAddr::V6(v6) = addr.ip() {
+        reject_mapped(v6, entry)?;
+    }
+    Ok(addr)
 }
 
-/// Parses "ip:port/tcp" or "ip:port/udp" into the address and its IP protocol.
-pub fn parse_exclude(entry: &str) -> Result<(std::net::SocketAddrV4, u8)> {
-    let (addr, proto) = entry
-        .rsplit_once('/')
-        .with_context(|| format!("expected \"ipv4:port/tcp\" or \"ipv4:port/udp\", got '{entry}'"))?;
+/// The kernel stores IPv4 v4-mapped, so a mapped input would alias the IPv4 entry.
+fn reject_mapped(addr: std::net::Ipv6Addr, entry: &str) -> Result<()> {
+    if addr.to_ipv4_mapped().is_some() {
+        bail!("write IPv4 addresses as a.b.c.d, not ::ffff:a.b.c.d (in '{entry}')");
+    }
+    Ok(())
+}
+
+/// Parses "ip:port/tcp" or "[ipv6]:port/udp" into the address and its IP protocol.
+pub fn parse_exclude(entry: &str) -> Result<(std::net::SocketAddr, u8)> {
+    let (addr, proto) = entry.rsplit_once('/').with_context(|| {
+        format!("expected \"ip:port/tcp\" or \"[ipv6]:port/udp\", got '{entry}'")
+    })?;
     let proto = match proto {
         "tcp" => libc::IPPROTO_TCP as u8,
         "udp" => libc::IPPROTO_UDP as u8,
@@ -798,19 +900,37 @@ pub fn parse_exclude(entry: &str) -> Result<(std::net::SocketAddrV4, u8)> {
     Ok((parse_socket_addr(addr)?, proto))
 }
 
-/// Parses "a.b.c.d/len" into (network address, prefix length).
-pub fn parse_cidr(entry: &str) -> Result<(std::net::Ipv4Addr, u8)> {
-    let (addr, len) = entry.split_once('/').unwrap_or((entry, "32"));
-    let addr: std::net::Ipv4Addr = addr
+/// Parses "a.b.c.d/len" or "ipv6/len"; without a length the network is a
+/// single address.
+pub fn parse_cidr(entry: &str) -> Result<crate::addr::Net> {
+    let (addr, len) = match entry.split_once('/') {
+        Some((addr, len)) => (addr, Some(len)),
+        None => (entry, None),
+    };
+    let addr: std::net::IpAddr = addr
         .parse()
         .with_context(|| format!("invalid network address in '{entry}'"))?;
-    let len: u8 = len
-        .parse()
-        .with_context(|| format!("invalid prefix length in '{entry}'"))?;
-    if len > 32 {
-        bail!("prefix length of '{entry}' must be <= 32");
+    if let std::net::IpAddr::V6(v6) = addr {
+        reject_mapped(v6, entry)?;
     }
-    Ok((addr, len))
+    let max = if addr.is_ipv4() { 32 } else { 128 };
+    let len: u8 = match len {
+        Some(len) => len
+            .parse()
+            .with_context(|| format!("invalid prefix length in '{entry}'"))?,
+        None => max,
+    };
+    if len > max {
+        bail!("prefix length of '{entry}' must be <= {max}");
+    }
+    let net = crate::addr::Net { addr, len };
+    if net.overlaps_v4_mapped() {
+        bail!(
+            "'{entry}' overlaps ::ffff:0:0/96, where the filter keeps IPv4: it would also match IPv4 \
+             addresses; write IPv4 networks as a.b.c.d/len"
+        );
+    }
+    Ok(net)
 }
 
 impl AutodetectConfig {
@@ -927,7 +1047,7 @@ mod tests {
         cfg.validate().expect("valid targets");
         assert!(parse_exclude("1.2.3.4:5/icmp").is_err());
         assert!(parse_socket_addr("1.2.3.4").is_err());
-        assert_eq!(parse_cidr("85.93.5.0/24").unwrap().1, 24);
+        assert_eq!(parse_cidr("85.93.5.0/24").unwrap().len, 24);
     }
 
     #[test]
@@ -1019,5 +1139,112 @@ mod tests {
     fn rejects_unknown_log_level() {
         let err = toml::from_str::<Config>("[logging]\nlevel = \"verbose\"").unwrap_err();
         assert!(err.to_string().contains("verbose"));
+    }
+
+    #[test]
+    fn parses_dual_stack_entries() {
+        assert_eq!(parse_socket_addr("1.2.3.4:25565").unwrap().to_string(), "1.2.3.4:25565");
+        assert_eq!(parse_socket_addr("[2001:db8::10]:25565").unwrap().to_string(), "[2001:db8::10]:25565");
+        assert!(parse_socket_addr("2001:db8::10:25565").is_err());
+        let (addr, proto) = parse_exclude("[2001:db8::1]:443/tcp").unwrap();
+        assert_eq!((addr.port(), proto), (443, libc::IPPROTO_TCP as u8));
+        assert_eq!(parse_cidr("2001:db8::/48").unwrap().len, 48);
+        assert_eq!(parse_cidr("2001:db8::1").unwrap().len, 128);
+        assert_eq!(parse_cidr("1.2.3.4").unwrap().len, 32);
+        assert!(parse_cidr("2001:db8::/129").is_err());
+        assert!(parse_cidr("1.2.3.0/33").is_err());
+    }
+
+    #[test]
+    fn rejects_v4_mapped_input() {
+        assert!(parse_cidr("::ffff:1.2.3.4/128").is_err());
+        assert!(parse_cidr("::ffff:1.2.3.4").is_err());
+        assert!(parse_socket_addr("[::ffff:1.2.3.4]:25565").is_err());
+        assert!(parse_exclude("[::ffff:1.2.3.4]:443/tcp").is_err());
+        let err = parse_cidr("::ffff:1.2.3.4").unwrap_err().to_string();
+        assert_eq!(err, "write IPv4 addresses as a.b.c.d, not ::ffff:a.b.c.d (in '::ffff:1.2.3.4')");
+    }
+
+    #[test]
+    fn v6_nets_overlapping_ipv4_are_rejected() {
+        for entry in ["::/0", "::/8", "::/64", "::/80"] {
+            let err = format!("{:#}", parse_cidr(entry).unwrap_err());
+            assert!(err.contains(&format!("'{entry}' overlaps ::ffff:0:0/96")), "{err}");
+        }
+        assert!(parse_cidr("::1").is_ok());
+        assert!(parse_cidr("2001:db8::/32").is_ok());
+        assert!(parse_cidr("0.0.0.0/0").is_ok());
+        let mut cfg = Config::default();
+        cfg.ratelimit.allow = vec!["::/0".into()];
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config::default();
+        cfg.blocklist.whitelist = vec!["::/64".into()];
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn ipv6_aggregate_tier() {
+        let cfg = Config::default();
+        assert_eq!(cfg.filter.aggregate_prefix(), Some(48));
+        assert_eq!(cfg.filter.aggregate_limit(10), 80);
+        assert_eq!(cfg.filter.aggregate_limit(u64::MAX), u64::MAX);
+        let parsed: Config = toml::from_str("[filter]\nipv6_aggregate_prefix = 56\nipv6_aggregate_factor = 4").unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(parsed.filter.aggregate_prefix(), Some(56));
+        assert_eq!(parsed.filter.aggregate_limit(10), 40);
+        // equal to the source prefix: the tier is off
+        let mut cfg = Config::default();
+        cfg.filter.ipv6_aggregate_prefix = 64;
+        cfg.validate().unwrap();
+        assert_eq!(cfg.filter.aggregate_prefix(), None);
+        for (prefix, factor) in [(15u8, 8u32), (129, 8), (48, 0), (48, 1025)] {
+            let mut cfg = Config::default();
+            cfg.filter.ipv6_aggregate_prefix = prefix;
+            cfg.filter.ipv6_aggregate_factor = factor;
+            assert!(cfg.validate().is_err(), "{prefix} {factor}");
+        }
+        // longer than the source prefix: the tier is off with a warning,
+        // the config still loads (a failed start would leave no filter)
+        let mut cfg = Config::default();
+        cfg.filter.ipv6_source_prefix = 40;
+        cfg.validate().unwrap();
+        assert_eq!(cfg.filter.aggregate_prefix(), None);
+        assert!(cfg.filter.aggregate_warning().unwrap().contains("ipv6_aggregate_prefix (48) is longer than ipv6_source_prefix (40)"));
+        assert!(Config::default().filter.aggregate_warning().is_none());
+        cfg.filter.ipv6_aggregate_prefix = 32;
+        cfg.validate().unwrap();
+        assert_eq!(cfg.filter.aggregate_prefix(), Some(32));
+        // IPv4-only configs load unchanged
+        let v4: Config = toml::from_str("[filter]\nhit_count = 5").unwrap();
+        v4.validate().unwrap();
+    }
+
+    #[test]
+    fn verified_caps() {
+        let cfg = Config::default();
+        assert_eq!(
+            (cfg.filter.max_verified_per_ipv4, cfg.filter.max_verified_per_ipv6_prefix, cfg.filter.max_verified_per_ipv6_aggregate),
+            (64, 64, 512)
+        );
+        let parsed: Config = toml::from_str("[filter]\nmax_verified_per_ipv4 = 0\nmax_verified_per_ipv6_aggregate = 1048576").unwrap();
+        parsed.validate().unwrap();
+        let mut cfg = Config::default();
+        cfg.filter.max_verified_per_ipv6_prefix = (1 << 20) + 1;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn ipv6_source_prefix_validation() {
+        let mut ok = Config::default();
+        ok.filter.ipv6_source_prefix = 32;
+        assert!(ok.validate().is_ok());
+        let mut cfg = Config::default();
+        assert_eq!(cfg.filter.ipv6_source_prefix, 64);
+        cfg.filter.ipv6_source_prefix = 31;
+        assert!(cfg.validate().is_err());
+        cfg.filter.ipv6_source_prefix = 129;
+        assert!(cfg.validate().is_err());
+        cfg.filter.ipv6_source_prefix = 128;
+        assert!(cfg.validate().is_ok());
     }
 }

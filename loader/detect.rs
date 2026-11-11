@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -22,6 +22,7 @@ use anyhow::{Result, bail};
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
+use crate::addr::Net;
 use crate::config::{AutodetectConfig, Config, parse_cidr, parse_exclude};
 use crate::shutdown::Shutdown;
 use crate::targets::{DstKey, Kind, PROTO_TCP, PROTO_UDP, Source, Targets};
@@ -59,7 +60,7 @@ struct Candidate {
 /// Probe history of one destination.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Record {
-    addr: SocketAddrV4,
+    addr: SocketAddr,
     proto: u8,
     /// Detected kind, None while it never answered a probe.
     kind: Option<Kind2>,
@@ -90,7 +91,7 @@ impl From<Kind2> for Kind {
 /// Which destinations may be probed at all.
 #[derive(Clone)]
 struct Scope {
-    networks: Vec<(u32, u32)>,
+    networks: Vec<Net>,
     min_port: u16,
     exclude_ports: HashSet<u16>,
     exclude: HashSet<DstKey>,
@@ -101,9 +102,7 @@ impl Scope {
         let auto = &config.autodetect;
         let mut networks = Vec::new();
         for network in &auto.networks {
-            let (addr, len) = parse_cidr(network)?;
-            let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
-            networks.push((u32::from(addr) & mask, mask));
+            networks.push(parse_cidr(network)?);
         }
         let mut exclude = HashSet::new();
         for entry in &config.targets.exclude {
@@ -118,16 +117,14 @@ impl Scope {
         })
     }
 
-    fn contains_ip(&self, ip: Ipv4Addr) -> bool {
-        let ip = u32::from(ip);
-        self.networks.iter().any(|&(net, mask)| ip & mask == net)
+    fn contains_ip(&self, ip: IpAddr) -> bool {
+        self.networks.iter().any(|n| n.contains(ip))
     }
 
     fn allows(&self, key: &DstKey) -> bool {
-        let addr = key.addr();
-        self.contains_ip(*addr.ip())
-            && addr.port() >= self.min_port
-            && !self.exclude_ports.contains(&addr.port())
+        self.contains_ip(key.ip().to_ip())
+            && key.port() >= self.min_port
+            && !self.exclude_ports.contains(&key.port())
             && !self.exclude.contains(key)
     }
 }
@@ -154,26 +151,28 @@ pub fn start(
     }
 
     for interface in &auto.sniff_interfaces {
-        // detection is an add-on: a missing interface must never keep the
-        // filter itself from running
-        let socket = match Sniffer::open(interface) {
-            Ok(socket) => socket,
-            Err(e) => {
-                warn!("Not sniffing on '{interface}': {e:#}");
-                continue;
-            }
-        };
-        info!("Auto detection sniffing server replies on {interface}");
-        let (scope, tx, shutdown) = (scope.clone(), tx.clone(), shutdown.clone());
-        let online = config
-            .filter
-            .online_mode_check
-            .then(|| (targets.clone(), config.filter.online_mode_cache_secs * 1_000_000_000));
-        handles.push(
-            thread::Builder::new()
-                .name(format!("detect-{interface}"))
-                .spawn(move || sniff_loop(socket, scope, tx, online, shutdown))?,
-        );
+        for (family, prefix) in [(Family::V4, "sniff"), (Family::V6, "sniff6")] {
+            // detection is an add-on: a missing interface must never keep the
+            // filter itself from running
+            let socket = match Sniffer::open(interface, family) {
+                Ok(socket) => socket,
+                Err(e) => {
+                    warn!("Not sniffing {} on '{interface}': {e:#}", family.name());
+                    continue;
+                }
+            };
+            info!("Auto detection sniffing {} server replies on {interface}", family.name());
+            let (scope, tx, shutdown) = (scope.clone(), tx.clone(), shutdown.clone());
+            let online = config
+                .filter
+                .online_mode_check
+                .then(|| (targets.clone(), config.filter.online_mode_cache_secs * 1_000_000_000));
+            handles.push(
+                thread::Builder::new()
+                    .name(format!("{prefix}-{interface}"))
+                    .spawn(move || sniff_loop(socket, scope, tx, online, shutdown))?,
+            );
+        }
     }
     drop(tx);
 
@@ -399,7 +398,7 @@ fn read_varint(stream: &mut impl Read) -> Option<i32> {
 }
 
 /// Builds handshake (next state status) + status request.
-fn java_status_request(addr: SocketAddrV4) -> Vec<u8> {
+fn java_status_request(addr: SocketAddr) -> Vec<u8> {
     let host = addr.ip().to_string();
     let mut handshake = vec![0x00];
     write_varint(&mut handshake, -1); // protocol version: "just asking"
@@ -416,9 +415,9 @@ fn java_status_request(addr: SocketAddrV4) -> Vec<u8> {
 }
 
 /// True if `addr` answers a java status ping with a status JSON.
-fn probe_java(addr: SocketAddrV4, timeout: Duration) -> bool {
+fn probe_java(addr: SocketAddr, timeout: Duration) -> bool {
     let result = (|| -> Option<bool> {
-        let mut stream = TcpStream::connect_timeout(&SocketAddr::V4(addr), timeout).ok()?;
+        let mut stream = TcpStream::connect_timeout(&addr, timeout).ok()?;
         stream.set_read_timeout(Some(timeout)).ok()?;
         stream.set_write_timeout(Some(timeout)).ok()?;
         stream.write_all(&java_status_request(addr)).ok()?;
@@ -444,9 +443,9 @@ fn probe_java(addr: SocketAddrV4, timeout: Duration) -> bool {
 }
 
 /// True if `addr` answers a RakNet unconnected ping with a pong.
-fn probe_bedrock(addr: SocketAddrV4, timeout: Duration) -> bool {
+fn probe_bedrock(addr: SocketAddr, timeout: Duration) -> bool {
     let result = (|| -> Option<bool> {
-        let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+        let socket = UdpSocket::bind(if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).ok()?;
         socket.set_read_timeout(Some(timeout)).ok()?;
         socket.connect(addr).ok()?;
         let mut ping = vec![RAKNET_UNCONNECTED_PING];
@@ -479,7 +478,7 @@ fn is_raknet_pong(payload: &[u8]) -> bool {
 
 fn socket_scan_loop(scope: Scope, tx: Sender<Candidate>, shutdown: Arc<Shutdown>) {
     loop {
-        let local_ips: Vec<Ipv4Addr> = local_ipv4s()
+        let local_ips: Vec<IpAddr> = local_ips()
             .into_iter()
             .filter(|ip| scope.contains_ip(*ip))
             .collect();
@@ -492,9 +491,17 @@ fn socket_scan_loop(scope: Scope, tx: Sender<Candidate>, shutdown: Arc<Shutdown>
                     continue;
                 };
                 for (ip, port) in parse_listeners(&contents, proto) {
-                    let ips = if ip.is_unspecified() { local_ips.clone() } else { vec![ip] };
+                    // 0.0.0.0 covers the local IPv4 addresses, :: (dual
+                    // stack) all local addresses
+                    let ips: Vec<IpAddr> = match ip {
+                        IpAddr::V4(v4) if v4.is_unspecified() => {
+                            local_ips.iter().copied().filter(IpAddr::is_ipv4).collect()
+                        }
+                        IpAddr::V6(v6) if v6.is_unspecified() => local_ips.clone(),
+                        ip => vec![ip],
+                    };
                     for ip in ips {
-                        let key = DstKey::new(SocketAddrV4::new(ip, port), proto);
+                        let key = DstKey::new(SocketAddr::new(ip, port), proto);
                         if scope.allows(&key) && tx.send(Candidate { key, hint: None }).is_err() {
                             return;
                         }
@@ -508,10 +515,10 @@ fn socket_scan_loop(scope: Scope, tx: Sender<Candidate>, shutdown: Arc<Shutdown>
     }
 }
 
-/// Listening (TCP state 0A) / unconnected bound (UDP state 07) IPv4 sockets
-/// of a /proc/net/{tcp,udp}[6] table. IPv6 sockets count when they are bound
-/// to :: (dual stack) or to a v4-mapped address.
-fn parse_listeners(contents: &str, proto: u8) -> Vec<(Ipv4Addr, u16)> {
+/// Listening (TCP state 0A) / unconnected bound (UDP state 07) sockets of a
+/// /proc/net/{tcp,udp}[6] table. v4-mapped addresses are reported as IPv4,
+/// :: as the IPv6 unspecified address (dual stack).
+fn parse_listeners(contents: &str, proto: u8) -> Vec<(IpAddr, u16)> {
     let wanted_state = if proto == PROTO_TCP { "0A" } else { "07" };
     let mut listeners = Vec::new();
     for line in contents.lines().skip(1) {
@@ -526,19 +533,24 @@ fn parse_listeners(contents: &str, proto: u8) -> Vec<(Ipv4Addr, u16)> {
             continue;
         };
         let ip = match addr.len() {
-            8 => u32::from_str_radix(addr, 16).ok().map(|v| Ipv4Addr::from(v.to_le_bytes())),
+            8 => u32::from_str_radix(addr, 16).ok().map(|v| IpAddr::V4(Ipv4Addr::from(v.to_le_bytes()))),
             32 => {
-                // four native endian u32 words
-                let words: Vec<u32> = (0..4)
-                    .filter_map(|i| u32::from_str_radix(&addr[i * 8..i * 8 + 8], 16).ok())
-                    .collect();
-                match words.as_slice() {
-                    [0, 0, 0, 0] => Some(Ipv4Addr::UNSPECIFIED),
-                    [0, 0, mapped, v4] if mapped.to_le_bytes() == [0, 0, 0xff, 0xff] => {
-                        Some(Ipv4Addr::from(v4.to_le_bytes()))
+                let mut octets = [0u8; 16];
+                let mut valid = true;
+                for (i, chunk) in addr.as_bytes().chunks(8).enumerate() {
+                    let word = std::str::from_utf8(chunk).ok().and_then(|c| u32::from_str_radix(c, 16).ok());
+                    match word {
+                        Some(word) => octets[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes()),
+                        None => valid = false,
                     }
-                    _ => None,
                 }
+                valid.then(|| {
+                    let v6 = Ipv6Addr::from(octets);
+                    match v6.to_ipv4_mapped() {
+                        Some(v4) => IpAddr::V4(v4),
+                        None => IpAddr::V6(v6),
+                    }
+                })
             }
             _ => None,
         };
@@ -549,7 +561,7 @@ fn parse_listeners(contents: &str, proto: u8) -> Vec<(Ipv4Addr, u16)> {
     listeners
 }
 
-fn local_ipv4s() -> Vec<Ipv4Addr> {
+fn local_ips() -> Vec<IpAddr> {
     let mut ips = Vec::new();
     let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs allocates the list, freed below with freeifaddrs.
@@ -565,7 +577,15 @@ fn local_ipv4s() -> Vec<Ipv4Addr> {
             let family = unsafe { (*entry.ifa_addr).sa_family } as i32;
             if family == libc::AF_INET {
                 let sin = unsafe { &*(entry.ifa_addr as *const libc::sockaddr_in) };
-                ips.push(Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes()));
+                ips.push(IpAddr::V4(Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes())));
+            } else if family == libc::AF_INET6 {
+                // SAFETY: the family says sockaddr_in6.
+                let sin6 = unsafe { &*(entry.ifa_addr as *const libc::sockaddr_in6) };
+                let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+                // link-local addresses are not routable targets
+                if ip.segments()[0] & 0xffc0 != 0xfe80 {
+                    ips.push(IpAddr::V6(ip));
+                }
             }
         }
         current = entry.ifa_next;
@@ -578,6 +598,21 @@ fn local_ipv4s() -> Vec<Ipv4Addr> {
 /* ------------------------------------------------------------------------
  * Candidate sources: replies of remote servers on the sniff interfaces
  * --------------------------------------------------------------------- */
+
+#[derive(Copy, Clone)]
+enum Family {
+    V4,
+    V6,
+}
+
+impl Family {
+    fn name(self) -> &'static str {
+        match self {
+            Family::V4 => "IPv4",
+            Family::V6 => "IPv6",
+        }
+    }
+}
 
 /// AF_PACKET socket that only receives TCP SYN-ACKs and RakNet pongs.
 struct Sniffer {
@@ -592,14 +627,18 @@ impl Drop for Sniffer {
 }
 
 impl Sniffer {
-    fn open(interface: &str) -> Result<Self> {
+    fn open(interface: &str, family: Family) -> Result<Self> {
         let name = std::ffi::CString::new(interface)?;
         // SAFETY: plain libc calls with checked results.
         let ifindex = unsafe { libc::if_nametoindex(name.as_ptr()) };
         if ifindex == 0 {
             bail!("interface not found");
         }
-        let protocol = (libc::ETH_P_IP as u16).to_be() as i32;
+        let protocol = (match family {
+            Family::V4 => libc::ETH_P_IP,
+            Family::V6 => libc::ETH_P_IPV6,
+        } as u16)
+            .to_be() as i32;
         // SOCK_DGRAM: packets start at the IP header on every link type
         let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, protocol) };
         if fd < 0 {
@@ -616,7 +655,7 @@ impl Sniffer {
         // the length varint); and UDP datagrams whose payload starts with the
         // RakNet pong id. 256 bytes are enough for the headers and the pong
         // magic
-        let filter: [libc::sock_filter; 27] = [
+        let filter_v4: [libc::sock_filter; 27] = [
             bpf(0x30, 0, 0, 9),              // 0: ldb [9]            ip protocol
             bpf(0x15, 0, 17, 6),             // 1: tcp ? 2 : 19
             bpf(0x28, 0, 0, 6),              // 2: ldh [6]            frag_off
@@ -645,6 +684,35 @@ impl Sniffer {
             bpf(0x06, 0, 0, 256),            // 25: accept
             bpf(0x06, 0, 0, 0),              // 26: reject
         ];
+        // IPv6: next header at [6], l4 at 40. Packets with extension headers
+        // are not sampled (servers do not send them on replies)
+        let filter_v6: [libc::sock_filter; 21] = [
+            bpf(0x30, 0, 0, 6),              // 0: ldb [6]            next header
+            bpf(0x15, 0, 14, 6),             // 1: tcp ? 2 : 16
+            bpf(0x30, 0, 0, 40 + 13),        // 2: ldb [53]           tcp flags
+            bpf(0x54, 0, 0, 0x12),           // 3: and #SYN|ACK
+            bpf(0x15, 1, 0, 0x12),           // 4: SYN-ACK -> 6
+            bpf(0x15, 0, 3, 0x02),           // 5: SYN ? 6 : 9
+            bpf(0x20, 0, 0, 0xffff_f038),    // 6: ld rand            (SKF_AD_RANDOM)
+            bpf(0x54, 0, 0, 3),              // 7: and #3
+            bpf(0x15, 10, 11, 0),            // 8: 1 in 4 -> 19 accept : 20 reject
+            bpf(0x30, 0, 0, 40 + 12),        // 9: ldb [52]           data offset
+            bpf(0x74, 0, 0, 4),              // 10: rsh #4
+            bpf(0x64, 0, 0, 2),              // 11: lsh #2            tcp header length
+            bpf(0x04, 0, 0, 40),             // 12: add #40           -> payload offset
+            bpf(0x07, 0, 0, 0),              // 13: tax
+            bpf(0x40, 0, 0, 2),              // 14: ld [x+2]          payload bytes 2..5
+            bpf(0x15, 3, 4, 0x0100_a201),    // 15: encryption request ? 19 : 20
+            bpf(0x15, 0, 3, 17),             // 16: udp ? 17 : 20     (A is still the next header)
+            bpf(0x30, 0, 0, 40 + 8),         // 17: ldb [48]          first payload byte
+            bpf(0x15, 0, 1, RAKNET_UNCONNECTED_PONG as u32), // 18: pong ? 19 : 20
+            bpf(0x06, 0, 0, 256),            // 19: accept
+            bpf(0x06, 0, 0, 0),              // 20: reject
+        ];
+        let filter: &[libc::sock_filter] = match family {
+            Family::V4 => &filter_v4,
+            Family::V6 => &filter_v6,
+        };
         let program = libc::sock_fprog {
             len: filter.len() as u16,
             filter: filter.as_ptr() as *mut libc::sock_filter,
@@ -775,34 +843,51 @@ enum Observation {
     /// A server reply (SYN-ACK, RakNet pong): its source is a server.
     Reply(Candidate),
     /// A client connection attempt to `key`, from `source`.
-    Syn { key: DstKey, source: Ipv4Addr },
+    Syn { key: DstKey, source: IpAddr },
     /// The java server `key` asked a client for encryption: online mode.
     OnlineMode(DstKey),
 }
 
 fn parse_observation(packet: &[u8]) -> Option<Observation> {
-    if packet.len() < 20 || packet[0] >> 4 != 4 {
-        return None;
-    }
-    let ihl = ((packet[0] & 0x0f) as usize) * 4;
-    let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
-    let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-    let l4 = packet.get(ihl..)?;
+    let (src, dst, proto, l4): (IpAddr, IpAddr, u8, &[u8]) = match packet.first()? >> 4 {
+        4 => {
+            if packet.len() < 20 {
+                return None;
+            }
+            let ihl = ((packet[0] & 0x0f) as usize) * 4;
+            (
+                IpAddr::V4(Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15])),
+                IpAddr::V4(Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19])),
+                packet[9],
+                packet.get(ihl..)?,
+            )
+        }
+        6 => {
+            if packet.len() < 40 {
+                return None;
+            }
+            let src: [u8; 16] = packet[8..24].try_into().ok()?;
+            let dst: [u8; 16] = packet[24..40].try_into().ok()?;
+            // the sniff filter only accepts packets without extension headers
+            (IpAddr::V6(src.into()), IpAddr::V6(dst.into()), packet[6], &packet[40..])
+        }
+        _ => return None,
+    };
     let sport = u16::from_be_bytes([*l4.first()?, *l4.get(1)?]);
-    match packet[9] {
+    match proto {
         6 => {
             let dport = u16::from_be_bytes([*l4.get(2)?, *l4.get(3)?]);
             let doff = ((*l4.get(12)? >> 4) as usize) * 4;
             if l4.get(doff + 2..doff + 6) == Some(&[0x01, 0x00, 0xa2, 0x01][..]) {
-                return Some(Observation::OnlineMode(DstKey::new(SocketAddrV4::new(src, sport), PROTO_TCP)));
+                return Some(Observation::OnlineMode(DstKey::new(SocketAddr::new(src, sport), PROTO_TCP)));
             }
             match *l4.get(13)? & 0x12 {
                 0x12 => Some(Observation::Reply(Candidate {
-                    key: DstKey::new(SocketAddrV4::new(src, sport), PROTO_TCP),
+                    key: DstKey::new(SocketAddr::new(src, sport), PROTO_TCP),
                     hint: Some(Kind::Java),
                 })),
                 0x02 => Some(Observation::Syn {
-                    key: DstKey::new(SocketAddrV4::new(dst, dport), PROTO_TCP),
+                    key: DstKey::new(SocketAddr::new(dst, dport), PROTO_TCP),
                     source: src,
                 }),
                 _ => None,
@@ -810,7 +895,7 @@ fn parse_observation(packet: &[u8]) -> Option<Observation> {
         }
         17 => is_raknet_pong(l4.get(8..)?).then(|| {
             Observation::Reply(Candidate {
-                key: DstKey::new(SocketAddrV4::new(src, sport), PROTO_UDP),
+                key: DstKey::new(SocketAddr::new(src, sport), PROTO_UDP),
                 hint: Some(Kind::Bedrock),
             })
         }),
@@ -821,12 +906,12 @@ fn parse_observation(packet: &[u8]) -> Option<Observation> {
 /// Counts distinct client sources per destination, see SYN_GATE_SOURCES.
 #[derive(Default)]
 struct SynGate {
-    seen: HashMap<DstKey, (Instant, Vec<Ipv4Addr>)>,
+    seen: HashMap<DstKey, (Instant, Vec<IpAddr>)>,
 }
 
 impl SynGate {
     /// Records a SYN; true exactly when `key` reaches the source threshold.
-    fn passes(&mut self, key: DstKey, source: Ipv4Addr, now: Instant) -> bool {
+    fn passes(&mut self, key: DstKey, source: IpAddr, now: Instant) -> bool {
         if self.seen.len() >= SYN_GATE_MAX && !self.seen.contains_key(&key) {
             self.seen.retain(|_, (first, _)| now.duration_since(*first) < SYN_GATE_WINDOW);
             if self.seen.len() >= SYN_GATE_MAX {
@@ -878,8 +963,8 @@ mod tests {
         assert_eq!(
             parse_listeners(tcp, PROTO_TCP),
             vec![
-                (Ipv4Addr::new(93, 80, 5, 2), 0x63dd),
-                (Ipv4Addr::UNSPECIFIED, 8080)
+                (IpAddr::V4(Ipv4Addr::new(93, 80, 5, 2)), 0x63dd),
+                (IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080)
             ]
         );
         let tcp6 = "  sl  local_address rem_address st\n\
@@ -888,8 +973,8 @@ mod tests {
         assert_eq!(
             parse_listeners(tcp6, PROTO_TCP),
             vec![
-                (Ipv4Addr::UNSPECIFIED, 0x63dd),
-                (Ipv4Addr::new(93, 80, 5, 2), 0x63de)
+                (IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0x63dd),
+                (IpAddr::V4(Ipv4Addr::new(93, 80, 5, 2)), 0x63de)
             ]
         );
     }
@@ -925,7 +1010,7 @@ mod tests {
         let key = DstKey::new("85.93.5.80:25565".parse().unwrap(), PROTO_TCP);
         let mut gate = SynGate::default();
         let now = Instant::now();
-        let ip = |n| Ipv4Addr::new(1, 2, 3, n);
+        let ip = |n| IpAddr::V4(Ipv4Addr::new(1, 2, 3, n));
         assert!(!gate.passes(key, ip(1), now));
         assert!(!gate.passes(key, ip(1), now)); // same source again
         assert!(!gate.passes(key, ip(2), now));
@@ -967,10 +1052,91 @@ mod tests {
         match parse_observation(&syn) {
             Some(Observation::Syn { key, source }) => {
                 assert_eq!(key.to_string(), "85.93.5.80:25565/tcp");
-                assert_eq!(source, Ipv4Addr::new(1, 2, 3, 4));
+                assert_eq!(source, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
             }
             _ => panic!("expected a syn observation"),
         }
+    }
+
+    fn v6_packet(next: u8, l4: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; 40];
+        p[0] = 0x60;
+        p[4..6].copy_from_slice(&(l4.len() as u16).to_be_bytes());
+        p[6] = next;
+        p[7] = 64;
+        p[8..24].copy_from_slice(&"2001:db8::10".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        p[24..40].copy_from_slice(&"2001:db8::20".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        p.extend_from_slice(l4);
+        p
+    }
+
+    #[test]
+    fn parses_v6_syn_ack() {
+        let mut tcp = vec![0u8; 20];
+        tcp[0..2].copy_from_slice(&25565u16.to_be_bytes());
+        tcp[2..4].copy_from_slice(&40000u16.to_be_bytes());
+        tcp[12] = 5 << 4;
+        tcp[13] = 0x12;
+        let c = parse_server_reply(&v6_packet(6, &tcp)).unwrap();
+        assert_eq!(c.key.to_string(), "[2001:db8::10]:25565/tcp");
+    }
+
+    #[test]
+    fn parses_v6_client_syn() {
+        let mut tcp = vec![0u8; 20];
+        tcp[0..2].copy_from_slice(&40000u16.to_be_bytes());
+        tcp[2..4].copy_from_slice(&25565u16.to_be_bytes());
+        tcp[12] = 5 << 4;
+        tcp[13] = 0x02;
+        match parse_observation(&v6_packet(6, &tcp)) {
+            Some(Observation::Syn { key, source }) => {
+                assert_eq!(key.to_string(), "[2001:db8::20]:25565/tcp");
+                assert_eq!(source.to_string(), "2001:db8::10");
+            }
+            _ => panic!("expected a syn"),
+        }
+    }
+
+    #[test]
+    fn ignores_v6_with_extension_headers() {
+        let mut ext = vec![6u8, 0, 0, 0, 0, 0, 0, 0];
+        ext.extend_from_slice(&[0u8; 20]);
+        assert!(parse_observation(&v6_packet(0, &ext)).is_none());
+    }
+
+    #[test]
+    fn parses_v6_listeners() {
+        // /proc/net/tcp6: 2001:db8::10 port 25565 (0x63DD) listening (0A)
+        let table = "  sl  local_address                         remote_address                        st\n   0: B80D0120000000000000000010000000:63DD 00000000000000000000000000000000:0000 0A\n";
+        assert_eq!(parse_listeners(table, PROTO_TCP), vec![("2001:db8::10".parse().unwrap(), 0x63dd)]);
+    }
+
+    #[test]
+    fn old_state_file_records_still_load() {
+        let old = r#"{"addr":"85.93.5.1:25565","proto":6,"kind":"java","last_ok":1700000000}"#;
+        let record: Record = serde_json::from_str(old).unwrap();
+        assert_eq!(record.addr.to_string(), "85.93.5.1:25565");
+        let v6 = Record { addr: "[2001:db8::10]:19132".parse().unwrap(), ..record };
+        let text = serde_json::to_string(&v6).unwrap();
+        assert!(text.contains(r#""addr":"[2001:db8::10]:19132""#));
+    }
+
+    #[test]
+    fn scope_handles_both_families() {
+        let config: Config = toml::from_str("[autodetect]\nnetworks = [\"85.93.5.0/24\", \"2001:db8::/32\"]").unwrap();
+        let scope = Scope::new(&config).unwrap();
+        let key = |s: &str, proto| DstKey::new(s.parse().unwrap(), proto);
+        assert!(scope.allows(&key("[2001:db8::10]:25565", PROTO_TCP)));
+        assert!(!scope.allows(&key("[2001:dead::10]:25565", PROTO_TCP)));
+        assert!(scope.allows(&key("85.93.5.80:25565", PROTO_TCP)));
+    }
+
+    #[test]
+    fn scope_v6_key_never_maps_to_v4() {
+        let config: Config = toml::from_str("[autodetect]\nnetworks = [\"0.0.0.0/0\"]").unwrap();
+        let scope = Scope::new(&config).unwrap();
+        let key = DstKey::new("[2001:db8::10]:25565".parse().unwrap(), PROTO_TCP);
+        assert!(!scope.allows(&key));
     }
 
     #[test]
