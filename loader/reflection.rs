@@ -1,6 +1,5 @@
 //! Userspace side of the UDP reflection protection (see xdp/reflection.h).
 
-use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -8,12 +7,12 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use aya::Ebpf;
 use aya::Pod;
-use aya::maps::lpm_trie::{Key, LpmTrie};
+use aya::maps::lpm_trie::LpmTrie;
 use aya::maps::{Array, MapData, PerCpuHashMap};
 use aya::programs::{SchedClassifier, TcAttachType};
-use log::{error, info, warn};
+use log::{error, info};
 
-use crate::addr::Net;
+use crate::addr::{Addr6, lpm_key};
 use crate::config::{Config, ProtectionMode, parse_cidr};
 use crate::shutdown::Shutdown;
 
@@ -43,16 +42,17 @@ unsafe impl Pod for PortBitmap {}
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct ReflectionKey {
-    daddr: u32,
+    daddr: Addr6,
     sport: u16,
     pad: u16,
 }
-// SAFETY: repr(C) struct of plain integers without padding.
+// SAFETY: repr(C) struct of plain integers without padding (16 + 2 + 2).
 unsafe impl Pod for ReflectionKey {}
+const _: () = assert!(std::mem::size_of::<ReflectionKey>() == 20);
 
 impl ReflectionKey {
-    pub fn daddr(&self) -> Ipv4Addr {
-        Ipv4Addr::from(self.daddr.to_ne_bytes())
+    pub fn daddr(&self) -> Addr6 {
+        self.daddr
     }
 
     pub fn sport(&self) -> u16 {
@@ -114,17 +114,12 @@ pub fn setup(
         return Ok(None);
     }
 
-    let mut networks: LpmTrie<MapData, u32, u8> = LpmTrie::try_from(
+    let mut networks: LpmTrie<MapData, Addr6, u8> = LpmTrie::try_from(
         ebpf.take_map("reflection_networks")
             .context("can't take map 'reflection_networks'")?,
     )?;
     for network in &refl.networks {
-        let Net { addr: IpAddr::V4(addr), len } = parse_cidr(network)? else {
-            warn!("[reflection] networks: IPv6 network '{network}' ignored, IPv6 not supported yet");
-            continue;
-        };
-        let key = Key::new(len as u32, u32::from_ne_bytes(addr.octets()));
-        networks.insert(&key, 1, 0)?;
+        networks.insert(&lpm_key(&parse_cidr(network)?), 1, 0)?;
     }
 
     let mut bitmap = PortBitmap { bits: [0; 1024] };

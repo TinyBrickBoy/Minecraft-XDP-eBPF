@@ -13,7 +13,6 @@ mod shutdown;
 mod targets;
 mod unused;
 
-use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +20,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use aya::maps::HashMap;
-use log::{error, info, warn};
+use log::{error, info};
 
 use config::Config;
 use shutdown::Shutdown;
@@ -161,8 +160,12 @@ fn run(args: &Args, config: &Config, shutdown: &Arc<Shutdown>) -> Result<()> {
     let map = ebpf
         .take_map("protected_targets")
         .context("can't take map 'protected_targets'")?;
+    let addrs = ebpf
+        .take_map("protected_addrs")
+        .context("can't take map 'protected_addrs'")?;
     let targets = Arc::new(Targets::new(
         HashMap::try_from(map)?,
+        HashMap::try_from(addrs)?,
         config.filter.adopt_grace_secs,
     ));
     apply_config_targets(config, &targets)?;
@@ -275,18 +278,12 @@ fn apply_config_targets(config: &Config, targets: &Targets) -> Result<()> {
         (&config.targets.bedrock, Kind::Bedrock),
     ] {
         for entry in entries {
-            let SocketAddr::V4(addr) = config::parse_socket_addr(entry)? else {
-                warn!("[targets] IPv6 entry '{entry}' ignored, IPv6 not supported yet");
-                continue;
-            };
+            let addr = config::parse_socket_addr(entry)?;
             targets.set(DstKey::new(addr, kind.proto()), kind, Source::Static)?;
         }
     }
     for entry in &config.targets.exclude {
-        let (SocketAddr::V4(addr), proto) = config::parse_exclude(entry)? else {
-            warn!("[targets] exclude: IPv6 entry '{entry}' ignored, IPv6 not supported yet");
-            continue;
-        };
+        let (addr, proto) = config::parse_exclude(entry)?;
         targets.set(DstKey::new(addr, proto), Kind::None, Source::Exclude)?;
     }
     Ok(())

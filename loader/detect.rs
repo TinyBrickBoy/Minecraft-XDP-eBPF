@@ -97,6 +97,15 @@ struct Scope {
     exclude: HashSet<DstKey>,
 }
 
+/// Auto detection is IPv4 only until it is migrated; its scope never admits
+/// an IPv6 key.
+fn addr4(key: &DstKey) -> SocketAddrV4 {
+    match key.addr() {
+        SocketAddr::V4(addr) => addr,
+        SocketAddr::V6(addr) => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, addr.port()),
+    }
+}
+
 impl Scope {
     fn new(config: &Config) -> Result<Self> {
         let auto = &config.autodetect;
@@ -115,7 +124,7 @@ impl Scope {
                 warn!("[targets] exclude: IPv6 entry '{entry}' ignored, IPv6 not supported yet");
                 continue;
             };
-            exclude.insert(DstKey::new(addr, proto));
+            exclude.insert(DstKey::new(addr.into(), proto));
         }
         Ok(Self {
             networks,
@@ -131,7 +140,7 @@ impl Scope {
     }
 
     fn allows(&self, key: &DstKey) -> bool {
-        let addr = key.addr();
+        let addr = addr4(key);
         self.contains_ip(*addr.ip())
             && addr.port() >= self.min_port
             && !self.exclude_ports.contains(&addr.port())
@@ -237,7 +246,7 @@ impl Prober {
         };
         for record in records {
             let Ok(record) = serde_json::from_value::<Record>(record) else { continue };
-            let key = DstKey::new(record.addr, record.proto);
+            let key = DstKey::new(record.addr.into(), record.proto);
             if !self.scope.allows(&key) {
                 continue;
             }
@@ -307,8 +316,8 @@ impl Prober {
         let now = unix_now();
         let timeout = Duration::from_millis(self.config.probe_timeout_ms);
         let detected = match key.proto() {
-            PROTO_TCP => probe_java(key.addr(), timeout).then_some(Kind2::Java),
-            PROTO_UDP => probe_bedrock(key.addr(), timeout).then_some(Kind2::Bedrock),
+            PROTO_TCP => probe_java(addr4(&key), timeout).then_some(Kind2::Java),
+            PROTO_UDP => probe_bedrock(addr4(&key), timeout).then_some(Kind2::Bedrock),
             _ => None,
         };
 
@@ -321,7 +330,7 @@ impl Prober {
             }
         }
         let record = self.records.entry(key).or_insert(Record {
-            addr: key.addr(),
+            addr: addr4(&key),
             proto: key.proto(),
             kind: None,
             last_ok: 0,
@@ -501,7 +510,7 @@ fn socket_scan_loop(scope: Scope, tx: Sender<Candidate>, shutdown: Arc<Shutdown>
                 for (ip, port) in parse_listeners(&contents, proto) {
                     let ips = if ip.is_unspecified() { local_ips.clone() } else { vec![ip] };
                     for ip in ips {
-                        let key = DstKey::new(SocketAddrV4::new(ip, port), proto);
+                        let key = DstKey::new(SocketAddrV4::new(ip, port).into(), proto);
                         if scope.allows(&key) && tx.send(Candidate { key, hint: None }).is_err() {
                             return;
                         }
@@ -801,15 +810,15 @@ fn parse_observation(packet: &[u8]) -> Option<Observation> {
             let dport = u16::from_be_bytes([*l4.get(2)?, *l4.get(3)?]);
             let doff = ((*l4.get(12)? >> 4) as usize) * 4;
             if l4.get(doff + 2..doff + 6) == Some(&[0x01, 0x00, 0xa2, 0x01][..]) {
-                return Some(Observation::OnlineMode(DstKey::new(SocketAddrV4::new(src, sport), PROTO_TCP)));
+                return Some(Observation::OnlineMode(DstKey::new(SocketAddrV4::new(src, sport).into(), PROTO_TCP)));
             }
             match *l4.get(13)? & 0x12 {
                 0x12 => Some(Observation::Reply(Candidate {
-                    key: DstKey::new(SocketAddrV4::new(src, sport), PROTO_TCP),
+                    key: DstKey::new(SocketAddrV4::new(src, sport).into(), PROTO_TCP),
                     hint: Some(Kind::Java),
                 })),
                 0x02 => Some(Observation::Syn {
-                    key: DstKey::new(SocketAddrV4::new(dst, dport), PROTO_TCP),
+                    key: DstKey::new(SocketAddrV4::new(dst, dport).into(), PROTO_TCP),
                     source: src,
                 }),
                 _ => None,
@@ -817,7 +826,7 @@ fn parse_observation(packet: &[u8]) -> Option<Observation> {
         }
         17 => is_raknet_pong(l4.get(8..)?).then(|| {
             Observation::Reply(Candidate {
-                key: DstKey::new(SocketAddrV4::new(src, sport), PROTO_UDP),
+                key: DstKey::new(SocketAddrV4::new(src, sport).into(), PROTO_UDP),
                 hint: Some(Kind::Bedrock),
             })
         }),

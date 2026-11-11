@@ -9,7 +9,6 @@
 //! every 15 s, bedrock clients far more often.
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
@@ -18,23 +17,24 @@ use aya::maps::{HashMap as BpfHashMap, MapData};
 use log::debug;
 use prometheus::{IntGauge, IntGaugeVec, register_int_gauge, register_int_gauge_vec};
 
+use crate::addr::Addr6;
 use crate::targets::Targets;
 
 /// A connection without new packets for this long is no longer counted.
 const ACTIVE_WINDOW: Duration = Duration::from_secs(30);
 
-/// Userspace mirror of `struct ipv4_flow_key` (xdp/common.h), network byte order.
+/// Userspace mirror of `struct flow_key` (xdp/common.h), network byte order.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FlowKey {
-    src_ip: u32,
-    dst_ip: u32,
+    src: Addr6,
+    dst: Addr6,
     src_port: u16,
     dst_port: u16,
 }
-// SAFETY: repr(C) struct of plain integers without padding.
+// SAFETY: repr(C) struct of plain integers without padding (16 + 16 + 2 + 2).
 unsafe impl Pod for FlowKey {}
-const _: () = assert!(std::mem::size_of::<FlowKey>() == 12);
+const _: () = assert!(std::mem::size_of::<FlowKey>() == 36);
 
 /// Userspace mirror of `struct player_entry` (xdp/minecraft_filter.c). The
 /// bpf_timer is opaque (the kernel zeroes it when copying to userspace).
@@ -80,7 +80,7 @@ impl Tracker {
     pub fn publish(&mut self, map: &PlayerMap, targets: &Targets) {
         let now = Instant::now();
         let mut current: HashMap<FlowKey, (u64, Instant)> = HashMap::with_capacity(self.seen.len());
-        let mut per_dst: HashMap<(u32, u16), i64> = HashMap::new();
+        let mut per_dst: HashMap<(Addr6, u16), i64> = HashMap::new();
         for entry in map.iter() {
             let Ok((key, value)) = entry else {
                 continue; // removed by the idle timer mid-iteration
@@ -91,16 +91,15 @@ impl Tracker {
             };
             current.insert(key, (value.packets, changed));
             if now.duration_since(changed) <= ACTIVE_WINDOW {
-                *per_dst.entry((key.dst_ip, key.dst_port)).or_default() += 1;
+                *per_dst.entry((key.dst, key.dst_port)).or_default() += 1;
             }
         }
         self.seen = current;
 
         // proto and kind of every destination from the protected targets
-        let mut kinds: HashMap<(u32, u16), (&'static str, &'static str)> = HashMap::new();
+        let mut kinds: HashMap<(Addr6, u16), (&'static str, &'static str)> = HashMap::new();
         for (key, kind, _source) in targets.snapshot() {
-            let addr = key.addr();
-            let k = (u32::from_ne_bytes(addr.ip().octets()), addr.port().to_be());
+            let k = (key.ip(), key.port().to_be());
             kinds.entry(k).or_insert((key.proto_name(), kind.name()));
         }
 
@@ -123,8 +122,16 @@ impl Tracker {
     }
 }
 
-fn set(gauge: &IntGaugeVec, ip: u32, port: u16, proto: &str, kind: &str, n: i64) {
-    let ip = Ipv4Addr::from(ip.to_ne_bytes()).to_string();
+fn set(gauge: &IntGaugeVec, ip: Addr6, port: u16, proto: &str, kind: &str, n: i64) {
+    let ip = ip.to_string();
     let port = u16::from_be(port).to_string();
     gauge.with_label_values(&[&ip, &port, proto, kind]).set(n);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn flow_key_layout() {
+        assert_eq!(std::mem::size_of::<super::FlowKey>(), 36);
+    }
 }

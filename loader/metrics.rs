@@ -17,7 +17,7 @@ use crate::reflection::{self, StatsMap as ReflectionStatsMap};
 use crate::targets::{DstKey, Targets};
 use crate::blocklist;
 use crate::players::{PlayerMap, Tracker};
-use crate::unused::{self, StatsMap as UnusedStatsMap};
+use crate::unused::StatsMap as UnusedStatsMap;
 
 /// Optional statistics maps of the network wide protections.
 pub struct Extra {
@@ -366,7 +366,7 @@ fn publish_unused(map: &UnusedStatsMap) {
             total_packets += stats.packets;
             total_bytes += stats.bytes;
         }
-        let ip = unused::addr(key).to_string();
+        let ip = key.to_string();
         let counter = packets.with_label_values(&[&ip]);
         counter.inc_by(total_packets.saturating_sub(counter.get()));
         let counter = bytes.with_label_values(&[&ip]);
