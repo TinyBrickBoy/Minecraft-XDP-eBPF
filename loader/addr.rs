@@ -84,6 +84,16 @@ impl Net {
         }
         Addr6::from_ip(ip).mask(self.lpm_len() as u8) == self.addr6()
     }
+
+    /// True when every address of `other` is inside `self` (same family).
+    pub fn covers(&self, other: &Net) -> bool {
+        self.lpm_len() <= other.lpm_len() && self.contains(other.addr)
+    }
+
+    /// True when the two networks share addresses (one covers the other).
+    pub fn overlaps(&self, other: &Net) -> bool {
+        self.covers(other) || other.covers(self)
+    }
 }
 
 impl fmt::Display for Net {
@@ -196,6 +206,28 @@ mod tests {
         };
         assert!(any6.contains("2001:db8::1".parse().unwrap()));
         assert!(!any6.contains("203.0.113.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn covers_and_overlaps() {
+        let n = |t: &str| {
+            let (a, l) = t.split_once('/').unwrap();
+            Net {
+                addr: a.parse().unwrap(),
+                len: l.parse().unwrap(),
+            }
+        };
+        assert!(n("1.2.3.0/24").covers(&n("1.2.3.4/32")));
+        assert!(!n("1.2.3.4/32").covers(&n("1.2.3.0/24")));
+        assert!(n("1.2.3.4/32").overlaps(&n("1.2.3.0/24")));
+        assert!(n("1.2.3.0/24").overlaps(&n("1.2.3.4/32")));
+        assert!(!n("1.2.3.4/32").overlaps(&n("1.2.4.0/24")));
+        assert!(n("2001:db8:1:2::/64").covers(&n("2001:db8:1:2::9/128")));
+        assert!(!n("2001:db8:1:2::9/128").covers(&n("2001:db8:1:2::/64")));
+        assert!(n("2001:db8:1:2::9/128").overlaps(&n("2001:db8:1:2::/64")));
+        assert!(!n("2001:db8:1:2::/64").overlaps(&n("2001:db8:1:3::/64")));
+        assert!(!n("0.0.0.0/0").covers(&n("::/0")));
+        assert!(!n("::/0").overlaps(&n("1.2.3.4/32")));
     }
 
     #[test]

@@ -185,7 +185,20 @@ fn auto_line(net: Net, until: u64, bans: usize) -> String {
 /// versions hold a bare IPv4 address, which stays a /32).
 fn line_net(line: &str) -> Option<Net> {
     let first = line.split('#').next()?.split_whitespace().next()?;
-    parse_cidr(first).ok()
+    let net = parse_cidr(first).ok()?;
+    Some(Net { addr: net.addr6().to_ip(), len: net.len })
+}
+
+/// True when a blocklist entry covers the whole network (a narrower entry
+/// at the prefix base does not).
+fn already_blocked<V>(current: &HashMap<Net, V>, net: &Net) -> bool {
+    current.keys().any(|n| n.covers(net))
+}
+
+/// Packets sent by all sources inside `net` (a prefix stays active while
+/// any member sends).
+fn prefix_packets(net: &Net, sources: &HashMap<IpAddr, SourceStats>) -> u64 {
+    sources.iter().filter(|(ip, _)| net.contains(**ip)).map(|(_, s)| s.packets).sum()
 }
 
 /// Removes expired automatic lines and automatic lines of `idle` sources
@@ -232,7 +245,11 @@ mod net_keys {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<HashMap<Net, Vec<u64>>, D::Error> {
         let text = HashMap::<String, Vec<u64>>::deserialize(d)?;
         text.into_iter()
-            .map(|(key, v)| parse_cidr(&key).map(|net| (net, v)).map_err(D::Error::custom))
+            .map(|(key, v)| {
+                parse_cidr(&key)
+                    .map(|net| (Net { addr: net.addr6().to_ip(), len: net.len }, v))
+                    .map_err(D::Error::custom)
+            })
             .collect()
     }
 }
@@ -266,7 +283,7 @@ impl Auto {
                 continue;
             }
             self.counted.insert(*ip, ban.since_ns);
-            if self.allow.iter().any(|net| net.contains(ip.addr)) {
+            if self.allow.iter().any(|a| a.overlaps(ip)) {
                 continue;
             }
             let times = self.history.bans.entry(*ip).or_default();
@@ -510,7 +527,7 @@ impl Worker {
         let mut add = Vec::new();
         if let Some(auto) = &mut self.auto {
             for (net, bans) in auto.record(&active, now) {
-                if self.current.keys().any(|n| n.contains(net.addr)) || self.whitelist.contains(net.addr) {
+                if already_blocked(&self.current, &net) || self.whitelist.contains(net.addr) {
                     continue; // already blocked, or whitelisted
                 }
                 warn!("Auto blocklist: {net} banned {bans} times, blocklisted for {} s", auto.duration);
@@ -559,7 +576,7 @@ impl Worker {
             let Some(net) = line_net(line) else { continue };
             listed.insert(net);
             // a prefix entry counts every source inside it
-            let packets: u64 = sources.iter().filter(|(ip, _)| net.contains(**ip)).map(|(_, s)| s.packets).sum();
+            let packets = prefix_packets(&net, &sources);
             let seen = self.activity.entry(net).or_insert((packets, now));
             if seen.0 != packets {
                 *seen = (packets, now);
@@ -836,6 +853,60 @@ mod tests {
         assert_eq!(parse_scoped(line, "t")[&net("1.2.3.4")], BLOCK_PROTECTED);
         assert_eq!(line_net("5.6.7.0/24 # manual"), Some(net("5.6.7.0/24")));
         assert_eq!(line_net("# only a comment"), None);
+    }
+
+    #[test]
+    fn hand_edited_entries_are_masked() {
+        assert_eq!(line_net("2001:db8::5/64 # auto until=1 (x) after 3 rate limit bans"), Some(net("2001:db8::/64")));
+        let h: History = serde_json::from_str(r#"{"bans":{"2001:db8::5/64":[1]}}"#).unwrap();
+        assert!(h.bans.contains_key(&net("2001:db8::/64")));
+    }
+
+    #[test]
+    fn allow_overlap_skips_bans() {
+        let dir = std::env::temp_dir().join(format!("xdp-allow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut auto = Auto {
+            after_bans: 1,
+            window: 100,
+            duration: 50,
+            allow: vec![net("2001:db8:1:2::9/128"), net("1.2.3.4/32")],
+            state: dir.join("state.json"),
+            history: History::default(),
+            counted: HashMap::new(),
+        };
+        let ban = |since| Ban { until_ns: u64::MAX, since_ns: since, rate: 1, dropped: 1, reason: 1 };
+        let p64 = net("2001:db8:1:2::/64");
+        assert!(auto.record(&[(p64, ban(1)), (net("1.2.3.4/32"), ban(1))], 10).is_empty());
+        assert!(auto.history.bans.is_empty());
+        // a neighbouring prefix and another v4 address are not exempt
+        let other = net("2001:db8:1:3::/64");
+        assert_eq!(auto.record(&[(other, ban(1)), (net("1.2.3.5/32"), ban(1))], 11).len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn narrower_entry_does_not_cover_prefix() {
+        let mut current: HashMap<Net, u8> = HashMap::new();
+        current.insert(net("2001:db8:1:2::/128"), 1);
+        assert!(!already_blocked(&current, &net("2001:db8:1:2::/64")));
+        current.insert(net("2001:db8:1::/48"), 1);
+        assert!(already_blocked(&current, &net("2001:db8:1:2::/64")));
+    }
+
+    #[test]
+    fn prefix_activity_sums_members() {
+        let stat = |p| SourceStats { packets: p, bytes: 0 };
+        let sources: HashMap<IpAddr, SourceStats> = [
+            ("2001:db8:1:2::1".parse().unwrap(), stat(3)),
+            ("2001:db8:1:2::2".parse().unwrap(), stat(4)),
+            ("2001:db8:1:3::1".parse().unwrap(), stat(100)),
+            ("1.2.3.4".parse().unwrap(), stat(5)),
+            ("1.2.3.5".parse().unwrap(), stat(7)),
+        ]
+        .into();
+        assert_eq!(prefix_packets(&net("2001:db8:1:2::/64"), &sources), 7);
+        assert_eq!(prefix_packets(&net("1.2.3.4/32"), &sources), 5);
     }
 
     #[test]
