@@ -127,6 +127,10 @@ static __always_inline int parse_l3_v6(const __u8 *ip, const void *data_end, str
     out->l3len = 40 + bpf_ntohs(plen);
     out->hoplimit = ip[7];
     out->frag = FRAG_NONE;
+    // decided on the fixed header, before the chain walk: a bogus packet is
+    // dropped also when its chain is unparseable (L3_BAD from below keeps
+    // the mark)
+    out->bogus = v6_bogus(&out->src, &out->dst);
 
     __u8 next = ip[6];
     __u32 off = 40;
@@ -175,9 +179,8 @@ static __always_inline int parse_l3_v6(const __u8 *ip, const void *data_end, str
     out->proto = next;
     out->l4off = off;
     out->hdrlen = off;
-    // fully parsed (the caller may still look at the l4 header), but never
-    // legitimate: dropped by the XDP program whatever the destination
-    out->bogus = v6_bogus(&out->src, &out->dst);
+    // fully parsed (the caller may still look at the l4 header), but a
+    // bogus one is never legitimate: dropped whatever the destination
     return out->bogus ? L3_BAD : L3_OK;
 }
 

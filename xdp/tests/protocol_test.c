@@ -938,6 +938,31 @@ static void test_parse_v6_bogus_addresses(void)
     set_v6_addr(p, 24, "ff02::1");
     CHECK(run_parse(p, n, &l) == L3_OK && l.bogus == BOGUS_NONE);
 
+    // the mark does not depend on the chain: five extension headers (over
+    // the limit) or a truncated chain from a v4-mapped or loopback source
+    // are still bogus, not just unparseable
+    const char *chain_src[] = {"::ffff:9.9.9.9", "::1"};
+    for (size_t i = 0; i < 2; i++)
+    {
+        n = build_v6(p, 60, 5 * 8 + 8);
+        for (int h = 0; h < 5; h++)
+        {
+            p[40 + h * 8] = h == 4 ? 17 : 60;
+        }
+        set_v6_addr(p, 8, chain_src[i]);
+        CHECK(run_parse(p, n, &l) == L3_BAD && l.bogus == BOGUS_ADDR);
+        n = build_v6(p, 60, 4); // truncated destination options
+        set_v6_addr(p, 8, chain_src[i]);
+        CHECK(run_parse(p, n, &l) == L3_BAD && l.bogus == BOGUS_ADDR);
+    }
+    // an unspecified source with an unparseable chain: bogus, and never NDP
+    n = build_v6(p, 60, 4);
+    set_v6_addr(p, 8, "::");
+    CHECK(run_parse(p, n, &l) == L3_BAD && l.bogus == BOGUS_UNSPEC && l.proto == 0);
+    // a clean source with an unparseable chain is only L3_BAD
+    n = build_v6(p, 60, 4);
+    CHECK(run_parse(p, n, &l) == L3_BAD && l.bogus == BOGUS_NONE);
+
     // IPv4 is never bogus, its hop limit is the ttl
     n = build_v4(p, 6, 0, 20);
     p[8] = 33;
